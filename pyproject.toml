@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prosodia-lyricist"
+version = "0.1.0"
+description = "Prosody-conditioned lyric generation trained on DALI annotations"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.6,<3",
+  "transformers>=4.45,<5",
+  "numpy>=1.26,<3",
+  "PyYAML>=6,<7",
+  "cmudict>=1.0,<2",
+  "tqdm>=4.66,<5",
+]
+
+[project.optional-dependencies]
+midi = ["miditoolkit>=1.0,<2"]
+dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
+
+[project.scripts]
+prosodia-prepare = "prosodia_lyricist.prepare:main"
+prosodia-train = "prosodia_lyricist.train:main"
+prosodia-infer = "prosodia_lyricist.infer:main"
+
+[tool.setuptools.packages.find]
+include = ["prosodia_lyricist*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+include = ["prosodia_lyricist/**/*.py", "tests/**/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
