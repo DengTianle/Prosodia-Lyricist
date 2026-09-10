@@ -1,9 +1,11 @@
 """Train prosody-conditioned BART on prepared DALI lyric lines."""
 
 import argparse
+import hashlib
 import json
 import logging
 import math
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,11 +29,23 @@ logger = logging.getLogger(__name__)
 
 
 def run_epoch(
-    model, loader, device, *, optimizer=None, scheduler=None, gradient_clip=1.0, max_batches=None
+    model,
+    loader,
+    device,
+    *,
+    optimizer=None,
+    scheduler=None,
+    gradient_clip=1.0,
+    max_batches=None,
+    loss_aggregation="tokens",
 ):
+    if loss_aggregation not in ("tokens", "batches"):
+        raise ValueError("loss_aggregation must be tokens or batches")
     training = optimizer is not None
     model.train(training)
     total_loss, total_tokens, batches = 0.0, 0, 0
+    components = {}
+    total_weight = 0
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for batch in tqdm(loader, desc="Train" if training else "Validate", leave=False):
@@ -39,33 +53,65 @@ def run_epoch(
             tokens = int(batch["labels"].ne(-100).sum())
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            loss = model(**batch).loss
+            output = model(**batch)
+            loss = output.loss
             if not torch.isfinite(loss):
                 raise FloatingPointError("Non-finite loss; stopping without accepting this epoch")
             if training:
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), gradient_clip, error_if_nonfinite=True
-                )
+                if gradient_clip is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), gradient_clip, error_if_nonfinite=True
+                    )
                 optimizer.step()
                 scheduler.step()
-            total_loss += loss.item() * tokens
+            weight = tokens if loss_aggregation == "tokens" else 1
+            total_weight += weight
+            total_loss += loss.item() * weight
+            for name, value in getattr(output, "loss_components", {}).items():
+                components[name] = components.get(name, 0.0) + value.item() * weight
             total_tokens += tokens
             batches += 1
             if max_batches is not None and batches >= max_batches:
                 break
     if not total_tokens:
         raise ValueError("No target tokens in this epoch")
-    return {"loss": total_loss / total_tokens, "tokens": total_tokens, "batches": batches}
+    return {
+        "loss": total_loss / total_weight,
+        "tokens": total_tokens,
+        "batches": batches,
+        "components": {k: v / total_weight for k, v in components.items()},
+    }
+
+
+def build_scheduler(optimizer, settings, total_steps):
+    """The original literal -1 schedule is preserved as an explicit experiment choice."""
+    mode = settings.get("schedule", "linear")
+    if mode not in ("xai_original", "linear", "constant_after_warmup"):
+        raise ValueError("Unknown schedule")
+    warmup = settings.get("warmup_steps", int(total_steps * settings.get("warmup_ratio", 0)))
+    if warmup < 0:
+        raise ValueError("warmup_steps must be nonnegative")
+    if mode == "constant_after_warmup":
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer, lambda step: step / warmup if step < warmup else 1.0
+        )
+    return get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup,
+        num_training_steps=-1 if mode == "xai_original" else total_steps,
+    )
 
 
 def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     settings = config["training"]
     if any(settings[key] < 1 for key in ("epochs", "batch_size", "patience")):
         raise ValueError("epochs, batch_size, and patience must be positive")
-    if not 0 <= settings["warmup_ratio"] < 1:
+    if not 0 <= settings.get("warmup_ratio", 0) < 1:
         raise ValueError("warmup_ratio must be in [0, 1)")
-    if settings["gradient_clip"] <= 0 or settings["learning_rate"] <= 0:
+    if (settings["gradient_clip"] is not None and settings["gradient_clip"] <= 0) or settings[
+        "learning_rate"
+    ] <= 0:
         raise ValueError("gradient_clip and learning_rate must be positive")
     seed_everything(settings["seed"])
     device = select_device(settings["device"])
@@ -74,11 +120,19 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     manifest = read_manifest(prepared_dir)
     if manifest["config"] != config["data"]:
         raise ValueError("Data configuration changed since preparation; run prosodia-prepare again")
+    if config["data"].get("song_ids_file"):
+        selection_hash = hashlib.sha256(
+            Path(config["data"]["song_ids_file"]).read_bytes()
+        ).hexdigest()
+        if selection_hash != manifest["selection"]["sha256"]:
+            raise ValueError("Song ID list changed since preparation; run prosodia-prepare again")
     max_syllables = manifest["config"]["max_syllables"]
     tokenizer = AutoTokenizer.from_pretrained(
         config["model"]["pretrained"], local_files_only=local_files_only
     )
     configure_tokenizer(tokenizer, max_syllables)
+    loss_weights = settings.get("loss_weights", {})
+    scaffold = any(loss_weights.get(k, 0) > 0 for k in ("syllable", "remainder", "sentence"))
     datasets = {
         split: LyricDataset(
             prepared_dir,
@@ -87,6 +141,7 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
             max_source_length=config["model"]["max_source_length"],
             max_target_length=config["model"]["max_target_length"],
             limit=16 if smoke_test else None,
+            scaffold=scaffold,
         )
         for split in ("train", "valid")
     }
@@ -103,6 +158,20 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
         )
         for split, dataset in datasets.items()
     }
+    if settings.get("fixed_batch_order", False):
+        # Original builds and shuffles its batch sampler once, outside the epoch loop.
+        indices = list(range(len(datasets["train"])))
+        rng = random.Random(settings["seed"])
+        rng.shuffle(indices)
+        size = min(settings["batch_size"], 2) if smoke_test else settings["batch_size"]
+        batches = [indices[i : i + size] for i in range(0, len(indices), size)]
+        rng.shuffle(batches)
+        loaders["train"] = DataLoader(
+            datasets["train"],
+            batch_sampler=batches,
+            collate_fn=ProsodyCollator(tokenizer.pad_token_id),
+            num_workers=0 if smoke_test else settings["num_workers"],
+        )
     if smoke_test:
         # Exercises real BART tokenization/data/optimization without downloading base weights.
         bart_config = BartConfig(
@@ -132,21 +201,25 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     for key in ("max_source_length", "max_target_length"):
         if not 2 <= config["model"][key] <= bart.config.max_position_embeddings:
             raise ValueError(f"{key} exceeds BART's position limit or is less than 2")
-    model = ProsodyBart(bart, max_syllables=max_syllables, dropout=config["model"]["dropout"]).to(
-        device
-    )
+    model = ProsodyBart(
+        bart,
+        max_syllables=max_syllables,
+        dropout=config["model"]["dropout"],
+        loss_weights=loss_weights,
+    ).to(device)
     epochs = 1 if smoke_test else settings["epochs"]
     max_batches = 2 if smoke_test else None
     steps_per_epoch = min(len(loaders["train"]), max_batches or len(loaders["train"]))
     total_steps = epochs * steps_per_epoch
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=settings["learning_rate"], weight_decay=settings["weight_decay"]
+        model.parameters(),
+        lr=settings["learning_rate"],
+        weight_decay=settings["weight_decay"],
+        betas=tuple(settings.get("adam_betas", (0.9, 0.98))),
     )
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(total_steps * settings["warmup_ratio"]),
-        num_training_steps=total_steps,
-    )
+    scheduler = build_scheduler(optimizer, settings, total_steps)
+    if settings.get("schedule") == "xai_original":
+        logger.warning("Original schedule selected: learning rate becomes zero after warmup")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     output = (
         Path(output_dir)
@@ -161,6 +234,7 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
         "total_steps": total_steps,
         "data_counts": manifest["counts"],
         "data_sha256": manifest["sha256"],
+        "data_selection": manifest["selection"],
         "tokenized_lines": {split: len(ds) for split, ds in datasets.items()},
         "skipped_token_limits": {split: ds.skipped for split, ds in datasets.items()},
     }
@@ -176,8 +250,15 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
                 scheduler=scheduler,
                 gradient_clip=settings["gradient_clip"],
                 max_batches=max_batches,
+                loss_aggregation=settings.get("loss_aggregation", "batches"),
             )
-            valid_metrics = run_epoch(model, loaders["valid"], device, max_batches=max_batches)
+            valid_metrics = run_epoch(
+                model,
+                loaders["valid"],
+                device,
+                max_batches=max_batches,
+                loss_aggregation=settings.get("loss_aggregation", "batches"),
+            )
             record = {
                 "epoch": epoch + 1,
                 "train": train_metrics,

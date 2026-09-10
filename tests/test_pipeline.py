@@ -157,7 +157,8 @@ def test_split_is_stable():
     assert {split_for(str(i), 1234, 0.1, 0.1) for i in range(100)} == {"train", "valid", "test"}
 
 
-def test_offline_training_and_midi_inference(tmp_path, annotation, tokenizer):
+@pytest.mark.parametrize("auxiliary", [False, True])
+def test_offline_training_and_midi_inference(tmp_path, annotation, tokenizer, auxiliary):
     from prosodia_lyricist.infer import infer
     from prosodia_lyricist.train import train
 
@@ -199,6 +200,8 @@ def test_offline_training_and_midi_inference(tmp_path, annotation, tokenizer):
             "gradient_clip": 1,
             "learning_rate": 0.001,
             "weight_decay": 0.01,
+            "fixed_batch_order": True,
+            "loss_weights": {"syllable": 0.5, "remainder": 0.5} if auxiliary else {},
         },
     }
     prepare(config)
@@ -206,6 +209,7 @@ def test_offline_training_and_midi_inference(tmp_path, annotation, tokenizer):
     metrics = json.loads((output / "metrics.jsonl").read_text())
     assert metrics["train"]["batches"] == metrics["valid"]["batches"] == 2
     assert metrics["learning_rate"] == 0
+    assert ("syllable" in metrics["train"]["components"]) == auxiliary
     melody = midi.MidiFile()
     instrument = midi.Instrument(0)
     instrument.notes = [midi.Note(80, 60, 0, 480)]

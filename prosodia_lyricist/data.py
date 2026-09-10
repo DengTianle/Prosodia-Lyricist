@@ -30,7 +30,15 @@ def read_manifest(directory):
 
 class LyricDataset(Dataset):
     def __init__(
-        self, directory, split, tokenizer, *, max_source_length, max_target_length, limit=None
+        self,
+        directory,
+        split,
+        tokenizer,
+        *,
+        max_source_length,
+        max_target_length,
+        limit=None,
+        scaffold=False,
     ):
         manifest = read_manifest(directory)
         path = Path(directory) / f"{split}.jsonl"
@@ -43,7 +51,9 @@ class LyricDataset(Dataset):
                 record = json.loads(row)
                 if manifest["songs"][record["song_id"]]["split"] != split:
                     raise ValueError(f"Song in incorrect split: {record['song_id']}")
-                example = encode_example(record, tokenizer, manifest["config"]["max_syllables"])
+                example = encode_example(
+                    record, tokenizer, manifest["config"]["max_syllables"], scaffold=scaffold
+                )
                 if (
                     len(example["input_ids"]) > max_source_length
                     or len(example["labels"]) > max_target_length
@@ -77,8 +87,13 @@ class ProsodyCollator:
         if not examples:
             raise ValueError("Cannot collate an empty batch")
         batch = {}
-        for key in (*SOURCE_KEYS, "labels"):
-            padding = self.pad_token_id if key == "input_ids" else (-100 if key == "labels" else 0)
+        keys = (*SOURCE_KEYS, "labels") + tuple(
+            key
+            for key in ("syllable_labels", "remainder_labels", "sentence_labels")
+            if key in examples[0]
+        )
+        for key in keys:
+            padding = self.pad_token_id if key == "input_ids" else (-100 if "labels" in key else 0)
             width = max(len(example[key]) for example in examples)
             batch[key] = torch.tensor(
                 [example[key] + [padding] * (width - len(example[key])) for example in examples],

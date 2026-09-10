@@ -150,8 +150,8 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
     Parent indices, not timestamp proximity or paragraph ids, define membership.
     One malformed line does not hide otherwise usable lines in the same song.
     """
-    if stress_source not in ("lexical", "unknown"):
-        raise ValueError("stress_source must be lexical or unknown")
+    if stress_source not in ("ipa", "lexical", "unknown"):
+        raise ValueError("stress_source must be ipa, lexical or unknown")
     words_by_line, notes_by_word = defaultdict(list), defaultdict(list)
     for word_id, word in enumerate(annot["words"]):
         words_by_line[parent_index(word, len(annot["lines"]))].append((word_id, word))
@@ -161,7 +161,7 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
     for line_id, line in enumerate(annot["lines"]):
         try:
             line_start, line_end = interval(line)
-            syllables, text = [], []
+            syllables, text, scaffold_words = [], [], []
             last_end = line_start
             for word_id, word in words_by_line[line_id]:
                 start, end = interval(word)
@@ -185,12 +185,28 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
                     syllable["stress"] = stress
                 syllables.extend(sung)
                 text.append(word_text)
-            if not 1 <= len(syllables) <= max_syllables:
-                raise AnnotationError("Empty line or syllable limit exceeded")
+                scaffold_words.append({"text": word_text, "syllable_count": len(sung)})
             # Relative duration needs no tempo, beat grid, or bar-line estimate.
+            if not syllables:
+                raise AnnotationError("Empty line")
             mean_duration = sum(s["duration"] for s in syllables) / len(syllables)
             for syllable in syllables:
                 syllable["length"] = "long" if syllable["duration"] > mean_duration else "short"
+            sung_template = syllables
+            if stress_source == "ipa":
+                from .ipa import parse_words
+
+                try:
+                    parsed = parse_words(" ".join(text))
+                except ValueError as exc:
+                    raise AnnotationError(str(exc)) from exc
+                syllables = [s for word in parsed for s in word["syllables"]]
+                scaffold_words = [
+                    {"text": w["text"], "syllable_count": len(w["syllables"])} for w in parsed
+                ]
+                text = [w["text"] for w in parsed]
+            if not 1 <= len(syllables) <= max_syllables:
+                raise AnnotationError("Empty line or syllable limit exceeded")
             records.append(
                 {
                     "id": f"{info['id']}:{line_id}",
@@ -201,6 +217,8 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
                     "start": line_start,
                     "end": line_end,
                     "syllables": syllables,
+                    "words": scaffold_words,
+                    "sung_syllables": sung_template,
                 }
             )
         except AnnotationError as exc:

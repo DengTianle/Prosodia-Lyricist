@@ -3,30 +3,43 @@ data:
   dali_dir: ../DALI_v2
   prepared_dir: ../data/dali
   language: english
+  song_ids_file: null # Optional .txt file, one exact DALI song ID per line.
   min_ncc: 0.0
-  max_syllables: 64
+  max_syllables: 40
   valid_fraction: 0.1
   test_fraction: 0.1
   seed: 1234
-  # Lexical stress is a pronunciation proxy, not a DALI beat annotation.
-  # Use "unknown" to train with duration and syllable counts only.
-  stress_source: lexical
+  # ipa: original prosodic stress AND vowel length/count; lexical/unknown:
+  # alternative DALI sung counts and duration lengths.
+  stress_source: ipa
 
 model:
   pretrained: facebook/bart-base
-  dropout: 0.1
-  max_source_length: 256
-  max_target_length: 256
+  dropout: 0.0 # Original declares 0.2 but never applies embedding dropout.
+  max_source_length: 1024
+  max_target_length: 1024
 
 training:
   output_dir: ../checkpoints/dali
   device: auto
   seed: 1234
-  epochs: 30
-  batch_size: 8
+  epochs: 1000
+  batch_size: 4
   num_workers: 0
+  fixed_batch_order: true
   learning_rate: 0.00005
-  weight_decay: 0.01
-  warmup_ratio: 0.06
-  gradient_clip: 1.0
+  adam_betas: [0.9, 0.98]
+  weight_decay: 0.001
+  warmup_steps: 2500
+  # Literal original schedule: LR is ZERO from step 2500 onward.
+  # Explicit alternatives: linear, constant_after_warmup.
+  schedule: xai_original
+  gradient_clip: null
+  loss_aggregation: batches
   patience: 5
+  # Original active baseline is text-only. Enable each non-text term explicitly.
+  loss_weights:
+    word: 1.0
+    syllable: 0.0
+    remainder: 0.0
+    sentence: 0.0

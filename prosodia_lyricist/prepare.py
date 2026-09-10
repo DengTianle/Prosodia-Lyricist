@@ -16,7 +16,7 @@ from tqdm import tqdm
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def normalized_identity(value):
@@ -68,8 +68,21 @@ def prepare(config, *, limit=None):
         raise ValueError("Require valid_fraction > 0, test_fraction >= 0, and their sum < 1")
     if data["max_syllables"] < 1 or (limit is not None and limit < 1):
         raise ValueError("max_syllables and limit must be positive")
-    if data["stress_source"] not in ("lexical", "unknown"):
-        raise ValueError("stress_source must be lexical or unknown")
+    if data["stress_source"] not in ("ipa", "lexical", "unknown"):
+        raise ValueError("stress_source must be ipa, lexical or unknown")
+    if data["stress_source"] == "ipa":
+        from .ipa import backend
+
+        backend()  # Fail before creating outputs if pronunciation support is unavailable.
+    requested, selection_hash = None, None
+    if data.get("song_ids_file"):
+        selection = Path(data["song_ids_file"]).read_bytes()
+        requested = set(selection.decode("utf-8-sig").splitlines())
+        requested = {s.strip() for s in requested if s.strip()}
+        if not requested or any(len(s.split()) != 1 for s in requested):
+            raise ValueError("song_ids_file must contain one exact song ID per nonempty line")
+        selection_hash = hashlib.sha256(selection).hexdigest()
+    seen_ids = set()
     source = Path(data["dali_dir"])
     files = sorted(p for p in source.iterdir() if p.suffix in (".gz", ".json"))
     if not files:
@@ -87,6 +100,10 @@ def prepare(config, *, limit=None):
             try:
                 info, annot = read_annotation(path)
                 song_id = str(info["id"])
+                if requested is not None and song_id not in requested:
+                    counts["songs_filtered_id"] += 1
+                    continue
+                seen_ids.add(song_id)
                 if song_id in songs:
                     raise AnnotationError("Duplicate song id (keep only one export per song)")
                 language = str(info.get("metadata", {}).get("language", "")).lower()
@@ -153,6 +170,12 @@ def prepare(config, *, limit=None):
             "schema_version": SCHEMA_VERSION,
             "config": data,
             "partial": limit is not None,
+            "selection": {
+                "sha256": selection_hash,
+                "requested_ids": sorted(requested) if requested is not None else None,
+                "missing_ids": sorted(requested - seen_ids) if requested is not None else [],
+                "unprepared_ids": sorted(requested - songs.keys()) if requested is not None else [],
+            },
             "counts": dict(counts),
             "songs": {
                 song_id: {"split": splits[song_id], "group": groups[song_id]}
@@ -173,8 +196,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--limit", type=int, help="Scan only the first N files for a smoke test")
+    parser.add_argument("--song-ids-file", help="Text file containing one exact DALI ID per line")
+    parser.add_argument(
+        "--english-only", action="store_true", help="Exclude other/unknown languages"
+    )
     args = parser.parse_args()
-    manifest = prepare(load_config(args.config), limit=args.limit)
+    config = load_config(args.config)
+    if args.song_ids_file:
+        config["data"]["song_ids_file"] = str(Path(args.song_ids_file).expanduser().resolve())
+    if args.english_only:
+        config["data"]["language"] = "english"
+    manifest = prepare(config, limit=args.limit)
     print(json.dumps(manifest["counts"], indent=2))
 
 

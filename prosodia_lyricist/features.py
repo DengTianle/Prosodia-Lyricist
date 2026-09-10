@@ -51,8 +51,34 @@ def encode_source(record, tokenizer, max_syllables):
     }
 
 
-def encode_example(record, tokenizer, max_syllables):
+def encode_example(record, tokenizer, max_syllables, *, scaffold=False):
     example = encode_source(record, tokenizer, max_syllables)
+    if scaffold or record.get("words"):
+        words = record.get("words")
+        if not words:
+            raise ValueError("Auxiliary losses require prepared word scaffolding; prepare again")
+        remaining = sum(w["syllable_count"] for w in words)
+        labels = [tokenizer.bos_token_id]
+        syllable, remainder, sentence = [-100], [-100], [0]
+        for word in words:
+            count = word["syllable_count"]
+            remaining -= count
+            tokens = tokenizer.encode(" " + word["text"], add_special_tokens=False)
+            labels.extend(tokens)
+            syllable.extend([count] * len(tokens))
+            remainder.extend([remaining] * len(tokens))
+            sentence.extend([1] * len(tokens))
+        labels.append(tokenizer.eos_token_id)
+        example.update(
+            labels=labels,
+            syllable_labels=syllable + [-100],
+            remainder_labels=remainder + [-100],
+            sentence_labels=sentence + [0],
+        )
+        if not scaffold:
+            for key in ("syllable_labels", "remainder_labels", "sentence_labels"):
+                del example[key]
+        return example
     # BART shifts labels internally, starting with decoder_start_token_id.
     example["labels"] = tokenizer.encode(record["text"], add_special_tokens=True)
     return example
