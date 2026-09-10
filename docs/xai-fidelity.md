@@ -2,7 +2,7 @@
 
 This baseline is intended for controlled DALI experiments. It is closer to the
 local XAI-Lyricist implementation after this revision, but it is **not an exact
-scientific clone yet**. In particular, example context, prompts, pretrained
+scientific clone yet**. In particular, keyword content, pretrained
 artifacts, and decoder correctness fixes below can affect results. Future
 iterations should use the same prepared manifest and baseline configuration;
 comparison with published XAI-Lyricist numbers requires resolving those differences.
@@ -19,8 +19,8 @@ references to external artifacts, so it is not an executable numerical oracle.
 
 | Item | Local original | Current default |
 | --- | --- | --- |
-| Pronunciation | `prosodic.Text`, word and line syllables | Legacy `prosodic` word syllables, flattened in word order |
-| Stress | Apostrophe: strong; backtick: substrong; otherwise weak | Same string rules |
+| Pronunciation | `prosodic.Text`, word and line syllables | Modern `prosodic` word tokens, first wordform per token |
+| Stress | Apostrophe: strong; backtick: substrong; otherwise weak | Same IPA rules, also accepting Unicode `ˈ` / `ˌ` |
 | Length | IPA `ː`: Long; otherwise Short | Same string rule, independent of DALI duration |
 | Syllable count | Pronunciation count, at most 40 per line | Same, even when DALI sung count differs |
 | Normalization | Quote normalization, `cuz` → `cause`, hyphen → space, remove periods | Same in IPA path, after DALI whitespace normalization |
@@ -35,7 +35,9 @@ references to external artifacts, so it is not an executable numerical oracle.
 | Batch order | Randomized once when building loader | Randomized once; seeded here |
 | Epoch loss aggregation | Mean of batch losses | Same; token-weighted option retained |
 | Early stopping | Configured patience 5 | Patience 5 on validation weighted-total loss |
-| Sequence limits | 1024 encoder / decoder | 1024 / 1024, skip rather than truncate |
+| Example context | One title followed by all lines in the record | One complete DALI song per example |
+| Line boundaries | Period after each source template/prompt and target line | Same, including the final line |
+| Sequence limits | 1024 encoder / decoder | 1024 / 1024, skip whole songs rather than truncate |
 | Active baseline loss | Text only; auxiliary terms commented out | Text weight 1; auxiliary weights 0 |
 
 The original scheduler call deserves special attention: with the standard
@@ -63,9 +65,10 @@ Text tokenization is identical with auxiliary terms enabled or disabled.
 | `word` | Next BART token |
 | `syllable` | Number of syllables in the word represented by this BPE piece |
 | `remainder` | Cumulative syllables remaining after that word |
-| `sentence` | Class 1 for lyric tokens, class 0 for BOS/EOS in one-line examples |
+| `sentence` | Class 1 for lyric tokens, class 0 for BOS/EOS and period boundaries |
 
-All padding labels are -100. Syllable/remainder supervision ignores BOS/EOS.
+All padding labels are -100. Syllable/remainder supervision ignores BOS/EOS
+and synthetic period separators. Remainders reset at each lyric line.
 Metrics include unweighted component losses and weighted total loss; training
 and validation use the same weights. Example configuration:
 
@@ -85,8 +88,9 @@ that intended pathway, not recovered pretrained heads or a claim of matching
 an unpublished multitask implementation. Original target remainder code sets
 `rem = line_syllable_num - num_syllables` independently for every word. Here it
 decrements cumulatively; this is an explicit correctness deviation that only
-affects remainder supervision. Sentence supervision is limited to boundaries
-in the current one-line representation, not full-song phrase identity.
+affects remainder supervision. Sentence supervision remains a binary lyric/boundary classification, rather
+than a distinct class for each phrase. The original active text binarizer also
+resets its line index inside each one-line text sample.
 
 This work restores training scaffolding. Hard syllable constraints, word-by-word
 pronunciation feedback during decoding, and MIDI evaluation are not implemented
@@ -105,18 +109,21 @@ or validated by these auxiliary objectives.
 - Grouped seeded 80/10/10 hash splitting replaces pre-existing train/valid
   text files. It prevents known artist/title/audio duplicates crossing splits.
 - Invalid DALI alignments reject a line/song even in IPA mode. This is stricter
-  than text-only preprocessing and can change corpus membership. Rejections,
-  absent IDs, and selected IDs excluded by filters are recorded.
-- JSONL/manifest schema replaces indexed pickle datasets. Schema version 2
-  requires re-preparation; old prepared data is not silently reinterpreted.
+  than text-only preprocessing and can change corpus membership. Any unusable
+  line now rejects its entire song, as the original rejects its record for an
+  unusable text line. Rejections, absent IDs, and selected IDs excluded by filters
+  are recorded.
+- JSONL/manifest schema replaces indexed pickle datasets. Schema version 3
+  requires re-preparation and retraining; old prepared data and inference
+  checkpoints are not silently reinterpreted. Counts distinguish songs from
+  lines; training reports tokenized and overlength-skipped songs.
 
 ## Remaining differences unrelated to changing the input dataset
 
 | Area | Difference and consequence |
 | --- | --- |
-| Example context | Current examples are one line. Original text records can pack several lines under one title. Cross-line context, length distributions, batch token counts, and updates per song therefore differ. This remains a material limitation for a strict clone. |
-| Prompts / separators | Current source uses title + syllable count + template + `<line>`; original adds per-line `<keywords>` and period separators. DALI does not supply original keyword fields, but omitting keyword extraction and retaining a new separator are still modeling differences. No AI keyword generator has been substituted. |
-| Target formatting | Wordwise leading-space BPE encoding is restored for prepared records. Original appends a period per line; current targets end with EOS without that synthetic period. Synthetic/legacy records lacking `words` retain whole-text tokenization. |
+| Keyword prompts | The source retains the original per-line `<keywords>` marker, with empty content for DALI. DALI does not supply the original keyword fields, and no keyword generator has been substituted. |
+| Target formatting | Wordwise leading-space BPE encoding and a period after every line are restored. Single BOS/EOS pairs enclose the song. Synthetic records lacking `words` retain whole-line text tokenization. |
 | Pretrained artifacts | Current default loads public `facebook/bart-base` and expands its vocabulary. Original loads an external custom BART directory and then a private experiment checkpoint using positional shape-based key remapping. Those artifacts are unavailable at the configured paths. A local Hugging Face model directory can be specified here, but original wrapper checkpoints are not compatible. Starting weights are not proven equivalent. |
 | Tokenizer / vocabulary | One expanded tokenizer is used for source and target here. Original uses a custom source tokenizer (asserts 50322 tokens) and a separate target tokenizer. Added-token IDs, embedding initialization, and softmax size may differ. |
 | Feature table sizes | Source length IDs match (padding 0, long 1, short 2). Remainder ID is remaining+1. The current source table allocates max_syllables+1 entries; original allocates an additional unused maximum-remainder row. Auxiliary class tables are explicit numeric counts rather than original dictionary offsets and unused entries. |
@@ -126,7 +133,7 @@ or validated by these auxiliary objectives.
 | Randomness / batching | Seed 1234 is explicit; original mixes Python/NumPy shuffles without an equivalent recorded seed. Fixed batch order is restored, but exact permutations/RNG states are not reproduced. Worker count is 0 here versus original environment default 10. |
 | Runtime / checkpoints | Modern stock Transformers/PyTorch, auto CUDA/MPS/CPU, strict state loading, atomic self-contained best checkpoints and JSON metrics replace the original fork/imports, CUDA assumptions, TensorBoard and permissive key remapping. Hardware and library versions can affect results. |
 | Early stopping details | Strictly lower validation loss resets patience here; ties count as stale. The referenced original early-stopping implementation is absent as source in this checkout, so tie/delta behavior cannot be verified. |
-| Pronunciation version | Original does not pin `prosodic`. This project pins legacy 1.6.2, but equivalence of its pronunciation dictionary to the original experiment is unproven. Its upstream build fails on Python 3.12 (`imp` removed). Both attempted 1.x installations failed in the requested environment; the subsequent source-download request was declined. IPA rules/integration wiring are tested with a substitute backend; the real-backend integration test is skipped while unavailable. |
+| Pronunciation version | The original does not pin `prosodic`. This project supports modern `prosodic>=3.10,<4`, tested with installed 3.10.0 under Python 3.12. It reads `wordtokens`, selects `wordtype.form` (the first pronunciation), and reads `syllable.ipa` rather than display text. The manifest records the actual version and selection policy. Dictionary/version equivalence to the original experiment remains unproven. |
 
 ## Validation and scope
 
@@ -135,11 +142,27 @@ IPA/DALI count disagreement, exact-ID selection independent of filenames,
 English/unknown-language filtering, target alignment and ignored padding,
 nonzero auxiliary gradients, combined loss, checkpoint round trips, and the
 literal scheduler's zero-after-warmup behavior. Existing preparation, tiny-BART
-training, and inference regression tests remain in place. The latter protect
-existing behavior; no new MIDI inference work was undertaken.
+training, and inference regression tests remain in place. Added regressions
+verify two-line song packing, period boundaries, line-local remainders, whole-song
+rejection, exact 1024/1025 source and target limits, and one generation call for
+multi-phrase MIDI. Inference uses the full song, splits generated periods into
+output lines, and checks the checkpoint source/target limits.
+
+A real-data smoke run in the `prosodia-lyricist` conda environment used
+`prosodic 3.10.0`, the cached BART tokenizer, and the first 100 local DALI files.
+It prepared 46 complete songs (35 train / 4 validation / 7 test), with 24 files
+excluded by language, 28 songs rejected for unusable lines, and 2 files rejected
+for invalid parent indices. The smoke loader retained 16 training songs and all
+4 validation songs, skipping one overlength training song before reaching its
+16-example cap. Two training and two validation batches with tiny random BART
+completed with finite losses and a saved checkpoint. Generated smoke artifacts
+were kept in a temporary directory; the existing full prepared dataset was not
+overwritten. Missing tokenizer resources were installed, and pronunciation
+cache/resource failures now abort preparation instead of being counted as bad
+annotations.
 
 These tests do not establish full-corpus IPA parsing, numerical agreement with
 the original checkpoint, or a reproduction of the paper's results. Real IPA
-preparation is blocked in the current Python 3.12 environment until the legacy
-dependency can be installed compatibly. Resolve context/prompt/artifact
-differences above before describing the system as differing *only* in dataset.
+integration is tested against the installed modern backend. Resolve keyword
+prompt and pretrained-artifact differences above before describing the system
+as differing *only* in dataset.

@@ -8,6 +8,7 @@ import pickle
 import re
 from collections import Counter
 from contextlib import ExitStack
+from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -16,7 +17,7 @@ from tqdm import tqdm
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def normalized_identity(value):
@@ -123,12 +124,22 @@ def prepare(config, *, limit=None):
                 for rejection in rejected:
                     rejects.write(json.dumps(rejection) + "\n")
                 counts["lines_rejected"] += len(rejected)
+                if rejected:
+                    # Keep complete songs, never join across a discarded lyric line.
+                    counts["songs_rejected_lines"] += 1
+                    continue
                 if not records:
                     counts["songs_without_usable_lines"] += 1
                     continue
                 songs[song_id] = info
+                song = {
+                    "id": song_id,
+                    "song_id": song_id,
+                    "title": normalize_text(info.get("title", "")),
+                    "lines": records,
+                }
+                rows.write(json.dumps(song, ensure_ascii=False) + "\n")
                 for record in records:
-                    rows.write(json.dumps(record, ensure_ascii=False) + "\n")
                     counts["syllables"] += len(record["syllables"])
                     counts["unknown_stress_syllables"] += sum(
                         s["stress"] == "unknown" for s in record["syllables"]
@@ -161,13 +172,18 @@ def prepare(config, *, limit=None):
             record = json.loads(row)
             split = splits[record["song_id"]]
             handles[split].write(row)
-            counts[f"{split}_lines"] += 1
+            counts[f"{split}_lines"] += len(record["lines"])
         for split in splits.values():
             counts[f"{split}_songs"] += 1
         # Close files before publishing; manifest is written last as the completion marker.
         stack.close()
         manifest = {
             "schema_version": SCHEMA_VERSION,
+            "pronunciation": (
+                {"package": "prosodic", "version": version("prosodic"), "wordform": "first"}
+                if data["stress_source"] == "ipa"
+                else None
+            ),
             "config": data,
             "partial": limit is not None,
             "selection": {

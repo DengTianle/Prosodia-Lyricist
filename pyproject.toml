@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ipa = ["prosodic==1.6.2"]
+ipa = ["prosodic>=3.10,<4"]
 midi = ["miditoolkit>=1.0,<2"]
 dev = ["pytest>=8,<10", "ruff>=0.9,<1"]
 

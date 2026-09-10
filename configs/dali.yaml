@@ -5,7 +5,7 @@ data:
   language: english
   song_ids_file: null # Optional .txt file, one exact DALI song ID per line.
   min_ncc: 0.0
-  max_syllables: 40
+  max_syllables: 40 # Per line; examples contain complete songs.
   valid_fraction: 0.1
   test_fraction: 0.1
   seed: 1234
@@ -16,7 +16,7 @@ data:
 model:
   pretrained: facebook/bart-base
   dropout: 0.0 # Original declares 0.2 but never applies embedding dropout.
-  max_source_length: 1024
+  max_source_length: 1024 # Whole song, including title, prompts, separators and BOS/EOS.
   max_target_length: 1024
 
 training:

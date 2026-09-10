@@ -47,8 +47,10 @@ class LyricDataset(Dataset):
         self.examples = []
         self.skipped = 0
         with path.open(encoding="utf-8") as handle:
-            for row in tqdm(handle, desc=f"Tokenizing {split}", unit="line"):
+            for row in tqdm(handle, desc=f"Tokenizing {split}", unit="song"):
                 record = json.loads(row)
+                if not record.get("lines"):
+                    raise ValueError("Expected a song with ordered lines; prepare again")
                 if manifest["songs"][record["song_id"]]["split"] != split:
                     raise ValueError(f"Song in incorrect split: {record['song_id']}")
                 example = encode_example(
@@ -69,7 +71,7 @@ class LyricDataset(Dataset):
             )
         if self.skipped:
             logger.warning(
-                "Skipped %d %s lines exceeding token limits (no truncation)", self.skipped, split
+                "Skipped %d %s songs exceeding token limits (no truncation)", self.skipped, split
             )
 
     def __len__(self):

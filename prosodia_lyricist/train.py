@@ -1,4 +1,4 @@
-"""Train prosody-conditioned BART on prepared DALI lyric lines."""
+"""Train prosody-conditioned BART on prepared DALI songs."""
 
 import argparse
 import hashlib
@@ -235,7 +235,9 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
         "data_counts": manifest["counts"],
         "data_sha256": manifest["sha256"],
         "data_selection": manifest["selection"],
-        "tokenized_lines": {split: len(ds) for split, ds in datasets.items()},
+        "data_schema_version": manifest["schema_version"],
+        "pronunciation": manifest["pronunciation"],
+        "tokenized_songs": {split: len(ds) for split, ds in datasets.items()},
         "skipped_token_limits": {split: ds.skipped for split, ds in datasets.items()},
     }
     (output / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")

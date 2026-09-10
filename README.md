@@ -14,7 +14,7 @@ Use the existing Conda environment (its name on this machine is
 ```bash
 conda activate prosodia-lyricist
 python -m pip install -e '.[midi,dev]'
-# IPA mode also needs the legacy pronunciation package; see compatibility note below.
+# Default IPA mode uses modern prosodic (tested with 3.10.0).
 python -m pip install -e '.[ipa]'
 # Optional: keep downloaded Hugging Face files inside this project.
 export HF_HOME="$PWD/data/huggingface"
@@ -22,13 +22,18 @@ export HF_HOME="$PWD/data/huggingface"
 
 Python 3.10+ is required. `midi` adds MIDI inference; `dev` adds pytest and Ruff.
 Preparation needs no audio downloads, MIDI files, DALI Python package, or custom
-Transformers fork. Default IPA preparation uses `prosodic==1.6.2`, retaining the
-original 1.x `Text.words()` / `word.syllables()` API. Its upstream installer uses
-`imp`, removed in Python 3.12: the `ipa` extra currently needs Python 3.10/3.11
-or a separately validated compatibility patch. Installation in this machine’s
-Python 3.12 `prosodia-lyricist` environment failed; real IPA integration remains
-unverified there. The lexical/unknown alternatives do not need this dependency. The first training run
-fetches the BART tokenizer and pretrained weights from Hugging Face.
+Transformers fork. Default IPA preparation uses `prosodic>=3.10,<4`, including
+its current word-token/wordform API and explicit syllable IPA strings. Install
+its tokenizer resources once if missing:
+
+```bash
+python -m nltk.downloader punkt punkt_tab
+```
+
+The adapter selects the first pronunciation for each word, preserves repeated
+words and punctuation, and does not run metrical or syntactic parsing. The
+lexical/unknown alternatives do not need this dependency. The first training
+run fetches the BART tokenizer and pretrained weights from Hugging Face.
 
 ## Prepare DALI
 
@@ -42,8 +47,11 @@ prosodia-prepare --config configs/dali.yaml
 ```
 
 This writes `data/dali/{train,valid,test}.jsonl`, `manifest.json`, and
-`rejected.jsonl`. Each record is one lyric line; the manifest records the
-configuration, song/group split assignments, counts, and file checksums.
+`rejected.jsonl`. Each record is one complete song with an ordered `lines` list;
+the manifest records configuration, pronunciation version, song/group split
+assignments, song and line counts, and file checksums. Schema version 3 requires
+re-running preparation and training; earlier line-level data/checkpoints are
+not silently reused.
 Preparation can be rerun and replaces only these generated outputs. Raw data
 and old local experiment outputs are ignored by Git.
 
@@ -78,11 +86,11 @@ values in the YAML: training checks its data settings against the manifest.
 - **Line and word membership:** DALI's parent indices link notes to words and
   words to lines. The target is the joined parent-word text.
 - **Default IPA syllables, stress, and length:** `stress_source: ipa` parses
-  lyric text with legacy `prosodic`, as in XAI-Lyricist. An apostrophe in the
-  syllable string means `strong`, a backtick means `substrong`, otherwise `weak`.
+  lyric text with modern `prosodic`. An apostrophe or IPA `ˈ` in the syllable
+  IPA means `strong`, a backtick or `ˌ` means `substrong`, otherwise `weak`.
   The IPA length mark `ː` means `long`, otherwise `short`. Counts and remainders
   use IPA syllables even when DALI's sung count differs. Unpronounceable words
-  reject the line rather than silently substituting another parser.
+  reject the song rather than silently substituting another parser.
 - **Optional sung features:** `stress_source: lexical` retains the previous
   DALI sung-count / CMUdict stress / relative-duration length mode.
   `stress_source: unknown` uses sung counts and duration with unknown stress.
@@ -101,10 +109,11 @@ is not an input to this model, as in the original compound prosody embedding.
 The optional sung mode remains dependent on DALI syllable and duration quality.
 
 Invalid indices, orphan continuations, overlapping/out-of-bounds intervals,
-empty words, and lines above `max_syllables` are reported and rejected. A line
-error discards that line; broken parent indices discard the song because its
-membership is ambiguous. Long token sequences are subsequently skipped with
-counts at training time, never silently truncated. Test data is held out from
+empty words, and lines above `max_syllables` (default 40 per line) are reported.
+Any unusable line rejects the whole song, preserving complete context without
+joining across missing lines. At tokenization, songs exceeding 1024 source or
+1024 target tokens (including title, prompts, separators and BOS/EOS) are
+skipped and counted, never truncated or split into independent lines. Test data is held out from
 training and checkpoint selection.
 
 For a preparation smoke test, `--limit 100` scans the first 100 files. Use a
@@ -147,19 +156,32 @@ losses. Non-text weights default to zero, matching the active original baseline.
 For example, `syllable: 1.0` and `remainder: 1.0` activate deterministic word/BPE
 label scaffolding and trainable auxiliary heads. Each word's BPE pieces share
 its syllable count and the cumulative number of syllables remaining after the
-word. Sentence supervision distinguishes lyric tokens from BOS/EOS in the
-current single-line examples. Padding is ignored by every loss. Metrics record
+word, resetting at each line. Sentence supervision distinguishes lyric tokens
+from BOS/EOS and period boundaries. Padding is ignored by every loss. Metrics record
 unweighted component losses and their weighted total; checkpoints save active
 heads and weights. This completes the original commented training scaffolding;
 it does not implement constrained MIDI decoding. Loading is strict; inference reconstructs
 the model entirely from its checkpoint without fetching the base model.
-Optimizer resume, distributed training, mixed precision, and full-song context
-are not implemented. Each training example and generated MIDI phrase is one
-independent lyric line.
+
+Each training example contains a complete song, with one title prefix and one
+BOS/EOS pair per source and target. Each line contributes
+`<syllable_N><template>…<keywords>.` to the source and wordwise BPE text followed
+by a period to the target, matching the original boundaries. DALI supplies no
+keywords, so that prompt remains empty. Source and target remainders reset at
+every line; the optional binary sentence head marks lyric tokens versus
+BOS/EOS/period boundaries. Optimizer resume, distributed training, and mixed
+precision are not implemented.
 
 ## MIDI inference
 
-MIDI remains the inference input for now:
+MIDI remains the inference input. All phrases are encoded together under one
+title and decoded in one call, giving the same song-level context as training.
+Generated periods become output line breaks. The model learns boundaries but
+does not enforce the requested number of lines. The default generation budget
+is the checkpoint target limit minus one decoder-start token (1023 for the
+standard configuration); `--max-new-tokens` can lower it. Overlong source songs
+raise an error without truncation:
+
 
 ```bash
 prosodia-infer \
@@ -195,8 +217,10 @@ ruff format --check prosodia_lyricist tests
 ```
 
 Tests use synthetic annotations and a tiny local tokenizer/model; no DALI
-files or network connection are needed. They cover IPA feature rules with a test backend, auxiliary-head gradients and
-reload, original scheduler behavior, exact-ID/language filtering, parent alignment, melisma,
+files or model downloads are needed. Real IPA integration tests run when
+`prosodic` is installed and require its tokenizer/pronunciation resources. They cover IPA feature rules with a test backend, auxiliary-head gradients and
+reload, song packing, source/target period boundaries, exact 1024-token limits,
+whole-song rejection, modern IPA pronunciation selection, original scheduler behavior, exact-ID/language filtering, parent alignment, melisma,
 invalid annotations, lexical stress, split reproducibility, padding, shifted
 labels, optimization, checkpoint reload/generation, and MIDI phrase handling.
 

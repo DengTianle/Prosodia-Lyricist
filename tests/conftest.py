@@ -11,7 +11,7 @@ from prosodia_lyricist.model import ProsodyBart
 
 @pytest.fixture
 def tokenizer():
-    words = ["<s>", "<pad>", "</s>", "<unk>", "hello", "world", "a", "song", "light"]
+    words = ["<s>", "<pad>", "</s>", "<unk>", "hello", "world", "a", "song", "light", "."]
     backend = Tokenizer(WordLevel({word: i for i, word in enumerate(words)}, unk_token="<unk>"))
     backend.pre_tokenizer = Whitespace()
     backend.post_processor = TemplateProcessing(

@@ -16,13 +16,17 @@ from prosodia_lyricist.train import build_scheduler, run_epoch
 
 def fake_backend(monkeypatch):
     words = [
-        SimpleNamespace(token="hello", syllables=lambda: ["hə", "'ləʊ"]),
-        SimpleNamespace(token="world", syllables=lambda: ["`wɜːld"]),
+        SimpleNamespace(
+            txt="hello", wordtype=SimpleNamespace(form=SimpleNamespace(syllables=["hə", "'ləʊ"]))
+        ),
+        SimpleNamespace(
+            txt="world", wordtype=SimpleNamespace(form=SimpleNamespace(syllables=["`wɜːld"]))
+        ),
     ]
     monkeypatch.setattr(
         ipa,
         "backend",
-        lambda: SimpleNamespace(Text=lambda *a, **kw: SimpleNamespace(words=lambda: words)),
+        lambda: SimpleNamespace(Text=lambda *a, **kw: SimpleNamespace(wordtokens=words)),
     )
 
 
@@ -49,7 +53,7 @@ def test_ipa_template_independent_of_sung_count(monkeypatch, annotation):
     assert [w["syllable_count"] for w in record["words"]] == [2, 1]
 
 
-def test_real_legacy_parser():
+def test_real_modern_parser():
     pytest.importorskip("prosodic")
     words = ipa.parse_words("hello world")
     assert sum(len(w["syllables"]) for w in words) == 3
@@ -63,9 +67,14 @@ def test_auxiliary_losses_gradients_padding_and_reload(tmp_path, tokenizer, tiny
     ]
     example = encode_example(record, tokenizer, 8, scaffold=True)
     assert example["labels"] == encode_example(record, tokenizer, 8)["labels"]
-    assert example["syllable_labels"] == [-100, 2, 1, -100]
-    assert example["remainder_labels"] == [-100, 1, 0, -100]
-    short = encode_example({**record, "words": record["words"][:1]}, tokenizer, 8, scaffold=True)
+    assert example["syllable_labels"] == [-100, 2, 1, -100, -100]
+    assert example["remainder_labels"] == [-100, 1, 0, -100, -100]
+    short = encode_example(
+        {**record, "words": record["words"][:1], "syllables": record["syllables"][:2]},
+        tokenizer,
+        8,
+        scaffold=True,
+    )
     batch = ProsodyCollator(tokenizer.pad_token_id)([example, short])
     assert batch["remainder_labels"][1, -1] == -100
     model = ProsodyBart(
