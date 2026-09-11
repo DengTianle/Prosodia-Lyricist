@@ -7,8 +7,8 @@ import torch
 from transformers import AutoTokenizer
 
 from prosodia_lyricist.data import LyricDataset, ProsodyCollator, read_manifest
-from prosodia_lyricist.features import encode_example, encode_source
-from prosodia_lyricist.model import ProsodyBart
+from prosodia_lyricist.legacy_features import encode_example, encode_source
+from prosodia_lyricist.legacy_model import ProsodyBart
 from prosodia_lyricist.prepare import prepare, song_groups, split_for
 from prosodia_lyricist.train import run_epoch
 
@@ -140,7 +140,12 @@ def test_prepare_reproducible_splits_and_loader(tmp_path, annotation, tokenizer)
     assert first["counts"]["test_lines"] > 0
     directory = config["data"]["prepared_dir"]
     dataset = LyricDataset(
-        directory, "train", tokenizer, max_source_length=64, max_target_length=64
+        directory,
+        "train",
+        tokenizer,
+        decoder_mode="lyrics",
+        max_source_length=64,
+        max_target_length=64,
     )
     assert len(dataset) == first["counts"]["train_lines"]
     assert read_manifest(directory) == first
@@ -149,7 +154,14 @@ def test_prepare_reproducible_splits_and_loader(tmp_path, annotation, tokenizer)
     with (Path(directory) / "train.jsonl").open("a") as handle:
         handle.write("{}\n")
     with pytest.raises(ValueError, match="differs"):
-        LyricDataset(directory, "train", tokenizer, max_source_length=64, max_target_length=64)
+        LyricDataset(
+            directory,
+            "train",
+            tokenizer,
+            decoder_mode="lyrics",
+            max_source_length=64,
+            max_target_length=64,
+        )
 
 
 def test_split_is_stable():
@@ -183,6 +195,7 @@ def test_offline_training_and_midi_inference(tmp_path, annotation, tokenizer, au
             "stress_source": "unknown",
         },
         "model": {
+            "decoder_mode": "lyrics",
             "pretrained": str(tmp_path / "tokenizer"),
             "dropout": 0,
             "max_source_length": 64,

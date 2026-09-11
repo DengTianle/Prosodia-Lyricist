@@ -6,7 +6,7 @@ from tokenizers.processors import TemplateProcessing
 from transformers import BartConfig, BartForConditionalGeneration, PreTrainedTokenizerFast
 
 from prosodia_lyricist.features import configure_tokenizer
-from prosodia_lyricist.model import ProsodyBart
+from prosodia_lyricist.legacy_model import ProsodyBart
 
 
 @pytest.fixture

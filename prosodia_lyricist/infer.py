@@ -26,13 +26,15 @@ def infer(
     max_new_tokens=None,
     seed=1234,
     stress_source=None,
+    return_explanations=False,
+    prosody_correction=True,
 ):
     if temperature <= 0 or top_k < 1 or (max_new_tokens is not None and max_new_tokens < 1):
         raise ValueError("temperature, top_k, and max_new_tokens must be positive")
     seed_everything(seed)
     checkpoint = Path(checkpoint)
     run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
-    if run.get("data_schema_version") != SCHEMA_VERSION:
+    if run.get("data_schema_version") not in (3, SCHEMA_VERSION):
         raise ValueError("Checkpoint uses an older input scheme; prepare and train song-level data")
     # Match duration/count-only training by default when lexical stress was disabled.
     if stress_source is None:
@@ -56,23 +58,39 @@ def infer(
         max_syllables=model.max_syllables,
         stress_source=stress_source,
     )
-    encoded = encode_source({"title": title, "lines": records}, tokenizer, model.max_syllables)
+    explainable = isinstance(model, ProsodyBart)
+    source_encoder = encode_source
+    if not explainable:
+        from .legacy_features import encode_source as source_encoder
+    encoded = source_encoder({"title": title, "lines": records}, tokenizer, model.max_syllables)
     source_limit = min(
         run["config"]["model"]["max_source_length"], model.bart.config.max_position_embeddings
     )
     if len(encoded["input_ids"]) > source_limit:
         raise ValueError("MIDI song template exceeds the checkpoint's source token limit")
     inputs = {key: torch.tensor([value], device=device) for key, value in encoded.items()}
-    generation = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": top_k > 1,
-        "bad_words_ids": [
-            [tokenizer.convert_tokens_to_ids(token)]
-            for token in tokenizer.additional_special_tokens
-        ],
-    }
+    generation = {"max_new_tokens": max_new_tokens, "do_sample": top_k > 1}
     if top_k > 1:
         generation.update(temperature=temperature, top_k=top_k)
+    if explainable:
+        result = model.generate(
+            **inputs, tokenizer=tokenizer, prosody_correction=prosody_correction, **generation
+        )
+        explanation = result.explanations[0]
+        explanation["template"] = {
+            "lyrics": result.sequences[0].tolist(),
+            "syllables": result.syllable_ids[0].tolist(),
+            "stresses": result.stress_ids[0].tolist(),
+            "lengths": result.length_ids[0].tolist(),
+            "tokens": tokenizer.convert_ids_to_tokens(result.sequences[0].tolist()),
+        }
+        explanation["source"] = {"title": title, "lines": records}
+        return explanation if return_explanations else explanation["lines"]
+    if return_explanations:
+        raise ValueError("Legacy lyrics-only checkpoints have no generated explanation streams")
+    generation["bad_words_ids"] = [
+        [tokenizer.convert_tokens_to_ids(token)] for token in tokenizer.additional_special_tokens
+    ]
     tokens = model.generate(**inputs, **generation)
     text = tokenizer.decode(tokens[0], skip_special_tokens=True)
     return [line.strip() for line in text.split(".") if line.strip()] or [""]
@@ -93,10 +111,27 @@ def main():
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--stress-source", choices=("heuristic", "unknown"))
     parser.add_argument("--output", help="Optional new UTF-8 text file")
+    parser.add_argument(
+        "--explanations", help="Optional new JSON file with predicted/corrected prosody"
+    )
+    parser.add_argument(
+        "--no-prosody-correction",
+        action="store_false",
+        dest="prosody_correction",
+        help="Ablation: feed sampled labels back without IPA correction",
+    )
     args = parser.parse_args()
     output = args.output
     del args.output
-    text = "\n".join(infer(**vars(args))) + "\n"
+    explanations = args.explanations
+    del args.explanations
+    result = infer(**vars(args), return_explanations=bool(explanations))
+    text = "\n".join(result["lines"] if explanations else result) + "\n"
+    if explanations:
+        path = Path(explanations)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x", encoding="utf-8") as handle:
+            json.dump(result, handle, indent=2, ensure_ascii=False)
     print(text, end="")
     if output:
         path = Path(output)

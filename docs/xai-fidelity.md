@@ -1,168 +1,97 @@
-# XAI-Lyricist fidelity audit
+# Explainable Prosody implementation notes
 
-This baseline is intended for controlled DALI experiments. It is closer to the
-local XAI-Lyricist implementation after this revision, but it is **not an exact
-scientific clone yet**. In particular, keyword content, pretrained
-artifacts, and decoder correctness fixes below can affect results. Future
-iterations should use the same prepared manifest and baseline configuration;
-comparison with published XAI-Lyricist numbers requires resolving those differences.
+The specification for the default model is the paper's Sections 3.1, 3.3,
+3.4, and Eq. (1), together with the supplement's IPA rules. The adjacent
+`../XAI-Lyricist` checkout is a partial implementation, not the final-model
+oracle. The PDFs are in `docs/references/`.
 
-The reference is the local `../XAI-Lyricist` checkout, specifically
-`1_data_binarisation/binarise.py`, `0_build_dict/build_dictionary.py`,
-`models/{conbart,melody_embedding,lyric_embedding,dataloader}.py`,
-`3_train_bart/train_bart_con.py`, and `configs/configs.yaml`. This audit follows
-active code as well as commented experiments; it does not assume every YAML
-field was actually used. The checkout contains incomplete/commented paths and
-references to external artifacts, so it is not an executable numerical oracle.
+## Implemented paper behavior
 
-## Restored defaults
-
-| Item | Local original | Current default |
-| --- | --- | --- |
-| Pronunciation | `prosodic.Text`, word and line syllables | Modern `prosodic` word tokens, first wordform per token |
-| Stress | Apostrophe: strong; backtick: substrong; otherwise weak | Same IPA rules, also accepting Unicode `ˈ` / `ˌ` |
-| Length | IPA `ː`: Long; otherwise Short | Same string rule, independent of DALI duration |
-| Syllable count | Pronunciation count, at most 40 per line | Same, even when DALI sung count differs |
-| Normalization | Quote normalization, `cuz` → `cause`, hyphen → space, remove periods | Same in IPA path, after DALI whitespace normalization |
-| Compound encoder | Concatenate BART token, length, remainder embeddings; linear projection | Same architecture |
-| New feature embedding initialization | Normal, std `hidden_size**-0.5`, zero padding row | Restored |
-| Embedding dropout | Declares 0.2; forward never calls it | Effective 0.0; configurable |
-| Optimizer | AdamW, lr 5e-5, betas (0.9, 0.98), decay 0.001 | Same |
-| Batch / epoch cap | 4 / 1000 | Same |
-| Warmup | 2500 optimizer steps | Same |
-| Schedule | Linear warmup helper with `num_training_steps=-1` | Literal same arguments under `xai_original` |
-| Gradient clipping | None | None (`null`) |
-| Batch order | Randomized once when building loader | Randomized once; seeded here |
-| Epoch loss aggregation | Mean of batch losses | Same; token-weighted option retained |
-| Early stopping | Configured patience 5 | Patience 5 on validation weighted-total loss |
-| Example context | One title followed by all lines in the record | One complete DALI song per example |
-| Line boundaries | Period after each source template/prompt and target line | Same, including the final line |
-| Sequence limits | 1024 encoder / decoder | 1024 / 1024, skip whole songs rather than truncate |
-| Active baseline loss | Text only; auxiliary terms commented out | Text weight 1; auxiliary weights 0 |
-
-The original scheduler call deserves special attention: with the standard
-Transformers helper, warmup increases LR through step 2499, and LR becomes zero
-at step 2500 and stays zero. The original trainer imports this helper from an
-unavailable `hugtransformers` fork; its precise implementation cannot be verified
-locally. The regression test verifies the standard helper's literal behavior,
-not a claim about an unavailable fork. `linear` uses the configured finite epoch
-budget; `constant_after_warmup` keeps peak LR after warmup. Both are explicit
-alternative experiments. No finite schedule is silently substituted.
-
-## Restored deterministic training scaffolding
-
-Preparation stores a word list with pronunciation syllable counts in IPA mode.
-Alternative lexical/unknown modes store DALI sung counts. This is deterministic
-processing, without an LLM or generated pseudo-labels. Dataset tokenization
-expands each word's attributes over its BPE tokens. Activating an auxiliary
-weight requests the aligned labels, creates its output head, computes its
-cross-entropy, and adds it to the text loss. Decoder hidden states carry gradients
-from all enabled heads. Weights and head parameters survive checkpoint reload.
-Text tokenization is identical with auxiliary terms enabled or disabled.
-
-| Weight | Supervision |
+| Paper behavior | Implementation |
 | --- | --- |
-| `word` | Next BART token |
-| `syllable` | Number of syllables in the word represented by this BPE piece |
-| `remainder` | Cumulative syllables remaining after that word |
-| `sentence` | Class 1 for lyric tokens, class 0 for BOS/EOS and period boundaries |
+| Title, ordered sentences, keywords, and syllable prosody | Encoder sequence `<title>…<sent_0><keywords>…<prosody>…`; independent compound stress/length embeddings |
+| Four output vocabularies | BART lyric vocabulary, word syllable count `0..max_syllables`, stress `pad/strong/weak`, length `pad/long/short` |
+| Compound decoder input | Concatenate lyric, syllable-count, stress, and length embeddings; linear projection to hidden size |
+| Four training targets | Sum of four independently averaged cross-entropies with unit default weights; no remainder/sentence loss |
+| Non-word symbols | Prosody class 0 at BOS/EOS, punctuation, and intermediate BPE pieces; batch padding `-100` excluded from CE |
+| Word prosody | Count IPA syllables; strong if any syllable is stressed; long if any syllable is long (Section 3.1) |
+| IPA extraction | Primary and secondary stress map to strong; long-vowel marks and English diphthongs map to long |
+| Sampling | Lyric symbol first; three non-pad prosody symbols at word completion; greedy or top-k temperature sampling |
+| Prosody correction | Replace sampled labels with complete-word IPA labels before embedding the next decoder input |
+| Explainable output | All four streams, predicted versus corrected labels, full IPA syllables, and source MIDI features available in JSON |
 
-All padding labels are -100. Syllable/remainder supervision ignores BOS/EOS
-and synthetic period separators. Remainders reset at each lyric line.
-Metrics include unweighted component losses and weighted total loss; training
-and validation use the same weights. Example configuration:
+All target streams are shifted together. The current target cannot enter the
+input used to predict itself. Inference caches only previously consumed events;
+the corrected word-completion event is embedded on the next step, so the cache
+never contains an uncorrected version of that event.
 
-```yaml
-training:
-  loss_weights:
-    word: 1.0
-    syllable: 1.0
-    remainder: 1.0
-    sentence: 0.0
-```
+## BART word completion adaptation
 
-The original commented code references sentence/syllable/remainder outputs
-that the active BART wrapper does not return. It also mixes `lambda_syll`,
-`lambda_syllable`, and absent `lambda_sent`. These new heads are a completion of
-that intended pathway, not recovered pretrained heads or a claim of matching
-an unpublished multitask implementation. Original target remainder code sets
-`rem = line_syllable_num - num_syllables` independently for every word. Here it
-decrements cumulatively; this is an explicit correctness deviation that only
-affects remainder supervision. Sentence supervision remains a binary lyric/boundary classification, rather
-than a distinct class for each phrase. The original active text binarizer also
-resets its line index inside each one-line text sample.
+The paper describes a word vocabulary and one event per word. Public BART uses
+byte-pair subwords. Treating each piece as an independently pronounceable word
+would corrupt IPA counts, especially for contractions and uncommon words.
 
-This work restores training scaffolding. Hard syllable constraints, word-by-word
-pronunciation feedback during decoding, and MIDI evaluation are not implemented
-or validated by these auxiliary objectives.
+This implementation encodes a word's BPE pieces, then an explicit `<word_end>`
+event with its three labels. Earlier pieces have auxiliary pad labels. At that
+event, the decoder samples all three labels, queries the complete word's IPA,
+corrects disagreements, and uses the corrected event to generate the next word.
+A whitespace-starting lexical token cannot start a second word before completion;
+BOS/EOS and encoder metadata cannot occur inside a word. A 24-piece word limit
+forces completion of otherwise unbounded fragments. Unknown pronunciations and
+out-of-vocabulary counts fail explicitly when correction is enabled. A token
+budget that cuts a word short removes the fragment and reports it in the result.
 
-## DALI adapter differences
+Consequences: this adds an event per word and changes token-budget usage and CE
+normalization relative to a literal word-vocabulary model. Prosody heads predict
+one word-level attribute set, while explanations additionally retain the complete
+syllable-level IPA pattern. No hard melody-alignment constraint is claimed.
 
-- Parent indices determine words and lines; note-text continuations and timing
-  are validated. Original input was a serialized list of text/keyword samples.
-- IPA templates use the lyric text, not DALI duration or sung count. The latter
-  remain in `sung_syllables` for provenance. IPA syllables are not assigned
-  invented timestamps when counts differ.
-- English filtering existed and remains the default. `language: all` disables
-  it; English pronunciation is still assumed by the IPA backend. Exact-ID
-  allowlists are optional, intersect other filters, and do not set data splits.
-- Grouped seeded 80/10/10 hash splitting replaces pre-existing train/valid
-  text files. It prevents known artist/title/audio duplicates crossing splits.
-- Invalid DALI alignments reject a line/song even in IPA mode. This is stricter
-  than text-only preprocessing and can change corpus membership. Any unusable
-  line now rejects its entire song, as the original rejects its record for an
-  unusable text line. Rejections, absent IDs, and selected IDs excluded by filters
-  are recorded.
-- JSONL/manifest schema replaces indexed pickle datasets. Schema version 3
-  requires re-preparation and retraining; old prepared data and inference
-  checkpoints are not silently reinterpreted. Counts distinguish songs from
-  lines; training reports tokenized and overlength-skipped songs.
+## Defaults and reproducibility limits
 
-## Remaining differences unrelated to changing the input dataset
+The default optimizer is Adam with betas (0.9, 0.98), epsilon 1e-5, no weight
+decay, and warmup followed by constant LR. Embedding and Transformer dropout
+are 0.3. The old reference `num_training_steps=-1` schedule, which stops learning
+after warmup, is retained only as an explicit `xai_original` experiment.
 
-| Area | Difference and consequence |
-| --- | --- |
-| Keyword prompts | The source retains the original per-line `<keywords>` marker, with empty content for DALI. DALI does not supply the original keyword fields, and no keyword generator has been substituted. |
-| Target formatting | Wordwise leading-space BPE encoding and a period after every line are restored. Single BOS/EOS pairs enclose the song. Synthetic records lacking `words` retain whole-line text tokenization. |
-| Pretrained artifacts | Current default loads public `facebook/bart-base` and expands its vocabulary. Original loads an external custom BART directory and then a private experiment checkpoint using positional shape-based key remapping. Those artifacts are unavailable at the configured paths. A local Hugging Face model directory can be specified here, but original wrapper checkpoints are not compatible. Starting weights are not proven equivalent. |
-| Tokenizer / vocabulary | One expanded tokenizer is used for source and target here. Original uses a custom source tokenizer (asserts 50322 tokens) and a separate target tokenizer. Added-token IDs, embedding initialization, and softmax size may differ. |
-| Feature table sizes | Source length IDs match (padding 0, long 1, short 2). Remainder ID is remaining+1. The current source table allocates max_syllables+1 entries; original allocates an additional unused maximum-remainder row. Auxiliary class tables are explicit numeric counts rather than original dictionary offsets and unused entries. |
-| Decoder teacher forcing | Original passes unshifted target embeddings together with identical labels. Here BART shifts labels internally, avoiding access to the current prediction target. This is a deliberate correctness fix, not numerical equivalence. |
-| Padding | Original attention masks are commented out and target padding is token 1. Here encoder padding is masked and target padding is excluded from CE. Loss values and gradients differ as a result. |
-| Model configuration | Real training takes layer/head/FFN sizes and internal dropout from pretrained BART config. Original accepts `n_head=8`, `d_model=512`, `ffn_hidden=2048` in YAML but its wrapper does not rebuild the loaded BART with them. Copying those unused values would not reproduce its active architecture. |
-| Randomness / batching | Seed 1234 is explicit; original mixes Python/NumPy shuffles without an equivalent recorded seed. Fixed batch order is restored, but exact permutations/RNG states are not reproduced. Worker count is 0 here versus original environment default 10. |
-| Runtime / checkpoints | Modern stock Transformers/PyTorch, auto CUDA/MPS/CPU, strict state loading, atomic self-contained best checkpoints and JSON metrics replace the original fork/imports, CUDA assumptions, TensorBoard and permissive key remapping. Hardware and library versions can affect results. |
-| Early stopping details | Strictly lower validation loss resets patience here; ties count as stale. The referenced original early-stopping implementation is absent as source in this checkout, so tie/delta behavior cannot be verified. |
-| Pronunciation version | The original does not pin `prosodic`. This project supports modern `prosodic>=3.10,<4`, tested with installed 3.10.0 under Python 3.12. It reads `wordtokens`, selects `wordtype.form` (the first pronunciation), and reads `syllable.ipa` rather than display text. The manifest records the actual version and selection policy. Dictionary/version equivalence to the original experiment remains unproven. |
+This is an implementation of the explainable generation setup, not a numerical
+reproduction of the published experiment:
 
-## Validation and scope
+- Training uses DALI rather than the paper's 101,120-song text corpus. Grouped
+  splits, alignment validation, and whole-song rejection change corpus membership.
+- The backbone is public pretrained `facebook/bart-base`; its layer/head/FFN
+  dimensions are retained, rather than rebuilding the paper's stated architecture.
+  Its tokenizer and pretrained weights differ from unavailable reference artifacts.
+- DALI provides no keyword prompts. Their encoder slots remain empty.
+- Sentence IDs support up to 256 lines; the configurable syllable vocabulary
+  defaults to 40, while the paper reports 20. Source and target limits default
+  to 1024 events and skip whole overlength songs.
+- Modern Prosodic selects the first pronunciation. Its version and the binary
+  stress/diphthong rule version are saved in preparation provenance.
+- MIDI inference still assumes a monophonic melody with phrase-end markers and
+  one note per syllable. Beat inference, melisma alignment, and the paper's
+  musical-score visualization are not added by this model change.
+- Training remains single-device full precision with early stopping; optimizer
+  resume and distributed training are not implemented.
 
-Offline tests exercise IPA marker rules (including long vowels versus diphthongs),
-IPA/DALI count disagreement, exact-ID selection independent of filenames,
-English/unknown-language filtering, target alignment and ignored padding,
-nonzero auxiliary gradients, combined loss, checkpoint round trips, and the
-literal scheduler's zero-after-warmup behavior. Existing preparation, tiny-BART
-training, and inference regression tests remain in place. Added regressions
-verify two-line song packing, period boundaries, line-local remainders, whole-song
-rejection, exact 1024/1025 source and target limits, and one generation call for
-multi-phrase MIDI. Inference uses the full song, splits generated periods into
-output lines, and checks the checkpoint source/target limits.
+## Data and checkpoint migration
 
-A real-data smoke run in the `prosodia-lyricist` conda environment used
-`prosodic 3.10.0`, the cached BART tokenizer, and the first 100 local DALI files.
-It prepared 46 complete songs (35 train / 4 validation / 7 test), with 24 files
-excluded by language, 28 songs rejected for unusable lines, and 2 files rejected
-for invalid parent indices. The smoke loader retained 16 training songs and all
-4 validation songs, skipping one overlength training song before reaching its
-16-example cap. Two training and two validation batches with tiny random BART
-completed with finite losses and a saved checkpoint. Generated smoke artifacts
-were kept in a temporary directory; the existing full prepared dataset was not
-overwritten. Missing tokenizer resources were installed, and pronunciation
-cache/resource failures now abort preparation instead of being counted as bad
-annotations.
+Prepared schema 4 records the revised IPA rules. Run preparation again and train
+a new explainable checkpoint; old feature labels and plain-text decoder weights
+cannot be silently reused as trained explanation heads. New checkpoints carry
+an explicit format version, word-boundary token, IPA rules, all heads/embeddings,
+and loss weights.
 
-These tests do not establish full-corpus IPA parsing, numerical agreement with
-the original checkpoint, or a reproduction of the paper's results. Real IPA
-integration is tested against the installed modern backend. Resolve keyword
-prompt and pretrained-artifact differences above before describing the system
-as differing *only* in dataset.
+Old song-level Prosodia checkpoints still load through `legacy_model.py` and use
+`legacy_features.py` at inference. `model.decoder_mode: lyrics` explicitly selects
+that historical architecture for new experiments. Its old loss names are valid
+only in that mode. Checkpoints from the adjacent research checkout have never
+been compatible with this project's checkpoint format.
+
+## Validation
+
+The tests cover four-stream alignment and padding, the exact CE sum, gradients
+through all heads and compound embeddings, causal shifting, strict save/reload,
+actual cached decoding, predicted-versus-corrected feedback before the next word,
+IPA failures, and a prepare/train/MIDI-infer integration run. Historical pipeline
+regressions remain in the suite under explicit legacy mode. These checks validate
+implementation behavior; they do not establish lyric quality or paper metrics.

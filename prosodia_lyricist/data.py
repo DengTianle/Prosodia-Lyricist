@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .features import SOURCE_KEYS, encode_example
+from .features import encode_example
 from .prepare import SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,12 @@ class LyricDataset(Dataset):
         max_target_length,
         limit=None,
         scaffold=False,
+        decoder_mode="explainable",
     ):
+        if decoder_mode not in ("explainable", "lyrics"):
+            raise ValueError("decoder_mode must be explainable or lyrics")
+        if decoder_mode == "lyrics":
+            from .legacy_features import encode_example as encode_legacy
         manifest = read_manifest(directory)
         path = Path(directory) / f"{split}.jsonl"
         if hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"][path.name]:
@@ -53,9 +58,12 @@ class LyricDataset(Dataset):
                     raise ValueError("Expected a song with ordered lines; prepare again")
                 if manifest["songs"][record["song_id"]]["split"] != split:
                     raise ValueError(f"Song in incorrect split: {record['song_id']}")
-                example = encode_example(
-                    record, tokenizer, manifest["config"]["max_syllables"], scaffold=scaffold
-                )
+                if decoder_mode == "lyrics":
+                    example = encode_legacy(
+                        record, tokenizer, manifest["config"]["max_syllables"], scaffold=scaffold
+                    )
+                else:
+                    example = encode_example(record, tokenizer, manifest["config"]["max_syllables"])
                 if (
                     len(example["input_ids"]) > max_source_length
                     or len(example["labels"]) > max_target_length
@@ -89,11 +97,9 @@ class ProsodyCollator:
         if not examples:
             raise ValueError("Cannot collate an empty batch")
         batch = {}
-        keys = (*SOURCE_KEYS, "labels") + tuple(
-            key
-            for key in ("syllable_labels", "remainder_labels", "sentence_labels")
-            if key in examples[0]
-        )
+        keys = tuple(examples[0])
+        if any(set(example) != set(keys) for example in examples):
+            raise ValueError("Cannot mix target formats in one batch")
         for key in keys:
             padding = self.pad_token_id if key == "input_ids" else (-100 if "labels" in key else 0)
             width = max(len(example[key]) for example in examples)

@@ -17,7 +17,7 @@ from tqdm import tqdm
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def normalized_identity(value):
@@ -180,7 +180,12 @@ def prepare(config, *, limit=None):
         manifest = {
             "schema_version": SCHEMA_VERSION,
             "pronunciation": (
-                {"package": "prosodic", "version": version("prosodic"), "wordform": "first"}
+                {
+                    "package": "prosodic",
+                    "version": version("prosodic"),
+                    "wordform": "first",
+                    "rules": "ipa_binary_stress_diphthong_length_v2",
+                }
                 if data["stress_source"] == "ipa"
                 else None
             ),

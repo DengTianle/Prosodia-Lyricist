@@ -15,7 +15,9 @@ data:
 
 model:
   pretrained: facebook/bart-base
-  dropout: 0.0 # Original declares 0.2 but never applies embedding dropout.
+  decoder_mode: explainable
+  dropout: 0.3
+  transformer_dropout: 0.3
   max_source_length: 1024 # Whole song, including title, prompts, separators and BOS/EOS.
   max_target_length: 1024
 
@@ -29,17 +31,17 @@ training:
   fixed_batch_order: true
   learning_rate: 0.00005
   adam_betas: [0.9, 0.98]
-  weight_decay: 0.001
+  adam_epsilon: 0.00001
+  weight_decay: 0.0
   warmup_steps: 2500
-  # Literal original schedule: LR is ZERO from step 2500 onward.
-  # Explicit alternatives: linear, constant_after_warmup.
-  schedule: xai_original
+  # Continue learning after warmup; the partial repository used a broken -1 schedule.
+  schedule: constant_after_warmup
   gradient_clip: null
   loss_aggregation: batches
   patience: 5
-  # Original active baseline is text-only. Enable each non-text term explicitly.
+  # Paper Eq. (1): equal-weight sum of four cross-entropies.
   loss_weights:
-    word: 1.0
-    syllable: 0.0
-    remainder: 0.0
-    sentence: 0.0
+    lyrics: 1.0
+    syllables: 1.0
+    stresses: 1.0
+    lengths: 1.0

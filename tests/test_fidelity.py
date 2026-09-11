@@ -8,8 +8,8 @@ import torch
 from prosodia_lyricist import ipa
 from prosodia_lyricist.dali import extract_lines
 from prosodia_lyricist.data import ProsodyCollator
-from prosodia_lyricist.features import encode_example
-from prosodia_lyricist.model import ProsodyBart
+from prosodia_lyricist.legacy_features import encode_example
+from prosodia_lyricist.legacy_model import ProsodyBart
 from prosodia_lyricist.prepare import prepare
 from prosodia_lyricist.train import build_scheduler, run_epoch
 
@@ -32,10 +32,10 @@ def fake_backend(monkeypatch):
 
 def test_ipa_rules():
     assert ipa.syllable_features("'ɑː")["stress"] == "strong"
-    assert ipa.syllable_features("`ə")["stress"] == "substrong"
+    assert ipa.syllable_features("`ə")["stress"] == "strong"
     assert ipa.syllable_features("ə")["stress"] == "weak"
     assert ipa.syllable_features("'ɑː")["length"] == "long"
-    assert ipa.syllable_features("'aɪ")["length"] == "short"
+    assert ipa.syllable_features("'aɪ")["length"] == "long"
 
 
 def test_ipa_template_independent_of_sung_count(monkeypatch, annotation):
@@ -48,8 +48,8 @@ def test_ipa_template_independent_of_sung_count(monkeypatch, annotation):
     record = records[0]
     assert len(record["syllables"]) == 3
     assert len(record["sung_syllables"]) == 2
-    assert [s["length"] for s in record["syllables"]] == ["short", "short", "long"]
-    assert [s["stress"] for s in record["syllables"]] == ["weak", "strong", "substrong"]
+    assert [s["length"] for s in record["syllables"]] == ["short", "long", "long"]
+    assert [s["stress"] for s in record["syllables"]] == ["weak", "strong", "strong"]
     assert [w["syllable_count"] for w in record["words"]] == [2, 1]
 
 

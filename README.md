@@ -1,10 +1,12 @@
 # Prosodia Lyricist
 
-Prosody-conditioned lyric generation with BART, trained on the **DALI music
-annotation dataset**. The intended baseline follows XAI-Lyricist with a DALI dataset adapter.
-It is not yet an exact reproduction: see the [fidelity audit](docs/xai-fidelity.md)
-for restored settings, deliberate correctness fixes, and outstanding differences.
-Old checkpoints, dictionaries, and training formats are not supported.
+Explainable prosody-conditioned lyric generation with BART, trained on the
+**DALI music annotation dataset**. The default implements XAI-Lyricist's four
+aligned decoder streams, compound decoder feedback, equal-weight four-part
+cross-entropy loss, and IPA prosody correction before the next word is generated.
+See the [paper implementation notes](docs/xai-fidelity.md) for the BART subword
+adaptation and differences from the published experiment. Previous song-level
+lyrics-only checkpoints remain loadable through an explicit legacy path.
 
 ## Setup
 
@@ -49,9 +51,10 @@ prosodia-prepare --config configs/dali.yaml
 This writes `data/dali/{train,valid,test}.jsonl`, `manifest.json`, and
 `rejected.jsonl`. Each record is one complete song with an ordered `lines` list;
 the manifest records configuration, pronunciation version, song/group split
-assignments, song and line counts, and file checksums. Schema version 3 requires
-re-running preparation and training; earlier line-level data/checkpoints are
-not silently reused.
+assignments, song and line counts, and file checksums. Schema version 4 requires
+re-running preparation and training; older prepared data must be rebuilt because the IPA stress/length rules changed.
+Existing lyrics-only checkpoints can still perform legacy inference; they cannot
+be converted into trained explainable models without retraining.
 Preparation can be rerun and replaces only these generated outputs. Raw data
 and old local experiment outputs are ignored by Git.
 
@@ -86,11 +89,10 @@ values in the YAML: training checks its data settings against the manifest.
 - **Line and word membership:** DALI's parent indices link notes to words and
   words to lines. The target is the joined parent-word text.
 - **Default IPA syllables, stress, and length:** `stress_source: ipa` parses
-  lyric text with modern `prosodic`. An apostrophe or IPA `ˈ` in the syllable
-  IPA means `strong`, a backtick or `ˌ` means `substrong`, otherwise `weak`.
-  The IPA length mark `ː` means `long`, otherwise `short`. Counts and remainders
-  use IPA syllables even when DALI's sung count differs. Unpronounceable words
-  reject the song rather than silently substituting another parser.
+  lyric text with modern `prosodic`. Primary and secondary stress both map to
+  `strong`; otherwise stress is `weak`. Long-vowel marks and English diphthongs
+  map to `long`, following the paper and supplement. Counts use IPA syllables
+  even when DALI's sung count differs. Unpronounceable words reject the song.
 - **Optional sung features:** `stress_source: lexical` retains the previous
   DALI sung-count / CMUdict stress / relative-duration length mode.
   `stress_source: unknown` uses sung counts and duration with unknown stress.
@@ -98,8 +100,6 @@ values in the YAML: training checks its data settings against the manifest.
   sum sounding intervals without gaps; above-line-mean durations are long.
 - **Alignment provenance:** `sung_syllables` retains DALI note timing separately
   from the IPA template; `words` retains deterministic per-word syllable counts.
-- **Remainder:** each syllable carries the number of syllables remaining in its
-  line, with a separate padding ID.
 
 **DALI has no bar-line annotations.** No tempo, meter, downbeats, or bar lines
 are inferred from its annotation frame rate. Pronunciation stress is a lexical
@@ -137,45 +137,46 @@ batch size for available memory. A new timestamped run directory under
 `--output-dir` specifies an alternative **new** run directory.
 `--local-files-only` prevents Hugging Face downloads when models are cached.
 
-The encoder projects concatenated token, length, and remainder embeddings.
-BART shifts decoder labels for next-token prediction. Encoder padding is
-masked and target padding uses `-100`, so it contributes no loss. The default settings now match the original active training choices: AdamW,
-learning rate 5e-5, betas (0.9, 0.98), weight decay 0.001, batch size 4,
-1000 maximum epochs, 2500 warmup steps, no gradient clipping, batch-mean
-validation loss, fixed batch order, and patience 5. Embedding dropout is zero
-because the original defines but does not apply it; BART's internal dropout
-retains its pretrained configuration.
+The encoder receives `<title>…<sent_0><keywords>…<prosody>…<sent_1>…`,
+with compound stress/length embeddings at each syllable. DALI has no keywords,
+so keyword prompts are empty. The decoder produces **four aligned streams**:
+lyrics, syllable count, stress, and length. Its input concatenates the embeddings
+of all four previous symbols and projects them to BART's hidden size. All four
+streams are shifted together for causal next-event prediction.
 
-**The default `schedule: xai_original` reproduces the literal original
-`num_training_steps=-1`: learning rate becomes zero at step 2500.** Choose
-`constant_after_warmup` or `linear` explicitly to run a different schedule.
-These are experimental deviations, not silently substituted defaults.
+The paper uses lyric words as timesteps. Here, BART spells each word using BPE
+pieces and then predicts a special `<word_end>` event, which carries that word's
+three prosody labels. This avoids pronouncing incomplete BPE fragments. A word's
+stress is strong if any syllable is stressed; its length is long if any syllable
+is long. BOS/EOS, punctuation, and unfinished BPE pieces carry the auxiliary
+`pad` class 0. Batch padding is `-100` and excluded from all four losses.
 
-`training.loss_weights` controls `word`, `syllable`, `remainder`, and `sentence`
-losses. Non-text weights default to zero, matching the active original baseline.
-For example, `syllable: 1.0` and `remainder: 1.0` activate deterministic word/BPE
-label scaffolding and trainable auxiliary heads. Each word's BPE pieces share
-its syllable count and the cumulative number of syllables remaining after the
-word, resetting at each line. Sentence supervision distinguishes lyric tokens
-from BOS/EOS and period boundaries. Padding is ignored by every loss. Metrics record
-unweighted component losses and their weighted total; checkpoints save active
-heads and weights. This completes the original commented training scaffolding;
-it does not implement constrained MIDI decoding. Loading is strict; inference reconstructs
-the model entirely from its checkpoint without fetching the base model.
+The default objective is:
 
-Each training example contains a complete song, with one title prefix and one
-BOS/EOS pair per source and target. Each line contributes
-`<syllable_N><template>…<keywords>.` to the source and wordwise BPE text followed
-by a period to the target, matching the original boundaries. DALI supplies no
-keywords, so that prompt remains empty. Source and target remainders reset at
-every line; the optional binary sentence head marks lyric tokens versus
-BOS/EOS/period boundaries. Optimizer resume, distributed training, and mixed
+```text
+loss = CE_lyrics + CE_syllables + CE_stresses + CE_lengths
+```
+
+Each CE is averaged over valid target events, including non-word pad classes
+in the three prosody vocabularies. `training.loss_weights` exposes `lyrics`,
+`syllables`, `stresses`, and `lengths` for explicit ablations; all default to 1.
+Metrics record each unweighted component and the weighted sum. All heads are
+saved in the checkpoint. The default uses Adam with betas (0.9, 0.98), epsilon
+1e-5, and a warmup followed by constant LR. The partial reference repository's
+`xai_original` schedule remains available explicitly; it sets LR to zero after
+warmup and is no longer the default.
+
+`model.decoder_mode: lyrics` selects the previous experimental model, including
+its old `word`/`syllable`/`remainder`/`sentence` loss names and encoder format.
+Explainable training requires IPA-prepared data. Both modes preserve whole-song
+context, enforce source/target token limits without truncation, and write strict,
+self-contained checkpoints. Optimizer resume, distributed training, and mixed
 precision are not implemented.
 
 ## MIDI inference
 
 MIDI remains the inference input. All phrases are encoded together under one
-title and decoded in one call, giving the same song-level context as training.
+title and decoded with one shared song context, giving the same song-level context as training.
 Generated periods become output line breaks. The model learns boundaries but
 does not enforce the requested number of lines. The default generation budget
 is the checkpoint target limit minus one decoder-start token (1023 for the
@@ -188,7 +189,8 @@ prosodia-infer \
   --checkpoint checkpoints/dali/RUN_ID/best \
   --midi examples/imagine.mid \
   --title Imagine \
-  --output outputs/imagine.txt
+  --output outputs/imagine.txt \
+  --explanations outputs/imagine.prosody.json
 ```
 
 Choose a monophonic melody with `--track` (default 0). Markers are interpreted
@@ -197,16 +199,26 @@ A trailing phrase after the final marker is retained. Each note is assumed to
 represent one syllable at this stage. MIDI melisma and explicit beat/bar marker
 support remain future evaluation work.
 
-The default MIDI stress feature uses the earlier project's duration-dependent
-four-beat heuristic, while default DALI training uses IPA stress and vowel length. This is a known
-conditioning mismatch to revisit when beat markers are available. Pass
-`--stress-source unknown` to disable the heuristic; this is the automatic
-choice for checkpoints trained with `stress_source: unknown`. Duration uses
-the relative phrase-mean rule of the optional sung training mode; this differs
-from default IPA vowel length. `--top-k 1` uses greedy
-prediction; larger values sample with `--temperature`. Generation is
-conditioned on prosody but does not enforce a hard syllable-count constraint.
-The old experimental parody and saliency scripts have been removed.
+The MIDI stress feature uses the duration-dependent four-beat heuristic from
+the reference project; sub-strong beats map to strong in the paper's binary
+vocabulary. `--stress-source unknown` disables the heuristic. MIDI lengths use
+relative note duration; training lengths use IPA vowels and diphthongs. These
+are the paper's two routes into a shared prosody representation.
+
+`--top-k 1` uses greedy decoding; larger values use top-k temperature sampling.
+At each `<word_end>`, all three prosody heads sample a non-pad label. The IPA
+parser recomputes the completed word's labels, replaces disagreements, and
+feeds the corrected compound event into the cached decoder **before** the next
+word. Missing pronunciation fails explicitly. `--no-prosody-correction` is an
+ablation that instead feeds back sampled labels without calling IPA.
+
+`--explanations` writes the four aligned streams, readable token strings,
+per-word sampled/corrected labels, full IPA syllables, source melody features,
+and completion status. Python callers can use `infer(..., return_explanations=True)`
+or `model.generate(..., tokenizer=tokenizer)` for structured results. The text
+output contains only lyrics. If the token budget cuts a word short, that unfinished
+word is excluded and reported as `truncated_word` in the JSON. Generation remains
+softly conditioned: it does not enforce the requested number of syllables or lines.
 
 ## Development
 
@@ -218,7 +230,7 @@ ruff format --check prosodia_lyricist tests
 
 Tests use synthetic annotations and a tiny local tokenizer/model; no DALI
 files or model downloads are needed. Real IPA integration tests run when
-`prosodic` is installed and require its tokenizer/pronunciation resources. They cover IPA feature rules with a test backend, auxiliary-head gradients and
+`prosodic` is installed and require its tokenizer/pronunciation resources. They cover IPA feature rules with a test backend, four-stream gradients, causal shifting, correction feedback, and
 reload, song packing, source/target period boundaries, exact 1024-token limits,
 whole-song rejection, modern IPA pronunciation selection, original scheduler behavior, exact-ID/language filtering, parent alignment, melisma,
 invalid annotations, lexical stress, split reproducibility, padding, shifted
@@ -228,10 +240,12 @@ labels, optimization, checkpoint reload/generation, and MIDI phrase handling.
 prosodia_lyricist/
   dali.py          DALI reader and aligned prosody extraction
   prepare.py       JSONL preparation, splits, and provenance
-  ipa.py           original IPA pronunciation and deterministic word scaffolding
+  ipa.py           paper IPA rules and deterministic pronunciation
   features.py      shared template encoding
   data.py          dataset validation and batch padding
-  model.py         compound embeddings and BART checkpoint IO
+  model.py         four-stream compound embeddings, losses, and checkpoint IO
+  generation.py    word completion, prosody sampling, and IPA correction
+  legacy_*.py      previous lyrics-only experimental model and encoding
   train.py         training and validation
   midi.py          MIDI phrase/prosody conversion
   infer.py         MIDI generation CLI

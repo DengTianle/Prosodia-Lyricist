@@ -2,20 +2,19 @@
 
 from functools import lru_cache
 
+# English IPA diphthongs, including common British and American transcriptions.
+DIPHTHONGS = ("eɪ", "aɪ", "ɔɪ", "əʊ", "oʊ", "aʊ", "ɪə", "eə", "ɛə", "ʊə")
+
 
 def syllable_features(syllable):
     # Modern Syllable.__str__ displays orthography, not IPA.
     ipa = syllable if isinstance(syllable, str) else syllable.ipa
     return {
         "ipa": ipa,
-        "stress": (
-            "strong"
-            if any(mark in ipa for mark in ("'", "ˈ"))
-            else "substrong"
-            if any(mark in ipa for mark in ("`", "ˌ"))
-            else "weak"
-        ),
-        "length": "long" if "ː" in ipa else "short",
+        "stress": "strong" if any(mark in ipa for mark in ("'", "ˈ", "`", "ˌ", '"')) else "weak",
+        "length": "long"
+        if "ː" in ipa or ":" in ipa or any(d in ipa for d in DIPHTHONGS)
+        else "short",
     }
 
 
@@ -25,14 +24,14 @@ def backend():
         import prosodic
     except ImportError as exc:
         raise RuntimeError(
-            "IPA preparation requires modern prosodic; install the ipa extra"
+            "IPA preparation/correction requires modern prosodic; install the ipa extra"
         ) from exc
     try:
         # Materialize lazy words too, so missing resources fail before output creation.
         list(prosodic.Text("hello", lang="en", syntax=False).wordtokens)
     except (AttributeError, LookupError) as exc:
         raise RuntimeError(
-            "IPA preparation requires prosodic>=3.10 and its pronunciation/tokenizer "
+            "IPA preparation/correction requires prosodic>=3.10 and its pronunciation/tokenizer "
             "resources. Install the ipa extra and NLTK punkt/punkt_tab data."
         ) from exc
     return prosodic

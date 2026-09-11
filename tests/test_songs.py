@@ -7,7 +7,7 @@ import pytest
 
 from prosodia_lyricist import ipa
 from prosodia_lyricist.data import LyricDataset, read_manifest
-from prosodia_lyricist.features import SOURCE_KEYS, encode_example
+from prosodia_lyricist.legacy_features import SOURCE_KEYS, encode_example
 from prosodia_lyricist.prepare import prepare
 
 
@@ -53,7 +53,13 @@ def test_two_lines_one_example_with_original_boundaries(tmp_path, annotation, to
     assert [line["line_id"] for line in song["lines"]] == [0, 1]
     assert [line["text"] for line in song["lines"]] == ["hello world", "light"]
     dataset = LyricDataset(
-        directory, split, tokenizer, max_source_length=1024, max_target_length=1024, scaffold=True
+        directory,
+        split,
+        tokenizer,
+        decoder_mode="lyrics",
+        max_source_length=1024,
+        max_target_length=1024,
+        scaffold=True,
     )
     assert len(dataset) == 1
     example = dataset[0]
@@ -131,7 +137,12 @@ def test_complete_song_limits_inclusive_and_never_truncated(tmp_path, annotation
     key = "input_ids" if side == "source" else "labels"
     assert [len(encode_example(row, tokenizer, 8)[key]) for row in rows[1:]] == [1024, 1025]
     dataset = LyricDataset(
-        directory, split, tokenizer, max_source_length=1024, max_target_length=1024
+        directory,
+        split,
+        tokenizer,
+        decoder_mode="lyrics",
+        max_source_length=1024,
+        max_target_length=1024,
     )
     assert len(dataset) == 2
     assert dataset.skipped == 1
@@ -152,7 +163,7 @@ def test_modern_syllable_uses_ipa_not_display_text():
         "stress": "strong",
         "length": "long",
     }
-    assert ipa.syllable_features(SimpleNamespace(ipa="ˌaɪ"))["stress"] == "substrong"
+    assert ipa.syllable_features(SimpleNamespace(ipa="ˌaɪ"))["stress"] == "strong"
 
 
 def test_modern_parser_selects_one_wordform_and_preserves_repetition():
@@ -183,7 +194,7 @@ def test_midi_song_generated_once_and_limits_checked(
     import torch
 
     from prosodia_lyricist import infer as inference
-    from prosodia_lyricist.model import ProsodyBart
+    from prosodia_lyricist.legacy_model import ProsodyBart
     from prosodia_lyricist.prepare import SCHEMA_VERSION
 
     tiny_model.save(tmp_path, tokenizer)
@@ -247,6 +258,7 @@ def test_limits_apply_to_combined_song(tmp_path, annotation, tokenizer, source_l
             directory,
             split,
             tokenizer,
+            decoder_mode="lyrics",
             max_source_length=source_limit,
             max_target_length=target_limit,
         )

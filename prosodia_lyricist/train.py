@@ -131,6 +131,11 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
         config["model"]["pretrained"], local_files_only=local_files_only
     )
     configure_tokenizer(tokenizer, max_syllables)
+    decoder_mode = config["model"].get("decoder_mode", "explainable")
+    if decoder_mode not in ("explainable", "lyrics"):
+        raise ValueError("decoder_mode must be explainable or lyrics")
+    if decoder_mode == "explainable" and config["data"]["stress_source"] != "ipa":
+        raise ValueError("Explainable training requires stress_source: ipa; prepare again")
     loss_weights = settings.get("loss_weights", {})
     scaffold = any(loss_weights.get(k, 0) > 0 for k in ("syllable", "remainder", "sentence"))
     datasets = {
@@ -142,6 +147,7 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
             max_target_length=config["model"]["max_target_length"],
             limit=16 if smoke_test else None,
             scaffold=scaffold,
+            decoder_mode=decoder_mode,
         )
         for split in ("train", "valid")
     }
@@ -176,6 +182,7 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
         # Exercises real BART tokenization/data/optimization without downloading base weights.
         bart_config = BartConfig(
             vocab_size=len(tokenizer),
+            dropout=config["model"].get("transformer_dropout", 0.3),
             d_model=32,
             encoder_layers=1,
             decoder_layers=1,
@@ -193,15 +200,22 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
         )
         bart = BartForConditionalGeneration(bart_config)
     else:
+        overrides = {}
+        if decoder_mode == "explainable":
+            overrides["dropout"] = config["model"].get("transformer_dropout", 0.3)
         bart = BartForConditionalGeneration.from_pretrained(
             config["model"]["pretrained"],
             local_files_only=local_files_only,
+            **overrides,
         )
         bart.resize_token_embeddings(len(tokenizer))
     for key in ("max_source_length", "max_target_length"):
         if not 2 <= config["model"][key] <= bart.config.max_position_embeddings:
             raise ValueError(f"{key} exceeds BART's position limit or is less than 2")
-    model = ProsodyBart(
+    model_class = ProsodyBart
+    if decoder_mode == "lyrics":
+        from .legacy_model import ProsodyBart as model_class
+    model = model_class(
         bart,
         max_syllables=max_syllables,
         dropout=config["model"]["dropout"],
@@ -211,11 +225,13 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     max_batches = 2 if smoke_test else None
     steps_per_epoch = min(len(loaders["train"]), max_batches or len(loaders["train"]))
     total_steps = epochs * steps_per_epoch
-    optimizer = torch.optim.AdamW(
+    optimizer_class = torch.optim.Adam if decoder_mode == "explainable" else torch.optim.AdamW
+    optimizer = optimizer_class(
         model.parameters(),
         lr=settings["learning_rate"],
         weight_decay=settings["weight_decay"],
         betas=tuple(settings.get("adam_betas", (0.9, 0.98))),
+        eps=settings.get("adam_epsilon", 1e-5 if decoder_mode == "explainable" else 1e-8),
     )
     scheduler = build_scheduler(optimizer, settings, total_steps)
     if settings.get("schedule") == "xai_original":
@@ -230,6 +246,7 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     output.mkdir(parents=True, exist_ok=False)
     run = {
         "config": config,
+        "decoder_mode": decoder_mode,
         "smoke_test": smoke_test,
         "total_steps": total_steps,
         "data_counts": manifest["counts"],
