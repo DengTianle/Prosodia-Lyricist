@@ -188,7 +188,9 @@ prosodia-infer \
   --checkpoint checkpoints/dali/RUN_ID/best \
   --midi examples/imagine.mid \
   --title Imagine \
-  --output outputs/imagine.txt
+  --top-k 1 \
+  --output outputs/imagine.txt \
+  --report-prefix outputs/imagine
 ```
 
 Choose a monophonic melody with `--track` (default 0). Markers are interpreted
@@ -197,16 +199,36 @@ A trailing phrase after the final marker is retained. Each note is assumed to
 represent one syllable at this stage. MIDI melisma and explicit beat/bar marker
 support remain future evaluation work.
 
-The default MIDI stress feature uses the earlier project's duration-dependent
-four-beat heuristic, while default DALI training uses IPA stress and vowel length. This is a known
-conditioning mismatch to revisit when beat markers are available. Pass
-`--stress-source unknown` to disable the heuristic; this is the automatic
-choice for checkpoints trained with `stress_source: unknown`. Duration uses
-the relative phrase-mean rule of the optional sung training mode; this differs
-from default IPA vowel length. `--top-k 1` uses greedy
-prediction; larger values sample with `--temperature`. Generation is
-conditioned on prosody but does not enforce a hard syllable-count constraint.
-The old experimental parody and saliency scripts have been removed.
+The default `--stress-source supplement` uses the supplement's duration-dependent
+4/4 pattern, nearest note-type-grid quantization, and melody-mean note length.
+The supplement leaves formula details ambiguous; the exact operational choices
+and differences from the public reference code are documented in
+[the evaluation guide](docs/evaluation.md). Explicit non-4/4 meters are rejected.
+Tick zero anchors the metrical grid; beat/bar markers are not required. Historical
+`--stress-source heuristic` retains the previous unquantized rule and phrase mean.
+`unknown` disables stress and remains the automatic mode for unknown-trained
+checkpoints. The historical baseline's IPA training features remain unchanged.
+
+`--report-prefix` writes readable Markdown and structured JSON, including the
+input/output templates, note positions, generated words/IPA, phrase counts,
+prosody-BLEU-4, and generated-sequence conditional perplexity (a self-score).
+Add `--reference path/to/lyrics.txt` for separate reference perplexity, with one
+nonempty line per MIDI phrase. See the guide for precise metric conventions and
+reproduction limits. Reports require the `ipa` extra and its tokenizer resources.
+Output files are never overwritten; use a new prefix for each run.
+
+The Imagine example contains 113 notes and 16 markers **plus an unmarked tail**:
+all 17 phrases are passed in together. Inspect its template without a model:
+
+```bash
+python -m prosodia_lyricist.infer --midi examples/imagine.mid --title Imagine \
+  --template-only --report-prefix outputs/imagine-template
+```
+
+`--top-k 1` uses greedy prediction; larger values sample with `--temperature`.
+Generation does not enforce syllable or phrase counts; reports retain and flag
+missing/extra phrases. The old experimental parody and saliency scripts have
+been removed.
 
 ## Development
 
@@ -235,6 +257,8 @@ prosodia_lyricist/
   train.py         training and validation
   midi.py          MIDI phrase/prosody conversion
   infer.py         MIDI generation CLI
+  evaluation.py    independent prosody-BLEU and conditional perplexity
+  report.py        readable Markdown and structured JSON sanity-check reports
   config.py        configuration loading
   runtime.py       seeds and device selection
 configs/dali.yaml  project defaults

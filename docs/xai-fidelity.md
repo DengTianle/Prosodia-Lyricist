@@ -92,9 +92,11 @@ affects remainder supervision. Sentence supervision remains a binary lyric/bound
 than a distinct class for each phrase. The original active text binarizer also
 resets its line index inside each one-line text sample.
 
-This work restores training scaffolding. Hard syllable constraints, word-by-word
-pronunciation feedback during decoding, and MIDI evaluation are not implemented
-or validated by these auxiliary objectives.
+This work restores training scaffolding. Hard syllable constraints and word-by-word
+pronunciation feedback during decoding are not implemented or validated by these
+auxiliary objectives. MIDI evaluation is now implemented separately; see
+[the evaluation guide](evaluation.md) for the supplement-based inference mode,
+conditional BPE perplexity, joint prosody-BLEU, reports, and reproduction limits.
 
 ## DALI adapter differences
 
