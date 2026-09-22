@@ -200,6 +200,8 @@ def generate_templates(
                 "lines": [line.strip() for line in text.split(".") if line.strip()] or [""],
                 "words": words,
                 "completed": complete,
+                "generated_events": step + 1,
+                "hit_token_limit": not complete,
                 "truncated_word": unfinished,
                 "prosody_correction": prosody_correction,
                 "label_vocabulary": {

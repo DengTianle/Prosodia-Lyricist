@@ -70,6 +70,11 @@ reproduction of the published experiment:
 - MIDI inference still assumes a monophonic melody with phrase-end markers and
   one note per syllable. Beat inference, melisma alignment, and the paper's
   musical-score visualization are not added by this model change.
+- The shared baseline evaluation port adds the documented supplement MIDI mode,
+  joint prosody-BLEU, and readable reports. Compound-decoder perplexity replays
+  prior feedback features and excludes auxiliary losses; its additional
+  conditioning differs from legacy plain-text perplexity. See
+  [evaluation conventions and reproduction limits](evaluation.md).
 - Training remains single-device full precision with early stopping; optimizer
   resume and distributed training are not implemented.
 

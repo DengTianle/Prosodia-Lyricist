@@ -1,6 +1,6 @@
 import pytest
 
-from prosodia_lyricist.midi import midi_records
+from prosodia_lyricist.midi import midi_records, supplement_stress
 
 miditoolkit = pytest.importorskip("miditoolkit")
 
@@ -37,3 +37,53 @@ def test_missing_markers_and_polyphonic_track(tmp_path):
     make_midi(path, overlap=True)
     with pytest.raises(ValueError, match="monophonic"):
         midi_records(path)
+
+
+@pytest.mark.parametrize("duration", [480, 240, 120])
+def test_supplement_figure_one(duration):
+    assert [supplement_stress(i * duration, duration, 480) for i in range(4)] == [
+        "strong",
+        "weak",
+        "strong",
+        "weak",
+    ]
+
+
+def test_supplement_rounding_fallback_and_melody_mean(tmp_path):
+    assert supplement_stress(119, 240, 480) == "strong"
+    assert supplement_stress(120, 240, 480) == "weak"  # Exact tie rounds upward.
+    assert supplement_stress(720, 360, 480) == "strong"  # Dotted: quarter-note grid.
+    path = tmp_path / "means.mid"
+    make_midi(path)
+    midi = miditoolkit.MidiFile(str(path))
+    midi.instruments[0].notes[-1].end = 2400
+    midi.dump(str(path))
+    supplement = midi_records(path)
+    historical = midi_records(path, stress_source="heuristic")
+    assert supplement[0]["length_threshold_ticks"] == 640
+    assert supplement[0]["syllables"][1]["length"] == "short"
+    assert historical[0]["syllables"][1]["length"] == "long"
+
+
+def test_supplement_rejects_non_four_four(tmp_path):
+    path = tmp_path / "waltz.mid"
+    make_midi(path)
+    midi = miditoolkit.MidiFile(str(path))
+    midi.time_signature_changes = [miditoolkit.TimeSignature(3, 4, 0)]
+    midi.dump(str(path))
+    with pytest.raises(ValueError, match="only 4/4"):
+        midi_records(path)
+
+
+def test_imagine_all_notes_and_marker_onsets_preserved():
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "imagine.mid"
+    records = midi_records(path)
+    assert len(records) == 17  # 16 markers plus an unmarked trailing phrase.
+    assert sum(len(r["syllables"]) for r in records) == 113
+    assert len(records[0]["syllables"]) == 7
+    assert records[0]["syllables"][-1]["note"]["start_tick"] == 1800
+    assert {r["length_threshold_ticks"] for r in records} == {
+        sum(s["note"]["duration_ticks"] for r in records for s in r["syllables"]) / 113
+    }

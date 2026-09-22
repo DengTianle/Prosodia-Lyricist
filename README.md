@@ -189,8 +189,10 @@ prosodia-infer \
   --checkpoint checkpoints/dali/RUN_ID/best \
   --midi examples/imagine.mid \
   --title Imagine \
+  --top-k 1 \
   --output outputs/imagine.txt \
-  --explanations outputs/imagine.prosody.json
+  --explanations outputs/imagine.prosody.json \
+  --report-prefix outputs/imagine
 ```
 
 Choose a monophonic melody with `--track` (default 0). Markers are interpreted
@@ -199,18 +201,40 @@ A trailing phrase after the final marker is retained. Each note is assumed to
 represent one syllable at this stage. MIDI melisma and explicit beat/bar marker
 support remain future evaluation work.
 
-The MIDI stress feature uses the duration-dependent four-beat heuristic from
-the reference project; sub-strong beats map to strong in the paper's binary
-vocabulary. `--stress-source unknown` disables the heuristic. MIDI lengths use
-relative note duration; training lengths use IPA vowels and diphthongs. These
-are the paper's two routes into a shared prosody representation.
+Default `--stress-source supplement` matches the baseline evaluation's explicit
+reconstruction: duration-dependent 4/4 strength, nearest note-type-grid rounding,
+and melody-mean duration. The [evaluation guide](docs/evaluation.md) records the
+supplement's ambiguities and exact conventions. Tick zero anchors the grid;
+explicit non-4/4 meters are rejected. `heuristic` preserves the historical
+unquantized strength/phrase-mean behavior; `unknown` disables stress.
+
+Imagine has 113 notes and 16 phrase markers plus an unmarked tail, yielding
+**17 phrases in one model input**. A trained template-decoder checkpoint is
+needed for lyrics. Inspect the musical template without any checkpoint:
+
+```bash
+python -m prosodia_lyricist.infer --midi examples/imagine.mid --title Imagine \
+  --template-only --report-prefix outputs/imagine-template-decoder-template
+```
+
+`--report-prefix PREFIX` writes `PREFIX.md` and `PREFIX.json`: musical and
+generated templates, IPA, note positions, predicted/corrected decoder features,
+phrase counts, prosody-BLEU-4 with n-gram diagnostics, and conditional perplexity.
+`--reference lyrics.txt` adds reference scoring (one nonempty line per input
+phrase), without giving those words to generation. Generated-text PPL is a
+self-score. Explainable scoring replays all four causal streams, excludes
+auxiliary losses, and reports lyric-BPE and all-event PPL separately. The
+extra decoder history limits direct PPL comparison with baseline. Prosody-BLEU
+uses the same independent extractor and formula in both branches; see the
+guide for limitations relative to the paper. Output paths must be new.
 
 `--top-k 1` uses greedy decoding; larger values use top-k temperature sampling.
 At each `<word_end>`, all three prosody heads sample a non-pad label. The IPA
 parser recomputes the completed word's labels, replaces disagreements, and
 feeds the corrected compound event into the cached decoder **before** the next
 word. Missing pronunciation fails explicitly. `--no-prosody-correction` is an
-ablation that instead feeds back sampled labels without calling IPA.
+ablation that instead feeds back sampled labels without calling IPA during
+generation; reporting still extracts IPA independently for evaluation.
 
 `--explanations` writes the four aligned streams, readable token strings,
 per-word sampled/corrected labels, full IPA syllables, source melody features,
@@ -249,6 +273,8 @@ prosodia_lyricist/
   train.py         training and validation
   midi.py          MIDI phrase/prosody conversion
   infer.py         MIDI generation CLI
+  evaluation.py    independent prosody-BLEU and causal conditional perplexity
+  report.py        Markdown/JSON template, lyrics, and decoder-feedback reports
   config.py        configuration loading
   runtime.py       seeds and device selection
 configs/dali.yaml  project defaults
