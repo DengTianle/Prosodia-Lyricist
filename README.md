@@ -90,12 +90,17 @@ values in the YAML: training checks its data settings against the manifest.
   IPA means `strong`, a backtick or `ˌ` means `substrong`, otherwise `weak`.
   The IPA length mark `ː` means `long`, otherwise `short`. Counts and remainders
   use IPA syllables even when DALI's sung count differs. Unpronounceable words
-  reject the song rather than silently substituting another parser.
+  reject the song rather than silently substituting another parser. Punctuation
+  tokens, including question marks, are retained with zero syllables.
 - **Optional sung features:** `stress_source: lexical` retains the previous
   DALI sung-count / CMUdict stress / relative-duration length mode.
   `stress_source: unknown` uses sung counts and duration with unknown stress.
   Empty or `~` continuation notes merge into the preceding syllable. Durations
   sum sounding intervals without gaps; above-line-mean durations are long.
+  Empty parent words containing only explicit `~` markers extend the preceding
+  word within the same line, after validating their original timing bounds.
+  Missing lyric text with ordinary notes and continuations starting a line still
+  reject the song; neighboring text fragments are never guessed or joined.
 - **Alignment provenance:** `sung_syllables` retains DALI note timing separately
   from the IPA template; `words` retains deterministic per-word syllable counts.
 - **Remainder:** each syllable carries the number of syllables remaining in its

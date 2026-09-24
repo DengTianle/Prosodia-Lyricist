@@ -62,7 +62,9 @@ def _parse_words(text):
         token = word.txt.strip()
         if not token:
             continue
-        if "?" in token or (any(c.isalpha() for c in token) and not syllables):
+        # Punctuation tokens (including '?') have no pronunciation by design.
+        # Retain them with zero syllables, just like commas and exclamation marks.
+        if any(c.isalpha() for c in token) and not syllables:
             raise ValueError(f"No IPA pronunciation for {token!r}")
         words.append({"text": token, "syllables": syllables})
     if not words or not any(w["syllables"] for w in words):
