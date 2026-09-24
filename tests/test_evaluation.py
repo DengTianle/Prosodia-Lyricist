@@ -164,7 +164,9 @@ def test_inference_report_and_template_cli(tmp_path, tokenizer, tiny_model, monk
     monkeypatch.setattr(
         evaluation.ipa,
         "parse_words",
-        lambda text: [{"text": word, "syllables": []} for word in text.split()],
+        lambda text: [
+            {"text": word, "syllables": [{"ipa": "ˈaɪ"}]} for word in text.split()
+        ],
     )
     with_reference = infer.infer(
         checkpoint,
@@ -177,6 +179,16 @@ def test_inference_report_and_template_cli(tmp_path, tokenizer, tiny_model, monk
     assert with_reference["reference_perplexity"] == report["generated_perplexity"]
     assert with_reference["encoded_source"] == report["encoded_source"]
     assert with_reference["generated_token_ids"] == report["generated_token_ids"]
+    assert with_reference["reference_syllables"][0][0] == {
+        "word": "hello", "ipa": "ˈaɪ", "stress": "strong", "length": "long"
+    }
+    reference_md = markdown_report(with_reference)
+    assert "Ground-truth lyrics: hello world" in reference_md
+    assert "Ground-truth prosody (derived from lyric IPA): 2 syllables." in reference_md
+    assert "`<strong,long> <strong,long>`" in reference_md
+    assert "Ground-truth word / IPA | Ground-truth prosody |" in reference_md
+    assert "hello / ˈaɪ | <strong,long>" in reference_md
+    assert "Ground-truth" not in markdown_report(report)
     monkeypatch.setattr(
         "sys.argv",
         ["infer", "--midi", str(path), "--template-only", "--report-prefix", str(tmp_path / "tpl")],

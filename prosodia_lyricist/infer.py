@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from .evaluation import conditional_perplexity, evaluate_prosody
+from .evaluation import conditional_perplexity, evaluate_prosody, paper_syllable
 from .features import encode_source
 from .midi import midi_records
 from .model import ProsodyBart
@@ -135,14 +135,22 @@ def infer(
         from .ipa import parse_words
 
         labels = [tokenizer.bos_token_id]
+        reference_syllables = []
         for line in reference_lines:
-            for word in parse_words(line):
+            words = parse_words(line)
+            reference_syllables.append([
+                {**paper_syllable(syllable), "word": word["text"]}
+                for word in words
+                for syllable in word["syllables"]
+            ])
+            for word in words:
                 labels.extend(tokenizer.encode(" " + word["text"], add_special_tokens=False))
             labels.extend(tokenizer.encode(".", add_special_tokens=False))
         labels.append(tokenizer.eos_token_id)
         if len(labels) > target_limit:
             raise ValueError("Reference exceeds checkpoint target token limit; no truncation")
         report["reference_lines"] = reference_lines
+        report["reference_syllables"] = reference_syllables
         report["reference_perplexity"] = conditional_perplexity(
             model, inputs, torch.tensor([labels], device=device), tokenizer
         )

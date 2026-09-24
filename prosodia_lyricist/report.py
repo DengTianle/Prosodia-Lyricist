@@ -67,6 +67,9 @@ def markdown_report(report):
     for index in range(count):
         source = report["template"][index] if index < len(report["template"]) else None
         entry = metrics["phrases"][index] if metrics else None
+        references = report.get("reference_lines", [])
+        reference_labels = report.get("reference_syllables", [])
+        reference = reference_labels[index] if index < len(reference_labels) else []
         rows.extend(["", f"## Phrase {index + 1}", ""])
         if source:
             rows.extend(
@@ -93,18 +96,33 @@ def markdown_report(report):
                 rows.append(f"**Scoring issue:** {escaped(entry['error'])}")
             else:
                 rows.extend(["", f"`{pattern(entry['generated_syllables'])}`"])
+        if index < len(references):
+            rows.extend(["", f"Ground-truth lyrics: {escaped(references[index])}"])
+            if index < len(reference_labels):
+                rows.extend([
+                    "",
+                    f"Ground-truth prosody (derived from lyric IPA): {len(reference)} syllables.",
+                    "",
+                    f"`{pattern(reference)}`",
+                ])
+        reference_columns = bool(references)
         rows.extend(
             [
                 "",
                 "Position-by-position inspection only; this is not a fitted lyric/note alignment.",
                 "",
-                "| Slot | Note | Start–end ticks | Bar:beat | Input | Word / IPA | Output |",
-                "| --- | --- | --- | --- | --- | --- | --- |",
+                "| Slot | Note | Start–end ticks | Bar:beat | Input | Word / IPA | Output |"
+                + (
+                    " Ground-truth word / IPA | Ground-truth prosody |"
+                    if reference_columns else ""
+                ),
+                "| --- | --- | --- | --- | --- | --- | --- |"
+                + (" --- | --- |" if reference_columns else ""),
             ]
         )
         syllables = source["syllables"] if source else []
         generated = (entry["generated_syllables"] or []) if entry else []
-        for slot in range(max(len(syllables), len(generated))):
+        for slot in range(max(len(syllables), len(generated), len(reference))):
             inp = syllables[slot] if slot < len(syllables) else None
             out = generated[slot] if slot < len(generated) else None
             note = inp["note"] if inp else None
@@ -117,6 +135,12 @@ def markdown_report(report):
                 f"{out['word']} / {out['ipa']}" if out else "—",
                 pattern([out]) if out else "—",
             ]
+            if reference_columns:
+                truth = reference[slot] if slot < len(reference) else None
+                cells.extend([
+                    f"{truth['word']} / {truth['ipa']}" if truth else "—",
+                    pattern([truth]) if truth else "—",
+                ])
             rows.append("| " + " | ".join(escaped(c) for c in cells) + " |")
     return "\n".join(rows) + "\n"
 
