@@ -86,6 +86,7 @@ def infer(
     inputs = {key: torch.tensor([value], device=device) for key, value in encoded.items()}
     generation = {
         "max_new_tokens": max_new_tokens,
+        "num_beams": 1,
         "do_sample": top_k > 1,
         "bad_words_ids": [
             [tokenizer.convert_tokens_to_ids(token)]

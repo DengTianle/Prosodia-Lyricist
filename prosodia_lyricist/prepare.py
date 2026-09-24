@@ -17,7 +17,7 @@ from tqdm import tqdm
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 3 #dataset version number to prevent mixing with legacy prep versions
 
 
 def normalized_identity(value):
