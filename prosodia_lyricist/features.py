@@ -82,6 +82,12 @@ def word_prosody(syllables):
 
 def encode_example(record, tokenizer, max_syllables):
     example = encode_source(record, tokenizer, max_syllables)
+    example.update(encode_targets(record, tokenizer, max_syllables))
+    return example
+
+
+def encode_targets(record, tokenizer, max_syllables):
+    """Build four causal targets independently of the conditioning modality."""
     streams = [[tokenizer.bos_token_id], [0], [0], [0]]
 
     def append(token, prosody=(0, 0, 0)):
@@ -115,5 +121,4 @@ def encode_example(record, tokenizer, max_syllables):
         for token in tokenizer.encode(".", add_special_tokens=False):
             append(token)
     append(tokenizer.eos_token_id)
-    example.update(zip(TARGET_KEYS, streams, strict=True))
-    return example
+    return dict(zip(TARGET_KEYS, streams, strict=True))

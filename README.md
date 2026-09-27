@@ -8,6 +8,12 @@ See the [paper implementation notes](docs/xai-fidelity.md) for the BART subword
 adaptation and differences from the published experiment. Previous song-level
 lyrics-only checkpoints remain loadable through an explicit legacy path.
 
+**Direct melody conditioning (option A):** `configs/melody.yaml` adds the pretrained
+`try-contrastive/two-pool` melody encoder while retaining this four-stream decoder.
+Melody windows are packed into one shared song or paragraph context. See the
+[implementation and training guide](docs/melody-direct.md), including the explanation
+of individual note vectors versus CLS/mean pooling and H100 memory settings.
+
 ## Setup
 
 Use the existing Conda environment (its name on this machine is

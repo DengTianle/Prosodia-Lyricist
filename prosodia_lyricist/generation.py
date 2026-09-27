@@ -48,6 +48,7 @@ def generate_templates(
     top_k=3,
     prosody_correction=True,
     pronunciation=None,
+    source_embeds=None,
 ):
     """Generate one independent song per batch row, preserving four aligned streams.
 
@@ -82,7 +83,9 @@ def generate_templates(
     word_level = type(tokenizer.backend_tokenizer.model).__name__ == "WordLevel"
     all_ids = set(range(len(tokenizer))) - forbidden
     encoder = model.bart.get_encoder()(
-        inputs_embeds=model.embed_source(input_ids, length_ids),
+        inputs_embeds=(
+            model.embed_source(input_ids, length_ids) if source_embeds is None else source_embeds
+        ),
         attention_mask=attention_mask,
         return_dict=True,
     )

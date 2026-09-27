@@ -50,6 +50,27 @@ def infer(
         raise ValueError("temperature, top_k, and max_new_tokens must be positive")
     seed_everything(seed)
     checkpoint = Path(checkpoint)
+    if (checkpoint / "melody.json").exists():
+        from .melody_infer import infer_melody
+
+        if return_report or reference_lines is not None or stress_source is not None:
+            raise ValueError(
+                "Direct melody inference uses note inputs; template reports/stress heuristics "
+                "are unsupported. Use --explanations for four-stream output."
+            )
+        return infer_melody(
+            checkpoint,
+            midi,
+            title=title,
+            track=track,
+            device=device,
+            temperature=temperature,
+            top_k=top_k,
+            max_new_tokens=max_new_tokens,
+            seed=seed,
+            return_explanations=return_explanations,
+            prosody_correction=prosody_correction,
+        )
     run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
     if run.get("data_schema_version") not in (3, SCHEMA_VERSION):
         raise ValueError("Checkpoint uses an older input scheme; prepare and train song-level data")

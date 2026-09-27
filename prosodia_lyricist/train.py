@@ -104,6 +104,15 @@ def build_scheduler(optimizer, settings, total_steps):
 
 
 def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
+    if config["model"].get("conditioning") == "melody":
+        from .melody_train import train_melody
+
+        return train_melody(
+            config,
+            output_dir=output_dir,
+            smoke_test=smoke_test,
+            local_files_only=local_files_only,
+        )
     settings = config["training"]
     if any(settings[key] < 1 for key in ("epochs", "batch_size", "patience")):
         raise ValueError("epochs, batch_size, and patience must be positive")

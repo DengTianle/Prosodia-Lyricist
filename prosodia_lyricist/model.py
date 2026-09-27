@@ -82,6 +82,25 @@ class ProsodyBart(nn.Module):
         stress_labels,
         length_labels,
     ):
+        return self.forward_embedded(
+            self.embed_source(input_ids, length_ids),
+            attention_mask,
+            labels,
+            syllable_labels,
+            stress_labels,
+            length_labels,
+        )
+
+    def forward_embedded(
+        self,
+        source_embeds,
+        attention_mask,
+        labels,
+        syllable_labels,
+        stress_labels,
+        length_labels,
+    ):
+        """Shared four-stream objective for template and melody conditioning."""
         targets = (syllable_labels, stress_labels, length_labels)
         for target in targets:
             if target.shape != labels.shape or not torch.equal(target.eq(-100), labels.eq(-100)):
@@ -91,7 +110,7 @@ class ProsodyBart(nn.Module):
         decoder_mask = torch.ones_like(labels)
         decoder_mask[:, 1:] = labels[:, :-1].ne(-100)
         output = self.bart(
-            inputs_embeds=self.embed_source(input_ids, length_ids),
+            inputs_embeds=source_embeds,
             attention_mask=attention_mask,
             decoder_inputs_embeds=self.embed_target(decoder_ids, *decoder_features),
             decoder_attention_mask=decoder_mask,
@@ -141,6 +160,10 @@ class ProsodyBart(nn.Module):
     @classmethod
     def load(cls, directory):
         directory = Path(directory)
+        if (directory / "melody.json").exists():
+            from .melody_model import MelodyBart
+
+            return MelodyBart.load(directory)
         metadata = json.loads((directory / "prosody.json").read_text(encoding="utf-8"))
         if "format_version" not in metadata:
             from .legacy_model import ProsodyBart as LegacyProsodyBart

@@ -1,0 +1,61 @@
+# H100 starting configuration. All relative paths are relative to this YAML.
+data:
+  dali_dir: ../DALI_v2
+  prepared_dir: ../data/dali-melody
+  language: english
+  song_ids_file: null
+  min_ncc: 0.0
+  max_syllables: 40
+  valid_fraction: 0.1
+  test_fraction: 0.1
+  seed: 1234
+  stress_source: ipa
+  include_melody: true
+  # Set to the immutable CSV used for melody pretraining BEFORE preparation.
+  pretraining_manifest: null
+  unit: song # song or paragraph (DALI paragraph IDs); never independent lines.
+  lines_per_window: 1 # Match the melody encoder's pretraining window size.
+  include_title: true
+
+model:
+  conditioning: melody
+  decoder_mode: explainable
+  pretrained: facebook/bart-base
+  # Optional trained four-stream template-decoder best/ directory.
+  # null initializes BART from pretrained above and trains new compound features.
+  template_checkpoint: null
+  # Required for real training: current mlm_note_177d_v1, audio_pooling=note.
+  melody_checkpoint: null
+  dropout: 0.1
+  transformer_dropout: 0.3
+  max_source_length: 1024
+  max_target_length: 1024
+
+training:
+  output_dir: ../checkpoints/melody
+  device: auto
+  seed: 1234
+  epochs: 100
+  batch_size: 2
+  num_workers: 0
+  precision: bf16 # CUDA BF16 required; use fp32 for CPU/MPS. Smoke tests use fp32.
+  gradient_accumulation_steps: 4
+  gradient_checkpointing: true
+  # Use 1 with a trained template checkpoint; 0 trains new compound features immediately.
+  freeze_decoder_epochs: 0
+  melody_unfreeze_epoch: null # Keep the melody encoder frozen initially.
+  learning_rate: 0.00002
+  adapter_learning_rate: 0.0001
+  melody_learning_rate: 0.000002
+  adam_betas: [0.9, 0.98]
+  adam_epsilon: 0.00001
+  weight_decay: 0.0
+  warmup_steps: 100
+  schedule: constant_after_warmup
+  gradient_clip: 1.0
+  patience: 5
+  loss_weights:
+    lyrics: 1.0
+    syllables: 1.0
+    stresses: 1.0
+    lengths: 1.0
