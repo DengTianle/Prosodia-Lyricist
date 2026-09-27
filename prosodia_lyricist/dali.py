@@ -144,6 +144,41 @@ def lexical_stresses(word, count, pronunciations=None):
     return ["unknown"] * count
 
 
+def aligned_words(words, notes_by_word, line_start, line_end):
+    """Validate original bounds, then attach empty tilde-only parents locally.
+
+    Some DALI exports give melisma notes their own empty word. Only explicit
+    tilde-only continuations may extend the previous word in the same line;
+    never infer missing lyrics or concatenate neighboring text fragments.
+    """
+    aligned = []
+    last_end = line_start
+    for word_id, word in words:
+        start, end = interval(word)
+        if start < last_end - 1e-6 or end > line_end + 1e-6:
+            raise AnnotationError("Word lies outside its line or overlaps the previous word")
+        last_end = end
+        notes = notes_by_word[word_id]
+        for note in notes:
+            note_start, note_end = interval(note)
+            if note_start < start - 1e-6 or note_end > end + 1e-6:
+                raise AnnotationError("Notes lie outside their parent word")
+        raw_text = word.get("text")
+        word_text = normalize_text(raw_text) if isinstance(raw_text, str) else ""
+        if not word_text:
+            if not notes or not all(
+                (text := normalize_text(n.get("text", ""))) and not text.strip("~")
+                for n in notes
+            ):
+                raise AnnotationError("Empty word text")
+            if not aligned:
+                raise AnnotationError("Melisma continuation without a preceding syllable")
+            aligned[-1][1].extend(notes)
+        else:
+            aligned.append((word_text, list(notes)))
+    return aligned
+
+
 def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
     """Return usable line records and explicit rejection reasons.
 
@@ -162,20 +197,10 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
         try:
             line_start, line_end = interval(line)
             syllables, text, scaffold_words = [], [], []
-            last_end = line_start
-            for word_id, word in words_by_line[line_id]:
-                start, end = interval(word)
-                if start < last_end - 1e-6 or end > line_end + 1e-6:
-                    raise AnnotationError(
-                        "Word lies outside its line or overlaps the previous word"
-                    )
-                last_end = end
-                word_text = normalize_text(word["text"])
-                if not word_text:
-                    raise AnnotationError("Empty word text")
-                sung = sung_syllables(notes_by_word[word_id])
-                if sung[0]["start"] < start - 1e-6 or sung[-1]["end"] > end + 1e-6:
-                    raise AnnotationError("Notes lie outside their parent word")
+            for word_text, notes in aligned_words(
+                words_by_line[line_id], notes_by_word, line_start, line_end
+            ):
+                sung = sung_syllables(notes)
                 stresses = (
                     lexical_stresses(word_text, len(sung))
                     if stress_source == "lexical"

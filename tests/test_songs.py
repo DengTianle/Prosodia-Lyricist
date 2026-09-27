@@ -184,6 +184,62 @@ def test_real_ipa_song_preparation(tmp_path, annotation):
     assert manifest["pronunciation"]["wordform"] == "first"
 
 
+def test_question_and_empty_melisma_keep_complete_ipa_song(tmp_path, annotation, tokenizer):
+    from prosodia_lyricist.features import TARGET_KEYS, WORD_END
+    from prosodia_lyricist.features import encode_example as encode_template_example
+
+    pytest.importorskip("prosodic")
+    annot = add_line(annotation)["annotations"]["annot"]
+    annot["words"][1]["text"] = "world?"
+    annot["words"][2].update(text="", time=[4, 4.5], index=0)
+    annot["words"].append({"text": "light", "time": [4.5, 5], "index": 1})
+    annot["notes"][4].update(text="~", time=[4, 4.5])
+    annot["notes"].append({"text": "light", "time": [4.5, 5], "index": 3})
+    annot["lines"][0]["time"] = [0, 4.5]
+    annot["lines"][1]["time"] = [4.5, 5]
+    directory, manifest = prepare_songs(tmp_path, [annotation], stress_source="ipa")
+    split = manifest["songs"]["song-a"]["split"]
+    row = json.loads((directory / f"{split}.jsonl").read_text())
+    assert len(row["lines"]) == 2
+    line = row["lines"][0]
+    assert line["text"] == "hello world ?"
+    assert line["words"][-1] == {"text": "?", "syllable_count": 0}
+    assert len(line["syllables"]) == len(line["sung_syllables"]) == 3
+    assert line["sung_syllables"][-1]["duration"] == 2.5
+    assert line["sung_syllables"][-1]["note_count"] == 2
+    assert not (directory / "rejected.jsonl").read_text()
+    # Punctuation survives the four-stream targets without a completed-word event.
+    tokenizer.add_tokens(["?"])
+    example = encode_template_example(row, tokenizer, 8)
+    question = example["labels"].index(tokenizer.convert_tokens_to_ids("?"))
+    assert example["labels"].count(tokenizer.convert_tokens_to_ids(WORD_END)) == 3
+    assert example["labels"][question + 1] == tokenizer.convert_tokens_to_ids(".")
+    assert all(example[key][question] == 0 for key in TARGET_KEYS[1:])
+    assert sum(example["syllable_labels"]) == 4
+    assert len({len(example[key]) for key in TARGET_KEYS}) == 1
+    assert manifest["schema_version"] == 4
+
+
+@pytest.mark.parametrize("text", ["?", "?!?"])
+def test_punctuation_alone_has_no_ipa_syllables(text):
+    pytest.importorskip("prosodic")
+    with pytest.raises(ValueError, match="No IPA syllables in line"):
+        ipa.parse_words(text)
+
+
+def test_word_without_pronunciation_still_rejected(monkeypatch):
+    from types import SimpleNamespace
+
+    word = SimpleNamespace(txt="missing", wordtype=SimpleNamespace(form=None))
+    monkeypatch.setattr(
+        ipa, "backend", lambda: SimpleNamespace(
+            Text=lambda *a, **kw: SimpleNamespace(wordtokens=[word])
+        )
+    )
+    with pytest.raises(ValueError, match="No IPA pronunciation for 'missing'"):
+        ipa.parse_words("missing")
+
+
 def test_midi_song_generated_once_and_limits_checked(
     tmp_path,
     tokenizer,

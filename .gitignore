@@ -20,3 +20,6 @@ dist/
 /tensorboards/
 /tmp/
 /nus-smc-corpus_48/
+/docs/preparation-rejection-audit.md
+/examples/
+rejected.jsonl

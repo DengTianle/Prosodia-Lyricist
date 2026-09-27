@@ -62,6 +62,57 @@ def test_continuation_fragment():
     assert len(result) == 1
 
 
+@pytest.mark.parametrize("source", ["lexical", "unknown"])
+def test_empty_melisma_word_extends_previous_syllable(annotation, source):
+    annot = annotation["annotations"]["annot"]
+    # A DALI word boundary on a continuation must not create another syllable.
+    annot["words"].insert(1, {"text": "", "time": [1.5, 2], "index": 0})
+    annot["words"][0]["time"] = [0, 1]
+    annot["notes"][2]["index"] = 1
+    annot["notes"][2]["text"] = "~~~~~"
+    annot["notes"][3]["index"] = 2
+    records, rejected = extract_lines(annotation["info"], annot, stress_source=source)
+    assert not rejected
+    record = records[0]
+    assert record["text"] == "hello world"
+    assert record["words"] == [
+        {"text": "hello", "syllable_count": 2},
+        {"text": "world", "syllable_count": 1},
+    ]
+    assert record["syllables"][1]["duration"] == 1.0
+    assert record["syllables"][1]["end"] == 2
+    assert record["syllables"][1]["note_count"] == 2
+    assert annot["words"][1]["text"] == ""  # Do not mutate source annotations.
+
+
+@pytest.mark.parametrize("missing", ["", None])
+def test_missing_lyrics_with_ordinary_notes_still_rejected(annotation, missing):
+    annot = annotation["annotations"]["annot"]
+    annot["words"][1]["text"] = missing
+    records, rejected = extract_lines(annotation["info"], annot)
+    assert not records
+    assert rejected[0]["reason"] == "Empty word text"
+
+
+def test_empty_melisma_cannot_cross_line_boundary(annotation):
+    annot = annotation["annotations"]["annot"]
+    annot["lines"].append({"text": "", "time": [4, 5], "index": 0})
+    annot["words"].append({"text": "", "time": [4, 5], "index": 1})
+    annot["notes"].append({"text": "~", "time": [4, 5], "index": 2})
+    records, rejected = extract_lines(annotation["info"], annot)
+    assert len(records) == 1
+    assert rejected[0]["reason"] == "Melisma continuation without a preceding syllable"
+
+
+def test_empty_melisma_validates_original_parent_bounds(annotation):
+    annot = annotation["annotations"]["annot"]
+    annot["words"][1]["text"] = ""
+    annot["notes"][3].update(text="~", time=[1.5, 4])
+    records, rejected = extract_lines(annotation["info"], annot)
+    assert not records
+    assert rejected[0]["reason"] == "Notes lie outside their parent word"
+
+
 def test_invalid_line_does_not_drop_other_lines(annotation):
     annot = annotation["annotations"]["annot"]
     annot["lines"].append({"text": "a", "time": [4, 5], "index": 0})
