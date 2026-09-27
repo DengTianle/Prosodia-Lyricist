@@ -9,7 +9,7 @@ from pathlib import Path
 import torch
 from transformers import AutoTokenizer
 
-from .evaluation import conditional_perplexity, evaluate_prosody, reference_targets
+from .evaluation import conditional_perplexity, evaluate_prosody, reference_targets, text_prosody
 from .features import encode_source
 from .midi import midi_records
 from .model import ProsodyBart
@@ -183,6 +183,7 @@ def infer(
         if len(streams[0]) > target_limit:
             raise ValueError("Reference exceeds checkpoint target token limit; no truncation")
         report["reference_lines"] = reference_lines
+        report["reference_syllables"] = [text_prosody(line) for line in reference_lines]
         targets = [torch.tensor([stream], device=device) for stream in streams]
         report["reference_perplexity"] = conditional_perplexity(
             model,
@@ -234,7 +235,10 @@ def main():
     parser.add_argument("--stress-source", choices=("supplement", "heuristic", "unknown"))
     parser.add_argument("--output", help="Optional new UTF-8 text file")
     parser.add_argument("--report-prefix", help="Write PREFIX.md and PREFIX.json with metrics")
-    parser.add_argument("--reference", help="UTF-8 lyrics, one line per phrase, for reference PPL")
+    parser.add_argument(
+        "--reference", metavar="FILE",
+        help="UTF-8 actual lyrics, one line per phrase, for ground-truth labels and reference PPL",
+    )
     parser.add_argument("--template-only", action="store_true", help="Inspect MIDI without a model")
     parser.add_argument(
         "--explanations", help="New JSON file with predicted/corrected decoder prosody"

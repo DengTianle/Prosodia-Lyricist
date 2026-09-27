@@ -11,6 +11,7 @@ from prosodia_lyricist.features import WORD_END, encode_source
 from prosodia_lyricist.infer import infer, main
 from prosodia_lyricist.model import ProsodyBart
 from prosodia_lyricist.prepare import SCHEMA_VERSION
+from prosodia_lyricist.report import markdown_report
 
 
 @pytest.fixture
@@ -162,7 +163,19 @@ def test_imagine_report_cli_with_compound_checkpoint(
     assert report["decoder_explanation"] == explanation
     assert explanation["completed"] and not report["generation"]["hit_token_limit"]
     assert all(w["correction_applied"] is correct for w in explanation["words"])
-    assert "Decoder prosody feedback" in prefix.with_suffix(".md").read_text()
+    markdown = prefix.with_suffix(".md").read_text()
+    assert "Decoder prosody feedback" in markdown
+    assert report["reference_syllables"] == [
+        [
+            {"word": word, "ipa": "ˈeɪ", "stress": "strong", "length": "long"}
+            for word in ("hello", "world")
+        ]
+    ] * 17
+    assert markdown.count("Ground-truth lyrics: hello world") == 17
+    assert markdown.count("Ground-truth prosody (derived from lyric IPA): 2 syllables.") == 17
+    assert "`<strong,long> <strong,long>`" in markdown
+    assert "Ground-truth word / IPA | Ground-truth prosody |" in markdown
+    assert "hello / ˈeɪ | <strong,long>" in markdown
     # No-reference inference uses the identical source and generation sequence.
     scripted_sample(monkeypatch, tokenizer, sequence)
     without_reference = infer(
@@ -170,6 +183,8 @@ def test_imagine_report_cli_with_compound_checkpoint(
     )
     assert without_reference["encoded_source"] == report["encoded_source"]
     assert without_reference["generated_token_ids"] == report["generated_token_ids"]
+    assert "reference_syllables" not in without_reference
+    assert "Ground-truth" not in markdown_report(without_reference)
 
 
 def test_truncation_after_unfinished_word_keeps_budget_warning(

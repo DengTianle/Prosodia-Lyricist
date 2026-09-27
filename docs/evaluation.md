@@ -166,6 +166,11 @@ python -m prosodia_lyricist.infer \
 ```
 
 Supply exactly one nonempty lyric line per input phrase, without a title/header.
+`--reference` requires the path to that text file. The Markdown report shows
+the actual lyrics, their IPA-derived syllable counts and stress/length labels,
+and comparison columns beside the MIDI and generated output. Reference labels
+use the same evaluation rules as generated lyrics and are also saved as
+`reference_syllables` in the JSON report.
 Target construction matches training's wordwise byte-BPE tokenization with
 explicit `<word_end>` events, three aligned IPA feature streams, period
 boundaries and one BOS/EOS pair. The text is only a scoring target and
