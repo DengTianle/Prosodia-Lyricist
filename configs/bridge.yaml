@@ -1,6 +1,6 @@
 # All paths are relative to this YAML. Keep the existing template data/checkpoint.
 data:
-  dali_dir: ../DALI_v2
+  dali_dir: ../../DALI_v2
   prepared_dir: ../data/dali-bridge
   language: english
   song_ids_file: null
@@ -34,7 +34,7 @@ training:
   epochs: 100
   batch_size: 16
   num_workers: 0
-  precision: fp32 # bf16 is also supported on CUDA hardware with BF16 support.
+  precision: bf16 #fp32 bf16 is also supported on CUDA hardware with BF16 support.
   gradient_accumulation_steps: 1
   # Zero-based: 1 warms up the new decoder for one epoch, then fine-tunes the trunk.
   # null keeps the pretrained trunk frozen; 0 fine-tunes immediately.
