@@ -178,6 +178,47 @@ context, enforce source/target token limits without truncation, and write strict
 self-contained checkpoints. Optimizer resume, distributed training, and mixed
 precision are not implemented.
 
+## Learned melody-to-template bridge
+
+The bridge trains the melody encoder from the `prosodia-direct` contrastive
+integration to predict the **syllable-level IPA templates** consumed by the
+existing template decoder:
+
+```text
+MIDI notes → contrastively pretrained melody encoder → learned prosody template
+           → existing template-decoder checkpoint → lyrics
+```
+
+It predicts stress, vowel length, and phrase endings (hence syllable counts),
+allowing different numbers of notes and syllables. The lyric decoder is trained
+separately and needs no retraining for this integration. All predicted phrases
+are passed to it together, preserving whole-song lyric context.
+
+In [`configs/bridge.yaml`](configs/bridge.yaml), set `model.melody_checkpoint`
+to the current note-based two-pool contrastive checkpoint and
+`data.pretraining_manifest` to its original CSV **before preparation**. Match
+`data.lines_per_window` to that manifest. Preparation uses `data/dali-bridge`
+and keeps shared songs and duplicate identities in their pretraining splits.
+
+```bash
+conda activate prosodia-lyricist
+python -m prosodia_lyricist.prepare --config configs/bridge.yaml
+python -m prosodia_lyricist.train --config configs/bridge.yaml --smoke-test
+python -m prosodia_lyricist.train --config configs/bridge.yaml
+
+python -m prosodia_lyricist.infer \
+  --checkpoint checkpoints/dali/TEMPLATE_RUN/best \
+  --bridge-checkpoint checkpoints/bridge/BRIDGE_RUN/best \
+  --midi examples/imagine.mid --title Imagine --top-k 1 \
+  --report-prefix outputs/imagine-bridge
+```
+
+`--bridge-checkpoint` replaces heuristic MIDI template construction. Omit it to
+retain existing inference. Use it with `--template-only` to inspect predictions
+without loading the lyric model. Reports retain both the predicted syllable
+templates and original note arrays; reference lyrics are used only for scoring.
+See [bridge architecture, training, and evaluation](docs/prosody-bridge.md).
+
 ## MIDI inference
 
 MIDI remains the inference input. All phrases are encoded together under one

@@ -131,6 +131,10 @@ def prepare(config, *, limit=None):
                 if not records:
                     counts["songs_without_usable_lines"] += 1
                     continue
+                if data.get("include_melody"):
+                    from .melody_data import attach_melody
+
+                    attach_melody(records, annot)
                 songs[song_id] = info
                 song = {
                     "id": song_id,
@@ -163,6 +167,15 @@ def prepare(config, *, limit=None):
             song_id: split_for(group, data["seed"], valid, test)
             for song_id, group in groups.items()
         }
+        split_audit = None
+        if data.get("include_melody") and data.get("pretraining_manifest"):
+            from .melody_data import audit_pretraining_splits, preserve_pretraining_splits
+
+            splits = preserve_pretraining_splits(songs, splits, data["pretraining_manifest"])
+            split_audit = audit_pretraining_splits(
+                {key: {**info, "split": splits[key]} for key, info in songs.items()},
+                data["pretraining_manifest"],
+            )
         handles = {
             split: stack.enter_context((staging / f"{split}.jsonl").open("w", encoding="utf-8"))
             for split in ("train", "valid", "test")
@@ -204,6 +217,8 @@ def prepare(config, *, limit=None):
             },
             "sha256": {},
         }
+        if data.get("include_melody"):
+            manifest["pretraining_split_audit"] = split_audit
         for name in ("train.jsonl", "valid.jsonl", "test.jsonl", "rejected.jsonl"):
             path = staging / name
             manifest["sha256"][name] = hashlib.sha256(path.read_bytes()).hexdigest()

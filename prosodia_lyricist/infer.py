@@ -45,11 +45,16 @@ def infer(
     reference_lines=None,
     return_explanations=False,
     prosody_correction=True,
+    bridge_checkpoint=None,
 ):
     if temperature <= 0 or top_k < 1 or (max_new_tokens is not None and max_new_tokens < 1):
         raise ValueError("temperature, top_k, and max_new_tokens must be positive")
     seed_everything(seed)
     checkpoint = Path(checkpoint)
+    if bridge_checkpoint and stress_source is not None:
+        raise ValueError("stress_source is a heuristic option; omit it when using a bridge")
+    if bridge_checkpoint and (checkpoint / "melody.json").exists():
+        raise ValueError("A bridge requires a four-stream template-decoder checkpoint")
     run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
     if run.get("data_schema_version") not in (3, SCHEMA_VERSION):
         raise ValueError("Checkpoint uses an older input scheme; prepare and train song-level data")
@@ -62,6 +67,8 @@ def infer(
     tokenizer = AutoTokenizer.from_pretrained(checkpoint / "tokenizer", local_files_only=True)
     model = ProsodyBart.load(checkpoint).to(device).eval()
     explainable = isinstance(model, ProsodyBart)
+    if bridge_checkpoint and not explainable:
+        raise ValueError("A bridge requires a four-stream template-decoder checkpoint")
     if return_explanations and not explainable:
         raise ValueError("Legacy lyrics-only checkpoints have no generated explanation streams")
     target_limit = min(
@@ -71,13 +78,27 @@ def infer(
         max_new_tokens = target_limit - 1  # Generation also includes the decoder start token.
     if max_new_tokens >= target_limit:
         raise ValueError("max_new_tokens must be smaller than the checkpoint's target token limit")
-    records = midi_records(
-        midi,
-        title=title,
-        track=track,
-        max_syllables=model.max_syllables,
-        stress_source=stress_source,
-    )
+    bridge = None
+    if bridge_checkpoint:
+        from .bridge_infer import predict_templates
+
+        records, bridge = predict_templates(
+            bridge_checkpoint,
+            midi,
+            title=title,
+            track=track,
+            device=device,
+            max_syllables=model.max_syllables,
+        )
+        stress_source = "learned"
+    else:
+        records = midi_records(
+            midi,
+            title=title,
+            track=track,
+            max_syllables=model.max_syllables,
+            stress_source=stress_source,
+        )
     if reference_lines is not None and (
         len(reference_lines) != len(records) or any(not line.strip() for line in reference_lines)
     ):
@@ -116,6 +137,8 @@ def infer(
             "tokens": tokenizer.convert_ids_to_tokens(tokens[0].tolist()),
         }
         explanation["source"] = {"title": title, "lines": records}
+        if bridge:
+            explanation["bridge"] = bridge
         text = explanation["text"]
     else:
         generation["bad_words_ids"] = [
@@ -130,6 +153,12 @@ def infer(
             return explanation
         return lyrics or [""]
     report = template_report(midi, records, title=title, track=track, stress_source=stress_source)
+    if bridge:
+        report["bridge"] = bridge
+        if bridge["forced_line_endings"]:
+            report["warnings"].append(
+                "Some bridge phrases reached the syllable cap; see bridge details."
+            )
     report.update(
         checkpoint=str(checkpoint.resolve()),
         checkpoint_run=run,
@@ -196,6 +225,7 @@ def infer(
 
 
 def template_report(midi, records, *, title, track, stress_source):
+    learned = stress_source == "learned"
     return {
         "report_version": 1,
         "unit": "whole_song",
@@ -205,12 +235,20 @@ def template_report(midi, records, *, title, track, stress_source):
         "track": track,
         "stress_source": stress_source,
         "template": records,
-        "warnings": [
-            "One MIDI note is treated as one syllable; melisma is not inferred.",
-            "The supplement's ambiguous onset/beat equation is resolved using its Figure 1 "
-            "and explicit note-grid conventions documented in docs/evaluation.md.",
-        ]
-        + (["No time signature supplied: assumed 4/4."] if records[0]["meter_assumed"] else [])
+        "template_role": "model_input",
+        "warnings": (
+            [
+                "Stress, vowel length and syllable count are learned IPA-template predictions.",
+                "No note-to-syllable alignment is inferred; note arrays are retained separately.",
+            ]
+            if learned
+            else [
+                "One MIDI note is treated as one syllable; melisma is not inferred.",
+                "The supplement's ambiguous onset/beat equation is resolved using its Figure 1 "
+                "and explicit note-grid conventions documented in docs/evaluation.md.",
+            ]
+        )
+        + (["No time signature supplied: assumed 4/4."] if records[0].get("meter_assumed") else [])
         + (
             ["Notes after the final MIDI marker are retained as an additional trailing phrase."]
             if records[-1]["unmarked_tail"]
@@ -222,6 +260,7 @@ def template_report(midi, records, *, title, track, stress_source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", help="The run's best/ directory")
+    parser.add_argument("--bridge-checkpoint", help="Learned melody-to-template best/ directory")
     parser.add_argument("--midi", required=True)
     parser.add_argument("--title", default="")
     parser.add_argument("--track", type=int, default=0)
@@ -236,10 +275,15 @@ def main():
     parser.add_argument("--output", help="Optional new UTF-8 text file")
     parser.add_argument("--report-prefix", help="Write PREFIX.md and PREFIX.json with metrics")
     parser.add_argument(
-        "--reference", metavar="FILE",
+        "--reference",
+        metavar="FILE",
         help="UTF-8 actual lyrics, one line per phrase, for ground-truth labels and reference PPL",
     )
-    parser.add_argument("--template-only", action="store_true", help="Inspect MIDI without a model")
+    parser.add_argument(
+        "--template-only",
+        action="store_true",
+        help="Inspect heuristic or learned templates without generating lyrics",
+    )
     parser.add_argument(
         "--explanations", help="New JSON file with predicted/corrected decoder prosody"
     )
@@ -250,6 +294,8 @@ def main():
         help="Ablation: feed predicted prosody back without IPA correction",
     )
     args = parser.parse_args()
+    if args.bridge_checkpoint and args.stress_source:
+        parser.error("--stress-source is a heuristic option; omit it with --bridge-checkpoint")
     if not args.template_only and not args.checkpoint:
         parser.error("--checkpoint is required unless --template-only is used")
     if args.template_only and args.reference:
@@ -269,11 +315,33 @@ def main():
     if len({p.resolve() for p in paths}) != len(paths) or any(p.exists() for p in paths):
         parser.error("Output paths must be distinct new files")
     if args.template_only:
-        stress = args.stress_source or "supplement"
-        records = midi_records(args.midi, title=args.title, track=args.track, stress_source=stress)
+        bridge = None
+        if args.bridge_checkpoint:
+            from .bridge_infer import predict_templates
+
+            seed_everything(args.seed)
+            records, bridge = predict_templates(
+                args.bridge_checkpoint,
+                args.midi,
+                title=args.title,
+                track=args.track,
+                device=select_device(args.device),
+            )
+            stress = "learned"
+        else:
+            stress = args.stress_source or "supplement"
+            records = midi_records(
+                args.midi, title=args.title, track=args.track, stress_source=stress
+            )
         report = template_report(
             args.midi, records, title=args.title, track=args.track, stress_source=stress
         )
+        if bridge:
+            report["bridge"] = bridge
+            if bridge["forced_line_endings"]:
+                report["warnings"].append(
+                    "Some bridge phrases reached the syllable cap; see bridge details."
+                )
         text = markdown_report(report)
     else:
         kwargs = vars(args).copy()

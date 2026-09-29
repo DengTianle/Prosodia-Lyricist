@@ -1,0 +1,547 @@
+"""Learned templates: no lyric leakage, variable syllable counts, reusable lyric decoder."""
+
+import copy
+import csv
+import json
+
+import numpy as np
+import pytest
+import torch
+
+from prosodia_lyricist.bridge_data import (
+    BOS,
+    EOS,
+    LINE_END,
+    BridgeDataset,
+    bridge_collate,
+    decode_bridge_tokens,
+    encode_bridge_source,
+    encode_bridge_targets,
+)
+from prosodia_lyricist.bridge_model import ProsodyBridge
+from prosodia_lyricist.bridge_train import run_bridge_epoch
+from prosodia_lyricist.features import encode_source
+from prosodia_lyricist.melody_checkpoint import file_sha256, load_contrastive_melody
+from prosodia_lyricist.melody_data import audit_pretraining_splits, preserve_pretraining_splits
+from prosodia_lyricist.melody_encoder.encoding import MELODY_REPRESENTATION
+from prosodia_lyricist.melody_encoder.modeling import MelodyTransformerEncoder
+from prosodia_lyricist.midi import midi_melody_record
+from prosodia_lyricist.model import ProsodyBart
+
+
+@pytest.fixture
+def lines(record):
+    first = copy.deepcopy(record)
+    first["melody"] = {
+        "midi_pitches": [60, 62, 64, 64],
+        "onset_seconds": [0, 0.5, 1.5, 2],
+        "note_duration_seconds": [0.5, 0.5, 0.5, 2],
+    }
+    second = {
+        "syllables": [{"stress": "weak", "length": "long"}],
+        "melody": {"midi_pitches": [67], "onset_seconds": [4], "note_duration_seconds": [1]},
+    }
+    return [first, second]
+
+
+@pytest.fixture
+def bridge():
+    return ProsodyBridge(
+        dict(d_model=8, num_layers=1, num_heads=2, dim_feedforward=16, dropout=0, max_length=32),
+        max_syllables=8,
+        lines_per_window=2,
+        d_model=8,
+        num_layers=1,
+        num_heads=2,
+        dim_feedforward=16,
+        dropout=0,
+    )
+
+
+def example(lines):
+    return {**encode_bridge_source(lines), "labels": encode_bridge_targets(lines, 8)}
+
+
+def test_source_target_separation_and_template_decoder_compatibility(lines, tokenizer):
+    source = encode_bridge_source(lines)
+    changed = copy.deepcopy(lines)
+    for line in changed:
+        line.update(text="secret", words=[], syllables=[])
+    other = encode_bridge_source(changed)
+    np.testing.assert_array_equal(source["melody_features"], other["melody_features"])
+    assert source["note_line_ids"] == other["note_line_ids"] == [1, 1, 1, 1, 2]
+    labels = encode_bridge_targets(lines, 8)
+    assert labels == [7, 4, 5, LINE_END, 6, LINE_END, EOS]
+    reconstructed = decode_bridge_tokens([BOS, *labels])
+    assert encode_source({"lines": reconstructed}, tokenizer, 8) == encode_source(
+        {"lines": lines}, tokenizer, 8
+    )
+
+
+def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path, lines, bridge):
+    batch = bridge_collate([example(lines), example(lines[:1])])
+    bridge.set_melody_trainable(False)
+    bridge.train()
+    assert not bridge.melody_encoder.training
+    bridge(**batch).loss.backward()
+    assert bridge.adapter[1].weight.grad.abs().sum() > 0
+    assert bridge.output.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in bridge.melody_encoder.parameters())
+    bridge.zero_grad(set_to_none=True)
+    bridge.set_melody_trainable(True)
+    bridge(**batch).loss.backward()
+    assert bridge.melody_encoder.input_projection[0].weight.grad.abs().sum() > 0
+    bridge.eval()
+    output = bridge(**batch)
+    future = {**batch, "labels": batch["labels"].clone()}
+    future["labels"][0, 1] = 7
+    after = bridge(**future)
+    assert torch.equal(output.logits[:, :2], after.logits[:, :2])
+    assert not torch.equal(output.logits[:, 2:], after.logits[:, 2:])
+    padded = {
+        key: torch.nn.functional.pad(value, (0, 0, 0, 3), value=99)
+        if key == "melody_features"
+        else value
+        if key == "line_counts"
+        else torch.nn.functional.pad(value, (0, 3), value=-100 if key == "labels" else 0)
+        for key, value in batch.items()
+    }
+    assert torch.allclose(output.loss, bridge(**padded).loss, atol=1e-6)
+    bridge.save(tmp_path)
+    restored = ProsodyBridge.load(tmp_path).eval()
+    assert torch.equal(output.logits, restored(**batch).logits)
+    # Saved model contains the complete melody trunk; no upstream path is required.
+    assert any(key.startswith("melody_encoder.") for key in restored.state_dict())
+
+
+def test_variable_counts_exact_phrase_count_and_boundary_caps(monkeypatch, lines, bridge):
+    batch = bridge_collate([encode_bridge_source(lines), encode_bridge_source(lines[:1])])
+    original = bridge.decode
+    sequence = [4, LINE_END, 6, 7, LINE_END, EOS]
+
+    def scripted(tokens, memory, mask):
+        logits = original(tokens, memory, mask)
+        logits[:, -1] = -1000
+        logits[:, -1, sequence[tokens.shape[1] - 1]] = 1000
+        return logits
+
+    bridge.eval()
+    monkeypatch.setattr(bridge, "decode", scripted)
+    result = bridge.generate(**batch)
+    assert [len(p["syllables"]) for p in decode_bridge_tokens(result.sequences[0].tolist())] == [
+        1,
+        2,
+    ]
+    assert len(decode_bridge_tokens(result.sequences[1].tolist())) == 1
+    assert result.forced_line_endings == [[], []]
+    monkeypatch.setattr(bridge, "decode", original)
+    with torch.no_grad():
+        bridge.output.weight.zero_()
+        bridge.output.bias.fill_(-1000)
+        bridge.output.bias[4] = 1000
+    capped = bridge.generate(**batch)
+    assert capped.forced_line_endings == [[0, 1], [0]]
+    assert [len(p["syllables"]) for p in decode_bridge_tokens(capped.sequences[0].tolist())] == [
+        8,
+        8,
+    ]
+
+
+def test_token_weighted_accumulation_and_partial_group(lines, bridge):
+    joint = copy.deepcopy(bridge)
+    a, b = example(lines), example(lines[:1])
+    results = []
+    for model, batches, accumulation in (
+        (bridge, [bridge_collate([a]), bridge_collate([b])], 3),
+        (joint, [bridge_collate([a, b])], 1),
+    ):
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        results.append(
+            run_bridge_epoch(
+                model,
+                batches,
+                torch.device("cpu"),
+                optimizer=optimizer,
+                scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1),
+                accumulation_steps=accumulation,
+                gradient_clip=None,
+            )
+        )
+    assert results[0]["optimizer_steps"] == 1
+    for a, b in zip(bridge.parameters(), joint.parameters(), strict=True):
+        assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_saved_limits_and_checkpoint_validation(tmp_path, lines, bridge):
+    bridge.max_notes = 4
+    bridge.save(tmp_path)
+    restored = ProsodyBridge.load(tmp_path).eval()
+    assert restored.max_notes == 4
+    with pytest.raises(ValueError, match="note limit"):
+        restored.generate(**bridge_collate([encode_bridge_source(lines)]))
+    metadata_path = tmp_path / "bridge.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["prosody_rules"] = "incompatible"
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="feature rules"):
+        ProsodyBridge.load(tmp_path)
+
+
+def test_bridge_config_paths_without_bart(tmp_path):
+    from prosodia_lyricist.config import load_config
+
+    path = tmp_path / "bridge.yaml"
+    path.write_text(
+        "data:\n  prepared_dir: ./data\n  pretraining_manifest: ./up.csv\n"
+        "model:\n  conditioning: bridge\n  melody_checkpoint: ./tower.pt\n"
+        "training:\n  output_dir: ./runs\n"
+    )
+    config = load_config(path)
+    assert config["data"]["pretraining_manifest"] == str(tmp_path / "up.csv")
+    assert config["model"]["melody_checkpoint"] == str(tmp_path / "tower.pt")
+    assert "pretrained" not in config["model"]
+
+
+def save_contrastive(path, *, pooling="cls"):
+    config = dict(
+        d_model=8,
+        num_layers=1,
+        num_heads=2,
+        dim_feedforward=16,
+        dropout=0,
+        max_length=32,
+        projection_dim=4,
+        pooling=pooling,
+    )
+    tower = MelodyTransformerEncoder(**config)
+    args = {f"melody_{k}": v for k, v in config.items() if k not in ("dropout", "projection_dim")}
+    args.update(audio_pooling="note", dropout=0, projection_dim=4, manifest=path.parent / "up.csv")
+    torch.save(
+        {
+            "melody_representation": MELODY_REPRESENTATION,
+            "args": args,
+            "model_state_dict": {f"melody_encoder.{k}": v for k, v in tower.state_dict().items()},
+        },
+        path,
+    )
+    return tower
+
+
+@pytest.mark.parametrize("pooling", ["cls", "mean"])
+def test_contrastive_import_is_strict_and_preserves_note_vectors(tmp_path, pooling):
+    path = tmp_path / "contrastive.pt"
+    original = save_contrastive(path, pooling=pooling).eval()
+    tower, cfg, provenance = load_contrastive_melody(path)
+    assert cfg["pooling"] == pooling and tower.projection is None
+    assert provenance["sha256"] == file_sha256(path)
+    tower.eval()
+    features = torch.randn(1, 4, 177)
+    assert torch.equal(
+        original.encode(features).note_embeddings,
+        tower.encode(features, project=False).note_embeddings,
+    )
+    with torch.serialization.safe_globals([type(path)]):
+        checkpoint = torch.load(path, weights_only=True)
+    checkpoint["melody_representation"] = "legacy_frame"
+    torch.save(checkpoint, path)
+    with pytest.raises(ValueError, match="note-based"):
+        load_contrastive_melody(path)
+
+
+def write_upstream(path, rows):
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["sample_id", "dali_id", "split", "artist", "title", "line_count"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_split_reuse_and_duplicate_leakage_rejection(tmp_path):
+    path = tmp_path / "up.csv"
+    write_upstream(
+        path,
+        [
+            dict(
+                sample_id="x",
+                dali_id="up",
+                split="test",
+                artist="Artist",
+                title="Song",
+                line_count=2,
+            )
+        ],
+    )
+    songs = {"down": {"artist": "artist", "title": "Song!"}}
+    assert preserve_pretraining_splits(songs, {"down": "train"}, path) == {"down": "test"}
+    with pytest.raises(ValueError, match="crosses splits"):
+        audit_pretraining_splits({"down": {**songs["down"], "split": "train"}}, path)
+
+
+def test_window_tail_note_limits_and_checksums(tmp_path, lines):
+    path = tmp_path / "train.jsonl"
+    third = copy.deepcopy(lines[1])
+    third["melody"]["onset_seconds"] = [6]
+    path.write_text(json.dumps({"song_id": "s", "lines": [*lines, third]}) + "\n")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "config": {"include_melody": True, "stress_source": "ipa", "max_syllables": 8},
+                "songs": {"s": {"split": "train", "group": "s"}},
+                "sha256": {"train.jsonl": file_sha256(path)},
+            }
+        )
+    )
+    ds = BridgeDataset(tmp_path, "train", lines_per_window=2, max_notes=5)
+    assert len(ds) == 2 and [e["line_count"] for e in ds] == [2, 1]
+    limited = BridgeDataset(tmp_path, "train", lines_per_window=2, max_notes=4)
+    assert len(limited) == 1 and limited.skipped == 1
+    path.write_text(path.read_text() + "\n")
+    with pytest.raises(ValueError, match="manifest"):
+        BridgeDataset(tmp_path, "train", lines_per_window=2, max_notes=5)
+
+
+@pytest.mark.parametrize("pretrained", [False, True])
+def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pretrained):
+    from prosodia_lyricist import ipa
+    from prosodia_lyricist.prepare import prepare
+    from prosodia_lyricist.train import train
+
+    monkeypatch.setattr(ipa, "backend", lambda: None)
+    monkeypatch.setattr(
+        ipa,
+        "parse_words",
+        lambda text: [
+            {"text": word, "syllables": [ipa.syllable_features("ˈeɪ")]} for word in text.split()
+        ],
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    rows = []
+    for index in range(20):
+        song = copy.deepcopy(annotation)
+        song["info"].update(id=f"s-{index}", title=f"Song {index}")
+        for note in song["annotations"]["annot"]["notes"]:
+            note["freq"] = [440.0]
+        (raw / f"{index}.json").write_text(json.dumps(song))
+        rows.append(
+            dict(
+                sample_id=f"sample-{index}",
+                dali_id=f"s-{index}",
+                split="train" if index < 10 else "val",
+                artist="Artist",
+                title=f"Song {index}",
+                line_count=2,
+            )
+        )
+    upstream = tmp_path / "up.csv"
+    write_upstream(upstream, rows)
+    checkpoint = tmp_path / "contrastive.pt"
+    original = save_contrastive(checkpoint)
+    config = {
+        "data": dict(
+            dali_dir=str(raw),
+            prepared_dir=str(tmp_path / "data"),
+            language="english",
+            min_ncc=0,
+            max_syllables=8,
+            valid_fraction=0.2,
+            test_fraction=0.2,
+            seed=1234,
+            stress_source="ipa",
+            include_melody=True,
+            lines_per_window=2,
+            pretraining_manifest=str(upstream) if pretrained else None,
+        ),
+        "model": dict(
+            conditioning="bridge",
+            melody_checkpoint=str(checkpoint) if pretrained else None,
+            max_notes=32,
+        ),
+        "training": dict(
+            output_dir=str(tmp_path / "runs"),
+            device="cpu",
+            seed=1234,
+            epochs=1,
+            batch_size=2,
+            patience=2,
+            learning_rate=0.001,
+            melody_learning_rate=0.0001,
+            melody_unfreeze_epoch=None,
+            warmup_steps=0,
+            schedule="constant_after_warmup",
+        ),
+    }
+    manifest = prepare(config)
+    if pretrained:
+        assert manifest["pretraining_split_audit"]["shared_songs"] == 20
+        assert manifest["songs"]["s-19"]["split"] == "valid"
+    output = train(config, smoke_test=True)
+    metrics = json.loads((output / "metrics.jsonl").read_text())
+    assert metrics["train"]["loss"] > 0
+    assert 0 <= metrics["valid"]["generation"]["syllable_count_accuracy"] <= 1
+    restored = ProsodyBridge.load(output / "best")
+    ds = BridgeDataset(tmp_path / "data", "valid", lines_per_window=2, max_notes=32)
+    assert len(ds[0]["note_line_ids"]) == 4  # Retains the DALI melisma note.
+    assert len(decode_bridge_tokens(ds[0]["labels"])[0]["syllables"]) == 2
+    if pretrained:
+        for key, value in restored.melody_encoder.state_dict().items():
+            assert torch.equal(value, original.state_dict()[key])
+        upstream.write_text(upstream.read_text() + "\n")
+        with pytest.raises(ValueError, match="unchanged"):
+            train(config, smoke_test=True)
+    else:
+        with pytest.raises(ValueError, match="melody_checkpoint"):
+            train(config)
+
+
+def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_model, tokenizer):
+    from prosodia_lyricist import generation, ipa
+    from prosodia_lyricist.infer import infer, main
+
+    midi = pytest.importorskip("miditoolkit")
+    monkeypatch.setattr(
+        ipa,
+        "parse_words",
+        lambda text: [
+            {"text": word, "syllables": [ipa.syllable_features("ˈeɪ")]} for word in text.split()
+        ],
+    )
+    model = ProsodyBart(tiny_model.bart, max_syllables=8, dropout=0)
+    checkpoint = tmp_path / "template"
+    model.save(checkpoint, tokenizer)
+    (checkpoint / "run.json").write_text(
+        json.dumps(
+            {
+                "data_schema_version": 4,
+                "config": {
+                    "data": {"stress_source": "ipa"},
+                    "model": {"max_source_length": 64, "max_target_length": 64},
+                },
+            }
+        )
+    )
+    bridge.save(tmp_path / "bridge")
+    original_decode = ProsodyBridge.decode
+
+    def decode(self, tokens, memory, mask):
+        values = original_decode(self, tokens, memory, mask)
+        values[:, -1] = -1000
+        values[:, -1, [4, LINE_END, 7, 6, LINE_END, EOS][tokens.shape[1] - 1]] = 1000
+        return values
+
+    monkeypatch.setattr(ProsodyBridge, "decode", decode)
+    song = midi.MidiFile(ticks_per_beat=480)
+    instrument = midi.Instrument(0)
+    instrument.notes = [
+        midi.Note(80, 60, 0, 240),
+        midi.Note(80, 62, 240, 480),
+        midi.Note(80, 64, 960, 1440),
+    ]
+    song.instruments.append(instrument)
+    song.markers.append(midi.Marker("end", 480))
+    song.tempo_changes = [midi.TempoChange(120, 0), midi.TempoChange(60, 960)]
+    song.time_signature_changes = [midi.TimeSignature(3, 4, 0)]
+    path = tmp_path / "song.mid"
+    song.dump(str(path))
+    raw = midi_melody_record(path)
+    assert len(raw["lines"]) == 2 and raw["lines"][1]["unmarked_tail"]
+    assert raw["lines"][1]["melody"]["note_duration_seconds"] == pytest.approx([1])
+    weights_hash = file_sha256(checkpoint / "weights.pt")
+
+    def script():
+        sequence = iter(
+            tokenizer.convert_tokens_to_ids(
+                ["<s>", "hello", "<word_end>", ".", "world", "<word_end>", ".", "</s>"]
+            )
+        )
+        monkeypatch.setattr(
+            generation,
+            "sample",
+            lambda logits, **kwargs: next(sequence) if logits.numel() == len(tokenizer) else 2,
+        )
+
+    script()
+    result = infer(
+        checkpoint,
+        path,
+        bridge_checkpoint=tmp_path / "bridge",
+        device="cpu",
+        top_k=1,
+        max_new_tokens=16,
+        return_report=True,
+        reference_lines=["hello", "world"],
+    )
+    assert result["lyrics"] == ["hello", "world"]
+    assert result["stress_source"] == "learned"
+    assert result["bridge"]["note_counts"] == [2, 1]
+    assert result["bridge"]["syllable_counts"] == [1, 2]
+    assert result["encoded_source"] == encode_source(
+        {"title": "", "lines": result["template"]}, tokenizer, 8
+    )
+    assert result["reference_perplexity"]["perplexity"] > 0
+    assert result["decoder_explanation"]["prosody_correction"]
+    script()
+    other = infer(
+        checkpoint,
+        path,
+        bridge_checkpoint=tmp_path / "bridge",
+        device="cpu",
+        top_k=1,
+        max_new_tokens=16,
+        return_report=True,
+        reference_lines=["song", "light"],
+    )
+    assert other["encoded_source"] == result["encoded_source"]
+    assert other["generated_token_ids"] == result["generated_token_ids"]
+    assert file_sha256(checkpoint / "weights.pt") == weights_hash
+    with pytest.raises(ValueError, match="heuristic option"):
+        infer(checkpoint, path, bridge_checkpoint=tmp_path / "bridge", stress_source="supplement")
+    prefix = tmp_path / "report"
+    explanations = tmp_path / "explanations.json"
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer",
+            "--checkpoint",
+            str(checkpoint),
+            "--bridge-checkpoint",
+            str(tmp_path / "bridge"),
+            "--midi",
+            str(path),
+            "--device",
+            "cpu",
+            "--report-prefix",
+            str(prefix),
+            "--explanations",
+            str(explanations),
+            "--max-new-tokens",
+            "16",
+        ],
+    )
+    script()
+    main()
+    report = json.loads(prefix.with_suffix(".json").read_text())
+    assert report["decoder_explanation"] == json.loads(explanations.read_text())
+    assert "one note per syllable" not in prefix.with_suffix(".md").read_text()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer",
+            "--bridge-checkpoint",
+            str(tmp_path / "bridge"),
+            "--midi",
+            str(path),
+            "--device",
+            "cpu",
+            "--template-only",
+            "--report-prefix",
+            str(tmp_path / "templates"),
+        ],
+    )
+    main()
+    assert json.loads((tmp_path / "templates.json").read_text())["bridge"]["syllable_counts"] == [
+        1,
+        2,
+    ]

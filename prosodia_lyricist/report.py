@@ -9,6 +9,8 @@ def pattern(syllables):
 
 
 def markdown_report(report):
+    learned = report["stress_source"] == "learned"
+
     def escaped(value):
         return str(value).replace("|", "\\|").replace("\n", " ").replace("`", "'")
 
@@ -20,9 +22,25 @@ def markdown_report(report):
         "",
         f"- Input: `{report['midi']}`",
         f"- Unit: **whole song**, {len(report['template'])} ordered phrases in one encoder input.",
-        f"- Template method: `{report['stress_source']}`; one note per syllable.",
-        "- MIDI tick zero anchors the metrical grid; phrase markers are inclusive of note onsets.",
+        (
+            "- Template method: learned IPA syllable counts, stress and vowel length."
+            if learned
+            else f"- Template method: `{report['stress_source']}`; one note per syllable."
+        ),
+        (
+            "- Phrase markers are inclusive of note onsets."
+            if learned
+            else "- MIDI tick zero anchors the metrical grid; "
+            "phrase markers are inclusive of note onsets."
+        ),
     ]
+    if learned:
+        rows.append(
+            "- Scores compare lyrics with the predicted template; "
+            "this is not ground-truth accuracy."
+        )
+        if report.get("bridge"):
+            rows.append(f"- Bridge checkpoint: `{report['bridge']['checkpoint']}`")
     if report.get("checkpoint"):
         rows.append(f"- Checkpoint: `{report['checkpoint']}`")
         if report.get("decoder_mode"):
@@ -118,7 +136,12 @@ def markdown_report(report):
             rows.extend(
                 [
                     f"Input: **{len(source['syllables'])} syllables**. "
-                    f"Long means duration > {source['length_threshold_ticks']:.3f} ticks.",
+                    + (
+                        f"Predicted from {len(source['melody']['midi_pitches'])} notes; "
+                        "length labels describe IPA vowels."
+                        if learned
+                        else f"Long means duration > {source['length_threshold_ticks']:.3f} ticks."
+                    ),
                     "",
                     f"`{pattern(source['syllables'])}`",
                 ]
@@ -164,8 +187,7 @@ def markdown_report(report):
                 "",
                 "| Slot | Note | Start–end ticks | Bar:beat | Input | Word / IPA | Output |"
                 + (
-                    " Ground-truth word / IPA | Ground-truth prosody |"
-                    if reference_columns else ""
+                    " Ground-truth word / IPA | Ground-truth prosody |" if reference_columns else ""
                 ),
                 "| --- | --- | --- | --- | --- | --- | --- |"
                 + (" --- | --- |" if reference_columns else ""),
@@ -176,7 +198,7 @@ def markdown_report(report):
         for slot in range(max(len(syllables), len(generated), len(reference))):
             inp = syllables[slot] if slot < len(syllables) else None
             out = generated[slot] if slot < len(generated) else None
-            note = inp["note"] if inp else None
+            note = inp.get("note") if inp else None
             cells = [
                 slot + 1,
                 note["pitch"] if note else "—",

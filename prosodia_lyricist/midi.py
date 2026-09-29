@@ -5,6 +5,51 @@ import math
 from .dali import normalize_text
 
 
+def midi_melody_record(path, *, track=0, title=""):
+    """Raw melody notes in seconds, with phrase ends and no inferred prosody labels."""
+    import miditoolkit
+
+    midi = miditoolkit.MidiFile(str(path))
+    if not 0 <= track < len(midi.instruments):
+        raise ValueError("MIDI melody track is out of range")
+    instrument = midi.instruments[track]
+    notes = sorted(instrument.notes, key=lambda n: (n.start, n.end))
+    if instrument.is_drum or not notes:
+        raise ValueError("Select a non-empty, non-drum melody track")
+    if any(n.start < 0 or n.end <= n.start for n in notes):
+        raise ValueError("MIDI has invalid note timing")
+    if any(a.end > b.start for a, b in zip(notes, notes[1:])):
+        raise ValueError("MIDI melody track must be monophonic")
+    boundaries = sorted({marker.time for marker in midi.markers})
+    if not boundaries:
+        raise ValueError("MIDI needs phrase-end markers matching training lyric lines")
+    final_marker = boundaries[-1]
+    if boundaries[-1] < notes[-1].end:
+        boundaries.append(notes[-1].end)
+    times = midi.get_tick_to_time_mapping()
+    lines, cursor = [], 0
+    for boundary in boundaries:
+        group = []
+        while cursor < len(notes) and notes[cursor].start <= boundary:
+            group.append(notes[cursor])
+            cursor += 1
+        if group:
+            lines.append(
+                {
+                    "id": f"midi:{len(lines)}",
+                    "unmarked_tail": group[0].start > final_marker,
+                    "melody": {
+                        "midi_pitches": [n.pitch for n in group],
+                        "onset_seconds": [float(times[n.start]) for n in group],
+                        "note_duration_seconds": [
+                            float(times[n.end] - times[n.start]) for n in group
+                        ],
+                    },
+                }
+            )
+    return {"title": normalize_text(title), "lines": lines}
+
+
 def metric_stress(start, duration, resolution):
     """Original project's duration-dependent 4-beat heuristic (not observed beats)."""
     durations = {resolution * factor for factor in (1, 0.5, 0.25, 0.125, 0.0625, 2, 4)}
