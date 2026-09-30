@@ -9,17 +9,17 @@ import pytest
 import torch
 
 from prosodia_lyricist.bridge_data import (
-    BOS,
-    EOS,
-    LINE_END,
+    FIRST_LINE,
+    PAIR_OFFSET,
     BridgeDataset,
     bridge_collate,
     decode_bridge_tokens,
     encode_bridge_source,
     encode_bridge_targets,
 )
+from prosodia_lyricist.bridge_infer import skeleton_counts
 from prosodia_lyricist.bridge_model import ProsodyBridge
-from prosodia_lyricist.bridge_train import run_bridge_epoch
+from prosodia_lyricist.bridge_train import evaluate_templates, run_bridge_epoch
 from prosodia_lyricist.features import encode_source
 from prosodia_lyricist.melody_checkpoint import file_sha256, load_contrastive_melody
 from prosodia_lyricist.melody_data import audit_pretraining_splits, preserve_pretraining_splits
@@ -71,8 +71,10 @@ def test_source_target_separation_and_template_decoder_compatibility(lines, toke
     np.testing.assert_array_equal(source["melody_features"], other["melody_features"])
     assert source["note_line_ids"] == other["note_line_ids"] == [1, 1, 1, 1, 2]
     labels = encode_bridge_targets(lines, 8)
-    assert labels == [7, 4, 5, LINE_END, 6, LINE_END, EOS]
-    reconstructed = decode_bridge_tokens([BOS, *labels])
+    assert labels == [FIRST_LINE, 6, 3, 4, FIRST_LINE + 1, 5]
+    reconstructed = decode_bridge_tokens(labels)
+    batch = bridge_collate([example(lines), example(lines[:1])])
+    assert batch["syllable_counts"].tolist() == [[3, 1], [3, 0]]
     assert encode_source({"lines": reconstructed}, tokenizer, 8) == encode_source(
         {"lines": lines}, tokenizer, 8
     )
@@ -86,6 +88,7 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     bridge(**batch).loss.backward()
     assert bridge.adapter[1].weight.grad.abs().sum() > 0
     assert bridge.output.weight.grad.abs().sum() > 0
+    assert bridge.count_head[1].weight.grad.abs().sum() > 0
     assert all(p.grad is None for p in bridge.melody_encoder.parameters())
     bridge.zero_grad(set_to_none=True)
     bridge.set_melody_trainable(True)
@@ -94,15 +97,16 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     bridge.eval()
     output = bridge(**batch)
     future = {**batch, "labels": batch["labels"].clone()}
-    future["labels"][0, 1] = 7
+    future["labels"][0, 1] = 3
     after = bridge(**future)
+    assert torch.equal(output.count_logits, after.count_logits)
     assert torch.equal(output.logits[:, :2], after.logits[:, :2])
     assert not torch.equal(output.logits[:, 2:], after.logits[:, 2:])
     padded = {
         key: torch.nn.functional.pad(value, (0, 0, 0, 3), value=99)
         if key == "melody_features"
         else value
-        if key == "line_counts"
+        if key in ("line_counts", "syllable_counts")
         else torch.nn.functional.pad(value, (0, 3), value=-100 if key == "labels" else 0)
         for key, value in batch.items()
     }
@@ -114,37 +118,51 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     assert any(key.startswith("melody_encoder.") for key in restored.state_dict())
 
 
-def test_variable_counts_exact_phrase_count_and_boundary_caps(monkeypatch, lines, bridge):
+def test_skeleton_counts_and_line_ids_are_fixed(lines, bridge):
     batch = bridge_collate([encode_bridge_source(lines), encode_bridge_source(lines[:1])])
-    original = bridge.decode
-    sequence = [4, LINE_END, 6, 7, LINE_END, EOS]
-
-    def scripted(tokens, memory, mask):
-        logits = original(tokens, memory, mask)
-        logits[:, -1] = -1000
-        logits[:, -1, sequence[tokens.shape[1] - 1]] = 1000
-        return logits
-
     bridge.eval()
-    monkeypatch.setattr(bridge, "decode", scripted)
-    result = bridge.generate(**batch)
-    assert [len(p["syllables"]) for p in decode_bridge_tokens(result.sequences[0].tolist())] == [
-        1,
-        2,
-    ]
-    assert len(decode_bridge_tokens(result.sequences[1].tolist())) == 1
-    assert result.forced_line_endings == [[], []]
-    monkeypatch.setattr(bridge, "decode", original)
     with torch.no_grad():
         bridge.output.weight.zero_()
         bridge.output.bias.fill_(-1000)
-        bridge.output.bias[4] = 1000
-    capped = bridge.generate(**batch)
-    assert capped.forced_line_endings == [[0, 1], [0]]
-    assert [len(p["syllables"]) for p in decode_bridge_tokens(capped.sequences[0].tolist())] == [
-        8,
-        8,
-    ]
+        bridge.output.bias[0] = 1000
+        bridge.count_head[1].weight.zero_()
+        bridge.count_head[1].bias.fill_(-1000)
+        bridge.count_head[1].bias[1] = 1000  # Two syllables per line, independent of note counts.
+    result = bridge.generate(**batch)
+    assert result.syllable_counts.tolist() == [[2, 2], [2, 0]]
+    assert len(decode_bridge_tokens(result.sequences[1].tolist())) == 1
+    mixed = bridge.generate(**batch, syllable_counts=torch.tensor([[0, 5], [8, 0]]))
+    assert mixed.syllable_counts.tolist() == [[2, 5], [8, 0]]
+    assert mixed.predicted_syllable_counts.tolist() == [[2, 2], [2, 0]]
+    first = mixed.sequences[0].tolist()
+    assert first == [FIRST_LINE, PAIR_OFFSET, PAIR_OFFSET, FIRST_LINE + 1] + [PAIR_OFFSET] * 5
+    assert bridge.output.out_features == 4
+    assert "line_end" not in bridge.vocabulary and "eos" not in bridge.vocabulary
+
+
+def test_training_requires_consistent_skeleton_and_validation_predicts_counts(
+    monkeypatch, lines, bridge
+):
+    batch = bridge_collate([example(lines)])
+    broken = {**batch, "syllable_counts": torch.tensor([[2, 2]])}
+    with pytest.raises(ValueError, match="skeleton"):
+        bridge(**broken)
+    with torch.no_grad():
+        bridge.count_head[1].weight.zero_()
+        bridge.count_head[1].bias.fill_(-1000)
+        bridge.count_head[1].bias[1] = 1000
+    original = bridge.generate
+    called = []
+
+    def generate(**kwargs):
+        assert "syllable_counts" not in kwargs and "labels" not in kwargs
+        called.append(True)
+        return original(**kwargs)
+
+    monkeypatch.setattr(bridge, "generate", generate)
+    scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
+    assert called and scores["syllable_count_accuracy"] == 0
+    assert scores["syllable_count_mae"] == 1
 
 
 def test_token_weighted_accumulation_and_partial_group(lines, bridge):
@@ -185,6 +203,93 @@ def test_saved_limits_and_checkpoint_validation(tmp_path, lines, bridge):
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="feature rules"):
         ProsodyBridge.load(tmp_path)
+    metadata["format_version"] = 1
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="retrain"):
+        ProsodyBridge.load(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "skeleton",
+    [
+        {},
+        {"lines": []},
+        {"lines": [{"line_id": 1}, {"line_id": 0}]},
+        {"lines": [{"line_id": 0}, {"line_id": 0}]},
+        {"lines": [{"line_id": 0, "syllable_count": 0}, {"line_id": 1}]},
+        {"lines": [{"line_id": 0, "syllable_count": 9}, {"line_id": 1}]},
+        {"lines": [{"line_id": 0, "syllable_count": True}, {"line_id": 1}]},
+        {"lines": [{"line_id": 0, "syllable_count": 1.5}, {"line_id": 1}]},
+    ],
+)
+def test_invalid_user_skeletons_are_rejected(skeleton):
+    with pytest.raises(ValueError, match="[Ss]keleton"):
+        skeleton_counts(skeleton, 2, 8)
+
+
+def test_user_skeleton_accepts_optional_counts_and_json(tmp_path):
+    skeleton = {"lines": [{"line_id": 0, "syllable_count": 5}, {"line_id": 1}]}
+    assert skeleton_counts(skeleton, 2, 8) == [5, 0]
+    path = tmp_path / "skeleton.json"
+    path.write_text(json.dumps(skeleton))
+    assert skeleton_counts(path, 2, 8) == [5, 0]
+    assert skeleton_counts(None, 2, 8) == [0, 0]
+
+
+def test_count_head_does_not_see_skeleton_lengths(lines, bridge):
+    changed = copy.deepcopy(lines)
+    changed[0]["syllables"] = changed[0]["syllables"][:1]
+    changed[1]["syllables"] *= 3
+    bridge.eval()
+    before = bridge(**bridge_collate([example(lines)]))
+    after = bridge(**bridge_collate([example(changed)]))
+    assert torch.equal(before.count_logits, after.count_logits)
+
+
+def test_skeleton_option_requires_bridge(monkeypatch):
+    from prosodia_lyricist.infer import infer, main
+
+    with pytest.raises(ValueError, match="requires a bridge_checkpoint"):
+        infer("unused", "unused.mid", bridge_skeleton={"lines": []})
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "infer",
+            "--midi",
+            "unused.mid",
+            "--template-only",
+            "--bridge-skeleton",
+            "unused.json",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 2
+
+
+def test_custom_skeleton_spans_encoder_windows_and_tail(tmp_path, bridge):
+    from prosodia_lyricist.bridge_infer import predict_templates
+
+    midi = pytest.importorskip("miditoolkit")
+    song = midi.MidiFile(ticks_per_beat=480)
+    instrument = midi.Instrument(0)
+    instrument.notes = [midi.Note(80, 60 + i, i * 960, i * 960 + 240) for i in range(3)]
+    song.instruments.append(instrument)
+    song.markers = [midi.Marker("end 0", 480), midi.Marker("end 1", 1440)]
+    path = tmp_path / "song.mid"
+    song.dump(str(path))
+    bridge.save(tmp_path / "bridge")
+    skeleton = {
+        "lines": [
+            {"line_id": index, "syllable_count": count} for index, count in enumerate([1, 3, 2])
+        ]
+    }
+    records, metadata = predict_templates(tmp_path / "bridge", path, skeleton=skeleton)
+    assert metadata["encoder_windows"] == 2
+    assert metadata["syllable_counts"] == [1, 3, 2]
+    assert metadata["skeleton"] == skeleton
+    assert [line["line_id"] for line in records] == [0, 1, 2]
+    assert records[-1]["unmarked_tail"]
 
 
 def test_bridge_config_paths_without_bart(tmp_path):
@@ -424,14 +529,23 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     )
     bridge.save(tmp_path / "bridge")
     original_decode = ProsodyBridge.decode
+    original_counts = ProsodyBridge.predict_counts
 
-    def decode(self, tokens, memory, mask):
-        values = original_decode(self, tokens, memory, mask)
+    def decode(self, tokens, memory, mask, skeleton):
+        values = original_decode(self, tokens, memory, mask, skeleton)
         values[:, -1] = -1000
-        values[:, -1, [4, LINE_END, 7, 6, LINE_END, EOS][tokens.shape[1] - 1]] = 1000
+        values[:, -1, 0] = 1000
+        return values
+
+    def predict_counts(self, memory, note_line_ids, line_counts):
+        values = original_counts(self, memory, note_line_ids, line_counts)
+        values.fill_(-1000)
+        values[:, 0, 0] = 1000
+        values[:, 1, 1] = 1000
         return values
 
     monkeypatch.setattr(ProsodyBridge, "decode", decode)
+    monkeypatch.setattr(ProsodyBridge, "predict_counts", predict_counts)
     song = midi.MidiFile(ticks_per_beat=480)
     instrument = midi.Instrument(0)
     instrument.notes = [
@@ -477,6 +591,7 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     assert result["stress_source"] == "learned"
     assert result["bridge"]["note_counts"] == [2, 1]
     assert result["bridge"]["syllable_counts"] == [1, 2]
+    assert result["bridge"]["count_sources"] == ["predicted", "predicted"]
     assert result["encoded_source"] == encode_source(
         {"title": "", "lines": result["template"]}, tokenizer, 8
     )
@@ -500,6 +615,17 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
         infer(checkpoint, path, bridge_checkpoint=tmp_path / "bridge", stress_source="supplement")
     prefix = tmp_path / "report"
     explanations = tmp_path / "explanations.json"
+    skeleton_path = tmp_path / "skeleton.json"
+    skeleton_path.write_text(
+        json.dumps(
+            {
+                "lines": [
+                    {"line_id": 0, "syllable_count": 3},
+                    {"line_id": 1},
+                ]
+            }
+        )
+    )
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -508,6 +634,8 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
             str(checkpoint),
             "--bridge-checkpoint",
             str(tmp_path / "bridge"),
+            "--bridge-skeleton",
+            str(skeleton_path),
             "--midi",
             str(path),
             "--device",
@@ -523,6 +651,8 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     script()
     main()
     report = json.loads(prefix.with_suffix(".json").read_text())
+    assert report["bridge"]["syllable_counts"] == [3, 2]
+    assert report["bridge"]["count_sources"] == ["provided", "predicted"]
     assert report["decoder_explanation"] == json.loads(explanations.read_text())
     assert "one note per syllable" not in prefix.with_suffix(".md").read_text()
     monkeypatch.setattr(
@@ -531,6 +661,8 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
             "infer",
             "--bridge-checkpoint",
             str(tmp_path / "bridge"),
+            "--bridge-skeleton",
+            str(skeleton_path),
             "--midi",
             str(path),
             "--device",
@@ -542,6 +674,6 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     )
     main()
     assert json.loads((tmp_path / "templates.json").read_text())["bridge"]["syllable_counts"] == [
-        1,
+        3,
         2,
     ]

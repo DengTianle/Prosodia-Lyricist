@@ -1,5 +1,8 @@
 # Contrastive melody → IPA template → lyrics
 
+> Historical v1 design. The current v2 bridge uses supplied line prefixes and
+> optional syllable counts, with no LINE_END prediction. See the README for usage.
+
 The bridge replaces the heuristic MIDI-to-template step. It reuses the trained
 melody trunk and 177-dimensional note encoding from `prosodia-direct`, learns
 to predict the template decoder's source labels, and leaves the existing

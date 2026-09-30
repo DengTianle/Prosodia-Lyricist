@@ -11,9 +11,18 @@ from .data import read_manifest
 from .melody_checkpoint import file_sha256
 from .melody_encoder.encoding import MELODY_FEATURE_DIM, encode_note_sequence
 
-PAD, BOS, EOS, LINE_END = range(4)
+PAD, BOS, SLOT = range(3)
 PAIRS = (("strong", "long"), ("strong", "short"), ("weak", "long"), ("weak", "short"))
-VOCAB = ["pad", "bos", "eos", "line_end"] + [f"{s}_{n}" for s, n in PAIRS]
+PAIR_OFFSET = 3
+FIRST_LINE = PAIR_OFFSET + len(PAIRS)
+
+
+def bridge_vocabulary(lines_per_window):
+    return (
+        ["pad", "bos", "slot"]
+        + [f"{s}_{n}" for s, n in PAIRS]
+        + [f"line_{index}" for index in range(lines_per_window)]
+    )
 
 
 def encode_bridge_source(lines):
@@ -48,39 +57,41 @@ def encode_bridge_source(lines):
 
 
 def encode_bridge_targets(lines, max_syllables):
+    """DALI line membership fixes the prefixes; IPA supplies syllables within each line."""
     labels = []
-    for line in lines:
+    for index, line in enumerate(lines):
         if not 1 <= len(line["syllables"]) <= max_syllables:
             raise ValueError("IPA template exceeds the per-phrase syllable limit")
+        labels.append(FIRST_LINE + index)
         for syllable in line["syllables"]:
             pair = syllable["stress"], syllable["length"]
             if pair not in PAIRS:
                 raise ValueError("Bridge targets require binary IPA stress and vowel length")
-            labels.append(4 + PAIRS.index(pair))
-        labels.append(LINE_END)
-    return labels + [EOS]
+            labels.append(PAIR_OFFSET + PAIRS.index(pair))
+    return labels
 
 
 def decode_bridge_tokens(tokens):
-    lines, syllables = [], []
+    lines, syllables, padded = [], None, False
     for token in tokens:
-        if token in (PAD, BOS):
+        if token == PAD:
+            padded = True
             continue
-        if token == EOS:
-            if syllables:
-                raise ValueError("Template ended before a phrase boundary")
-            break
-        if token == LINE_END:
-            if not syllables:
-                raise ValueError("Empty predicted template phrase")
-            lines.append({"syllables": syllables})
+        if padded:
+            raise ValueError("Template padding must be trailing")
+        if token >= FIRST_LINE:
+            if token != FIRST_LINE + len(lines):
+                raise ValueError("Template line IDs must be consecutive, starting at line_0")
+            if syllables == []:
+                raise ValueError("Empty template phrase")
             syllables = []
-        elif 4 <= token < len(VOCAB):
-            stress, length = PAIRS[token - 4]
+            lines.append({"syllables": syllables})
+        elif PAIR_OFFSET <= token < FIRST_LINE and syllables is not None:
+            stress, length = PAIRS[token - PAIR_OFFSET]
             syllables.append({"stress": stress, "length": length})
         else:
-            raise ValueError("Invalid template token")
-    if syllables or not lines:
+            raise ValueError("Expected a line prefix followed by prosody pairs")
+    if not syllables:
         raise ValueError("Incomplete predicted template")
     return lines
 
@@ -138,6 +149,9 @@ def bridge_collate(examples):
         batch["labels"] = torch.full(
             (len(examples), max(len(e["labels"]) for e in examples)), -100, dtype=torch.long
         )
+        batch["syllable_counts"] = torch.zeros(
+            len(examples), int(batch["line_counts"].max()), dtype=torch.long
+        )
     for row, example in enumerate(examples):
         n = len(example["note_line_ids"])
         batch["melody_features"][row, :n] = torch.from_numpy(example["melody_features"])
@@ -145,4 +159,8 @@ def bridge_collate(examples):
         batch["note_line_ids"][row, :n] = torch.tensor(example["note_line_ids"])
         if "labels" in batch:
             batch["labels"][row, : len(example["labels"])] = torch.tensor(example["labels"])
+            counts = [len(line["syllables"]) for line in decode_bridge_tokens(example["labels"])]
+            if len(counts) != example["line_count"]:
+                raise ValueError("Target line skeleton does not match the melody lines")
+            batch["syllable_counts"][row, : len(counts)] = torch.tensor(counts)
     return batch
