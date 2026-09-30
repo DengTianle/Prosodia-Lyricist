@@ -12,13 +12,13 @@ data:
   stress_source: ipa
   include_melody: true
   # Set BEFORE preparation to the original CSV used for contrastive training.
-  pretraining_manifest: null
+  pretraining_manifest: ../../try-contrastive/600_2line_window12/segments_manifest.csv
   lines_per_window: 2 # Must match that manifest; final shorter window is retained.
 
 model:
   conditioning: bridge
   # Current note-based two-pool contrastive checkpoint (same format as prosodia-direct).
-  melody_checkpoint: null
+  melody_checkpoint: ../../try-contrastive/checkpoints/600_2line_window12/22Sep_1mig/best.pt
   max_notes: 512 # Skip overlong windows, never truncate.
   bridge_decoder:
     d_model: 256
