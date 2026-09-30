@@ -189,10 +189,11 @@ MIDI notes → contrastively pretrained melody encoder → learned prosody templ
            → existing template-decoder checkpoint → lyrics
 ```
 
-It predicts stress, vowel length, and phrase endings (hence syllable counts),
-allowing different numbers of notes and syllables. The lyric decoder is trained
-separately and needs no retraining for this integration. All predicted phrases
-are passed to it together, preserving whole-song lyric context.
+It fills a supplied line skeleton with stress/vowel-length pairs. DALI line
+membership and IPA counts define the training skeleton. At inference, counts
+can be supplied or predicted by a separate melody-conditioned count head;
+the decoder does not generate line endings. All predicted phrases are passed
+to the lyric model together, preserving whole-song lyric context.
 
 In [`configs/bridge.yaml`](configs/bridge.yaml), set `model.melody_checkpoint`
 to the current note-based two-pool contrastive checkpoint and
@@ -217,7 +218,10 @@ python -m prosodia_lyricist.infer \
 retain existing inference. Use it with `--template-only` to inspect predictions
 without loading the lyric model. Reports retain both the predicted syllable
 templates and original note arrays; reference lyrics are used only for scoring.
-See [bridge architecture, training, and evaluation](docs/prosody-bridge.md).
+`--bridge-skeleton skeleton.json` accepts `{"lines": [{"line_id": 0,
+"syllable_count": 8}, {"line_id": 1}]}`: IDs follow MIDI phrase order, and omitted
+counts are predicted. The new v2 bridge requires retraining; the existing
+prepared DALI data and template-decoder checkpoint can be reused.
 
 ## MIDI inference
 

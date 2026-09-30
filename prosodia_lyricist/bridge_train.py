@@ -12,7 +12,13 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .bridge_data import BridgeDataset, bridge_collate, decode_bridge_tokens
+from .bridge_data import (
+    FIRST_LINE,
+    PAIR_OFFSET,
+    BridgeDataset,
+    bridge_collate,
+    decode_bridge_tokens,
+)
 from .bridge_model import ProsodyBridge
 from .data import read_manifest
 from .melody_checkpoint import file_sha256, load_contrastive_melody
@@ -37,17 +43,20 @@ def run_bridge_epoch(
 ):
     training = optimizer is not None
     model.train(training)
-    total_loss, tokens, correct, batches, updates = 0.0, 0, 0, 0, 0
+    totals = {"prosody": 0.0, "counts": 0.0}
+    tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
-            group_tokens = sum(int(batch["labels"].ne(-100).sum()) for batch in group)
+            group_tokens = sum(int(batch["syllable_counts"].sum()) for batch in group)
+            group_phrases = sum(int(batch["line_counts"].sum()) for batch in group)
             if training:
                 optimizer.zero_grad(set_to_none=True)
             for batch in group:
                 batch = {key: value.to(device) for key, value in batch.items()}
-                active = batch["labels"].ne(-100)
+                active = batch["labels"].ge(PAIR_OFFSET) & batch["labels"].lt(FIRST_LINE)
                 count = int(active.sum())
+                line_count = int(batch["line_counts"].sum())
                 with (
                     torch.autocast("cuda", dtype=torch.bfloat16)
                     if precision == "bf16"
@@ -57,10 +66,18 @@ def run_bridge_epoch(
                 if not torch.isfinite(output.loss):
                     raise FloatingPointError("Non-finite bridge loss")
                 if training:
-                    (output.loss * (count / group_tokens)).backward()
-                correct += int((output.logits.argmax(-1).eq(batch["labels"]) & active).sum())
-                total_loss += output.loss.item() * count
+                    # Each objective has its own valid-target denominator, including tails.
+                    (
+                        output.loss_components["prosody"] * (count / group_tokens)
+                        + output.loss_components["counts"] * (line_count / group_phrases)
+                    ).backward()
+                correct += int(
+                    ((output.logits.argmax(-1) + PAIR_OFFSET).eq(batch["labels"]) & active).sum()
+                )
+                totals["prosody"] += output.loss_components["prosody"].item() * count
+                totals["counts"] += output.loss_components["counts"].item() * line_count
                 tokens += count
+                phrases += line_count
                 batches += 1
             if training:
                 if gradient_clip is not None:
@@ -74,10 +91,13 @@ def run_bridge_epoch(
                 updates += 1
     if not tokens:
         raise ValueError("No template targets")
+    components = {"prosody": totals["prosody"] / tokens, "counts": totals["counts"] / phrases}
     return {
-        "loss": total_loss / tokens,
-        "teacher_forced_token_accuracy": correct / tokens,
+        "loss": sum(components.values()),
+        "components": components,
+        "teacher_forced_pair_accuracy": correct / tokens,
         "tokens": tokens,
+        "phrases": phrases,
         "batches": batches,
         "optimizer_steps": updates,
     }
@@ -87,12 +107,13 @@ def run_bridge_epoch(
 def evaluate_templates(model, loader, device, *, max_batches=None):
     """Free-running accuracy, including the learned number of syllables per phrase."""
     model.eval()
-    phrases, exact, count_matches, count_error, forced = 0, 0, 0, 0, 0
+    phrases, exact, count_matches, count_error = 0, 0, 0, 0
     for batch in islice(loader, max_batches):
         labels = batch.pop("labels")
+        # Automatic validation must not receive the ground-truth skeleton lengths.
+        batch.pop("syllable_counts")
         batch = {key: value.to(device) for key, value in batch.items()}
         result = model.generate(**batch)
-        forced += sum(map(len, result.forced_line_endings))
         for predicted, truth in zip(result.sequences.tolist(), labels.tolist(), strict=True):
             expected = decode_bridge_tokens([token for token in truth if token != -100])
             actual = decode_bridge_tokens(predicted)
@@ -106,7 +127,6 @@ def evaluate_templates(model, loader, device, *, max_batches=None):
         "exact_template_accuracy": exact / phrases,
         "syllable_count_accuracy": count_matches / phrases,
         "syllable_count_mae": count_error / phrases,
-        "forced_line_endings": forced,
     }
 
 
@@ -233,6 +253,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     output.mkdir(parents=True, exist_ok=False)
     run = {
         "conditioning": "bridge",
+        "bridge_target_scheme": "line_skeleton_v2",
         "config": config,
         "smoke_test": smoke_test,
         "data_schema_version": manifest["schema_version"],
