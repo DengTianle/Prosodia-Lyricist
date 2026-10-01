@@ -29,7 +29,7 @@ model:
 
 training:
   output_dir: ../checkpoints/bridge
-  device: auto
+  device: cuda
   seed: 1234
   epochs: 100
   batch_size: 16

@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=prosodia-bridge
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:h100-47:4
+#SBATCH --gres=gpu:h100-47:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=02:50:00
