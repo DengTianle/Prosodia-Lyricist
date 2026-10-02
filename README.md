@@ -230,6 +230,25 @@ and the template-decoder checkpoint can be reused. Training IPA counts can diffe
 from inference note counts because of melisma; exact slot counts do not guarantee
 that the downstream lyric model produces the same number of syllables.
 
+Evaluate a bridge directly on the prepared held-out `test` split (or use
+`--split valid`). This loads the checkpoint's limits without needing the training YAML:
+
+```bash
+python -m prosodia_lyricist.bridge_eval \
+  --checkpoint checkpoints/bridge/BRIDGE_RUN/best \
+  --prepared-dir data/dali-bridge --device cuda --precision bf16 \
+  --output outputs/bridge-eval.json
+```
+
+The JSON reports slot-weighted cross-entropy and strength, length, and combined
+accuracy with teacher forcing on the IPA skeleton. A separate greedy evaluation
+uses note counts and reports the same accuracies by slot order (missing/extra
+slots count as incorrect), exact phrase accuracy, and the existing phrase-mean
+prosody-BLEU. This is unsmoothed BLEU-4, so phrases shorter than four slots score
+zero even when correct. Count mismatches and skipped windows are also reported.
+Use `--limit 100` for a quick subset check; omit it for the full split. On CPU/MPS,
+use `--precision fp32` (the default).
+
 ## MIDI inference
 
 MIDI remains the inference input. All phrases are encoded together under one

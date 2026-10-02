@@ -5,7 +5,7 @@ import logging
 import math
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from itertools import islice
+from itertools import islice, zip_longest
 from pathlib import Path
 
 import torch
@@ -21,6 +21,7 @@ from .bridge_data import (
 )
 from .bridge_model import TARGET_SCHEME, ProsodyBridge
 from .data import read_manifest
+from .evaluation import prosody_bleu
 from .melody_checkpoint import file_sha256, load_contrastive_melody
 from .melody_data import read_melody_manifest
 from .runtime import seed_everything, select_device
@@ -45,6 +46,7 @@ def run_bridge_epoch(
     model.train(training)
     total_loss = 0.0
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
+    strength_correct, length_correct = 0, 0
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
@@ -67,9 +69,12 @@ def run_bridge_epoch(
                 if training:
                     # Weight by valid prosody slots, including partial accumulation groups.
                     (output.loss * (count / group_tokens)).backward()
-                correct += int(
-                    ((output.logits.argmax(-1) + PAIR_OFFSET).eq(batch["labels"]) & active).sum()
-                )
+                predicted = output.logits.argmax(-1)[active]
+                expected = batch["labels"][active] - PAIR_OFFSET
+                correct += int(predicted.eq(expected).sum())
+                # PAIRS groups strong/weak by quotient and long/short by remainder.
+                strength_correct += int((predicted // 2).eq(expected // 2).sum())
+                length_correct += int((predicted % 2).eq(expected % 2).sum())
                 total_loss += output.loss.item() * count
                 tokens += count
                 phrases += line_count
@@ -90,6 +95,8 @@ def run_bridge_epoch(
     return {
         "loss": loss,
         "components": {"prosody": loss},
+        "teacher_forced_strength_accuracy": strength_correct / tokens,
+        "teacher_forced_length_accuracy": length_correct / tokens,
         "teacher_forced_pair_accuracy": correct / tokens,
         "tokens": tokens,
         "phrases": phrases,
@@ -99,12 +106,15 @@ def run_bridge_epoch(
 
 
 @torch.inference_mode()
-def evaluate_templates(model, loader, device, *, max_batches=None):
+def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp32"):
     """Note-count generation accuracy; note/IPA count differences are dataset diagnostics."""
     model.eval()
     phrases, exact, count_matches, count_error, count_phrases = 0, 0, 0, 0, 0
     skipped_windows, skipped_phrases = 0, 0
+    bleu_sum, short_phrases = 0.0, 0
+    slots, strength_correct, length_correct, pair_correct = 0, 0, 0, 0
     for batch in islice(loader, max_batches):
+        batch = dict(batch)
         labels = batch.pop("labels")
         # Inference uses actual notes, never ground-truth IPA slot lengths.
         ipa_counts = batch.pop("syllable_counts")
@@ -122,17 +132,39 @@ def evaluate_templates(model, loader, device, *, max_batches=None):
         batch = {key: value[eligible] for key, value in batch.items()}
         # A filtered batch can have fewer phrases than its original padding width.
         batch = {key: value.to(device) for key, value in batch.items()}
-        result = model.generate(**batch)
+        with (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if precision == "bf16"
+            else nullcontext()
+        ):
+            result = model.generate(**batch)
         for predicted, truth in zip(result.sequences.tolist(), labels.tolist(), strict=True):
             expected = decode_bridge_tokens([token for token in truth if token != -100])
             actual = decode_bridge_tokens(predicted)
             for a, b in zip(actual, expected, strict=True):
                 phrases += 1
                 exact += a == b
+                hypothesis, reference = a["syllables"], b["syllables"]
+                bleu_sum += prosody_bleu(reference, hypothesis)
+                short_phrases += min(len(reference), len(hypothesis)) < 4
+                # Compare by phrase/slot order; missing and extra slots are incorrect.
+                slots += max(len(hypothesis), len(reference))
+                for predicted_slot, expected_slot in zip_longest(hypothesis, reference):
+                    if predicted_slot is not None and expected_slot is not None:
+                        strength_correct += predicted_slot["stress"] == expected_slot["stress"]
+                        length_correct += predicted_slot["length"] == expected_slot["length"]
+                        pair_correct += predicted_slot == expected_slot
     return {
         "phrases": phrases,
         "slot_count_source": "notes",
+        "strength_accuracy": strength_correct / slots if slots else None,
+        "length_accuracy": length_correct / slots if slots else None,
+        "pair_accuracy": pair_correct / slots if slots else None,
+        "compared_slots": slots,
         "exact_template_accuracy": exact / phrases if phrases else None,
+        "prosody_bleu": bleu_sum / phrases if phrases else None,
+        "bleu_short_phrases": short_phrases,
+        "count_diagnostic_phrases": count_phrases,
         "note_ipa_count_match_rate": count_matches / count_phrases,
         "note_ipa_count_mae": count_error / count_phrases,
         "skipped_slot_limit_windows": skipped_windows,
@@ -310,6 +342,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 loaders["valid"],
                 device,
                 max_batches=max_batches,
+                precision=precision,
             )
             handle.write(
                 json.dumps(
