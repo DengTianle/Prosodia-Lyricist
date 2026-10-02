@@ -19,7 +19,7 @@ from .bridge_data import (
     bridge_collate,
     decode_bridge_tokens,
 )
-from .bridge_model import ProsodyBridge
+from .bridge_model import TARGET_SCHEME, ProsodyBridge
 from .data import read_manifest
 from .melody_checkpoint import file_sha256, load_contrastive_melody
 from .melody_data import read_melody_manifest
@@ -43,13 +43,12 @@ def run_bridge_epoch(
 ):
     training = optimizer is not None
     model.train(training)
-    totals = {"prosody": 0.0, "counts": 0.0}
+    total_loss = 0.0
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
             group_tokens = sum(int(batch["syllable_counts"].sum()) for batch in group)
-            group_phrases = sum(int(batch["line_counts"].sum()) for batch in group)
             if training:
                 optimizer.zero_grad(set_to_none=True)
             for batch in group:
@@ -66,16 +65,12 @@ def run_bridge_epoch(
                 if not torch.isfinite(output.loss):
                     raise FloatingPointError("Non-finite bridge loss")
                 if training:
-                    # Each objective has its own valid-target denominator, including tails.
-                    (
-                        output.loss_components["prosody"] * (count / group_tokens)
-                        + output.loss_components["counts"] * (line_count / group_phrases)
-                    ).backward()
+                    # Weight by valid prosody slots, including partial accumulation groups.
+                    (output.loss * (count / group_tokens)).backward()
                 correct += int(
                     ((output.logits.argmax(-1) + PAIR_OFFSET).eq(batch["labels"]) & active).sum()
                 )
-                totals["prosody"] += output.loss_components["prosody"].item() * count
-                totals["counts"] += output.loss_components["counts"].item() * line_count
+                total_loss += output.loss.item() * count
                 tokens += count
                 phrases += line_count
                 batches += 1
@@ -91,10 +86,10 @@ def run_bridge_epoch(
                 updates += 1
     if not tokens:
         raise ValueError("No template targets")
-    components = {"prosody": totals["prosody"] / tokens, "counts": totals["counts"] / phrases}
+    loss = total_loss / tokens
     return {
-        "loss": sum(components.values()),
-        "components": components,
+        "loss": loss,
+        "components": {"prosody": loss},
         "teacher_forced_pair_accuracy": correct / tokens,
         "tokens": tokens,
         "phrases": phrases,
@@ -105,13 +100,27 @@ def run_bridge_epoch(
 
 @torch.inference_mode()
 def evaluate_templates(model, loader, device, *, max_batches=None):
-    """Free-running accuracy, including the learned number of syllables per phrase."""
+    """Note-count generation accuracy; note/IPA count differences are dataset diagnostics."""
     model.eval()
-    phrases, exact, count_matches, count_error = 0, 0, 0, 0
+    phrases, exact, count_matches, count_error, count_phrases = 0, 0, 0, 0, 0
+    skipped_windows, skipped_phrases = 0, 0
     for batch in islice(loader, max_batches):
         labels = batch.pop("labels")
-        # Automatic validation must not receive the ground-truth skeleton lengths.
-        batch.pop("syllable_counts")
+        # Inference uses actual notes, never ground-truth IPA slot lengths.
+        ipa_counts = batch.pop("syllable_counts")
+        counts = model.note_counts(batch["note_line_ids"], batch["line_counts"])
+        active = ipa_counts.gt(0)
+        count_matches += int((counts.eq(ipa_counts) & active).sum())
+        count_error += int((counts - ipa_counts).abs()[active].sum())
+        count_phrases += int(active.sum())
+        eligible = counts.le(model.max_syllables).all(-1)
+        skipped_windows += int((~eligible).sum())
+        skipped_phrases += int(batch["line_counts"][~eligible].sum())
+        if not eligible.any():
+            continue
+        labels = labels[eligible]
+        batch = {key: value[eligible] for key, value in batch.items()}
+        # A filtered batch can have fewer phrases than its original padding width.
         batch = {key: value.to(device) for key, value in batch.items()}
         result = model.generate(**batch)
         for predicted, truth in zip(result.sequences.tolist(), labels.tolist(), strict=True):
@@ -120,13 +129,14 @@ def evaluate_templates(model, loader, device, *, max_batches=None):
             for a, b in zip(actual, expected, strict=True):
                 phrases += 1
                 exact += a == b
-                count_matches += len(a["syllables"]) == len(b["syllables"])
-                count_error += abs(len(a["syllables"]) - len(b["syllables"]))
     return {
         "phrases": phrases,
-        "exact_template_accuracy": exact / phrases,
-        "syllable_count_accuracy": count_matches / phrases,
-        "syllable_count_mae": count_error / phrases,
+        "slot_count_source": "notes",
+        "exact_template_accuracy": exact / phrases if phrases else None,
+        "note_ipa_count_match_rate": count_matches / count_phrases,
+        "note_ipa_count_mae": count_error / count_phrases,
+        "skipped_slot_limit_windows": skipped_windows,
+        "skipped_slot_limit_phrases": skipped_phrases,
     }
 
 
@@ -253,7 +263,9 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     output.mkdir(parents=True, exist_ok=False)
     run = {
         "conditioning": "bridge",
-        "bridge_target_scheme": "line_skeleton_v2",
+        "bridge_target_scheme": TARGET_SCHEME,
+        "training_count_source": "ipa",
+        "inference_count_source": "notes",
         "config": config,
         "smoke_test": smoke_test,
         "data_schema_version": manifest["schema_version"],

@@ -14,6 +14,7 @@ from .melody_encoder.encoding import MELODY_REPRESENTATION
 from .melody_encoder.modeling import MelodyTransformerEncoder, SinusoidalPositionalEncoding
 
 PROSODY_RULES = "ipa_binary_stress_diphthong_length_v2"
+TARGET_SCHEME = "line_skeleton_v3"
 
 
 class ProsodyBridge(nn.Module):
@@ -88,7 +89,6 @@ class ProsodyBridge(nn.Module):
                 nn.init.xavier_uniform_(parameter)
         # Only prosody pairs can be predicted. Line markers come from the skeleton.
         self.output = nn.Linear(d_model, len(PAIRS))
-        self.count_head = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, max_syllables))
         self.melody_frozen = False
 
     def set_melody_trainable(self, trainable):
@@ -121,40 +121,38 @@ class ProsodyBridge(nn.Module):
             or (((note_line_ids < 1) | (note_line_ids > line_counts[:, None])) & active).any()
         ):
             raise ValueError("Invalid note phrase membership or empty melody")
+        counts = self.note_counts(note_line_ids, line_counts)
+        active_lines = torch.arange(counts.shape[1], device=counts.device)[None].lt(
+            line_counts[:, None]
+        )
+        if (counts.eq(0) & active_lines).any():
+            raise ValueError("Every skeleton line must have melody notes")
         with torch.no_grad() if self.melody_frozen else nullcontext():
             notes = self.melody_encoder.encode(
                 melody_features, melody_attention_mask, project=False
             ).note_embeddings
         return self.adapter(notes) + self.line_embedding(note_line_ids)
 
-    def predict_counts(self, memory, note_line_ids, line_counts):
-        line_ids = torch.arange(1, int(line_counts.max()) + 1, device=memory.device)
-        membership = note_line_ids[:, None].eq(line_ids[None, :, None])
-        active = line_ids[None].le(line_counts[:, None])
-        if (membership.sum(-1).eq(0) & active).any():
-            raise ValueError("Every skeleton line must have melody notes")
-        weights = membership.to(memory.dtype)
-        pooled = weights.bmm(memory) / weights.sum(-1, keepdim=True).clamp_min(1)
-        return self.count_head(pooled)
+    @staticmethod
+    def note_counts(note_line_ids, line_counts):
+        """Count actual notes per phrase; padding has phrase ID zero."""
+        line_ids = torch.arange(1, int(line_counts.max()) + 1, device=note_line_ids.device)
+        return note_line_ids[:, None].eq(line_ids[None, :, None]).sum(-1)
 
-    def resolve_counts(self, count_logits, line_counts, supplied=None, *, training=False):
-        active = torch.arange(count_logits.shape[1], device=line_counts.device)[None].lt(
+    def validate_counts(self, counts, line_counts):
+        if counts.dtype not in (torch.int32, torch.int64) or counts.shape != (
+            len(line_counts), int(line_counts.max())
+        ):
+            raise ValueError("Skeleton syllable_counts must be integer counts for each line")
+        active = torch.arange(counts.shape[1], device=line_counts.device)[None].lt(
             line_counts[:, None]
         )
-        predicted = (count_logits.argmax(-1) + 1).masked_fill(~active, 0)
-        if supplied is None:
-            if training:
-                raise ValueError("Training requires a DALI syllable-count skeleton")
-            return predicted, predicted
-        if supplied.shape != predicted.shape or supplied.dtype not in (torch.int32, torch.int64):
-            raise ValueError("Skeleton syllable_counts must be integer counts for each line")
         if (
-            ((supplied < 0) | (supplied > self.max_syllables)).any()
-            or (supplied[~active].ne(0).any())
-            or (training and supplied[active].eq(0).any())
+            ((counts < 0) | (counts > self.max_syllables)).any()
+            or counts[~active].ne(0).any()
+            or counts[active].eq(0).any()
         ):
             raise ValueError("Invalid skeleton syllable counts or nonzero padding")
-        return torch.where(supplied.ne(0), supplied, predicted), predicted
 
     def make_skeleton(self, counts, *, width=None):
         """Fixed line prefixes and known slots; local IDs restart at each melody window."""
@@ -217,9 +215,8 @@ class ProsodyBridge(nn.Module):
         if not labels.ne(-100).any():
             raise ValueError("No bridge target labels")
         memory = self.encode(melody_features, melody_attention_mask, note_line_ids, line_counts)
-        count_logits = self.predict_counts(memory, note_line_ids, line_counts)
-        counts, _ = self.resolve_counts(count_logits, line_counts, syllable_counts, training=True)
-        skeleton = self.make_skeleton(counts, width=labels.shape[1])
+        self.validate_counts(syllable_counts, line_counts)
+        skeleton = self.make_skeleton(syllable_counts, width=labels.shape[1])
         slots = skeleton["tokens"].eq(SLOT)
         structure = skeleton["tokens"].masked_fill(skeleton["tokens"].eq(PAD), -100)
         if (
@@ -232,15 +229,12 @@ class ProsodyBridge(nn.Module):
         tokens[:, 1:] = labels[:, :-1].masked_fill(labels[:, :-1].eq(-100), PAD)
         logits = self.decode(tokens, memory, melody_attention_mask, skeleton)
         pair_targets = (labels - PAIR_OFFSET).masked_fill(~slots, -100)
-        count_targets = (counts - 1).masked_fill(counts.eq(0), -100)
         components = {
             "prosody": F.cross_entropy(logits.flatten(0, 1), pair_targets.flatten()),
-            "counts": F.cross_entropy(count_logits.flatten(0, 1), count_targets.flatten()),
         }
         return SimpleNamespace(
             loss=sum(components.values()),
             logits=logits,
-            count_logits=count_logits,
             loss_components=components,
         )
 
@@ -251,12 +245,15 @@ class ProsodyBridge(nn.Module):
         melody_attention_mask,
         note_line_ids,
         line_counts,
-        syllable_counts=None,
     ):
-        """Fill a fixed skeleton. A zero/omitted count is predicted once per melody line."""
+        """Fill exactly one prosody slot per note in each supplied melody phrase."""
         memory = self.encode(melody_features, melody_attention_mask, note_line_ids, line_counts)
-        count_logits = self.predict_counts(memory, note_line_ids, line_counts)
-        counts, predicted_counts = self.resolve_counts(count_logits, line_counts, syllable_counts)
+        counts = self.note_counts(note_line_ids, line_counts)
+        if counts.gt(self.max_syllables).any():
+            raise ValueError(
+                f"Phrase note count exceeds bridge slot limit {self.max_syllables}; no truncation"
+            )
+        self.validate_counts(counts, line_counts)
         skeleton = self.make_skeleton(counts)
         size, device = len(memory), memory.device
         tokens = torch.full((size, 1), BOS, dtype=torch.long, device=device)
@@ -271,15 +268,15 @@ class ProsodyBridge(nn.Module):
         return SimpleNamespace(
             sequences=tokens[:, 1:],
             syllable_counts=counts,
-            predicted_syllable_counts=predicted_counts,
         )
 
     def save(self, directory):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         metadata = {
-            "format_version": 2,
-            "target_scheme": "line_skeleton_v2",
+            "format_version": 3,
+            "target_scheme": TARGET_SCHEME,
+            "inference_count_source": "notes",
             "melody_representation": MELODY_REPRESENTATION,
             "prosody_rules": PROSODY_RULES,
             "vocabulary": self.vocabulary,
@@ -298,10 +295,13 @@ class ProsodyBridge(nn.Module):
         directory = Path(directory)
         meta = json.loads((directory / "bridge.json").read_text(encoding="utf-8"))
         if meta["format_version"] == 1:
-            raise ValueError("The LINE_END bridge uses format v1; retrain for the v2 line skeleton")
+            raise ValueError("The LINE_END bridge uses format v1; retrain for the v3 line skeleton")
         if (
-            meta["format_version"] != 2
-            or meta.get("target_scheme") != "line_skeleton_v2"
+            meta["format_version"] not in (2, 3)
+            or meta.get("target_scheme") != (
+                "line_skeleton_v2" if meta["format_version"] == 2 else TARGET_SCHEME
+            )
+            or (meta["format_version"] == 3 and meta.get("inference_count_source") != "notes")
             or meta["vocabulary"] != bridge_vocabulary(meta["lines_per_window"])
             or (meta["melody_representation"] != MELODY_REPRESENTATION)
             or meta["prosody_rules"] != PROSODY_RULES
@@ -315,8 +315,15 @@ class ProsodyBridge(nn.Module):
             max_notes=meta["max_notes"],
             provenance=meta["provenance"],
         )
-        model.load_state_dict(
-            torch.load(directory / "bridge_weights.pt", map_location="cpu", weights_only=True),
-            strict=True,
-        )
+        state = torch.load(directory / "bridge_weights.pt", map_location="cpu", weights_only=True)
+        if meta["format_version"] == 2:
+            # The v2 prosody decoder is identical; discard only the removed count-head weights.
+            for key in (
+                "count_head.0.weight", "count_head.0.bias",
+                "count_head.1.weight", "count_head.1.bias",
+            ):
+                if key not in state:
+                    raise ValueError(f"Incomplete v2 bridge checkpoint: missing {key}")
+                state.pop(key)
+        model.load_state_dict(state, strict=True)
         return model

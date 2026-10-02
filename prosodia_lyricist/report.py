@@ -10,6 +10,8 @@ def pattern(syllables):
 
 def markdown_report(report):
     learned = report["stress_source"] == "learned"
+    count_sources = report.get("bridge", {}).get("count_sources", [])
+    note_slots = learned and bool(count_sources) and all(s == "notes" for s in count_sources)
 
     def escaped(value):
         return str(value).replace("|", "\\|").replace("\n", " ").replace("`", "'")
@@ -23,7 +25,9 @@ def markdown_report(report):
         f"- Input: `{report['midi']}`",
         f"- Unit: **whole song**, {len(report['template'])} ordered phrases in one encoder input.",
         (
-            "- Template method: learned IPA syllable counts, stress and vowel length."
+            "- Template method: learned stress and IPA vowel length; one prosody slot per note."
+            if note_slots
+            else "- Template method: learned IPA syllable counts, stress and vowel length."
             if learned
             else f"- Template method: `{report['stress_source']}`; one note per syllable."
         ),
@@ -137,7 +141,8 @@ def markdown_report(report):
                 [
                     f"Input: **{len(source['syllables'])} syllables**. "
                     + (
-                        f"Predicted from {len(source['melody']['midi_pitches'])} notes; "
+                        ("Fixed from " if note_slots else "Predicted from ")
+                        + f"{len(source['melody']['midi_pitches'])} notes; "
                         "length labels describe IPA vowels."
                         if learned
                         else f"Long means duration > {source['length_threshold_ticks']:.3f} ticks."

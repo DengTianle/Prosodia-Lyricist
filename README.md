@@ -189,11 +189,12 @@ MIDI notes → contrastively pretrained melody encoder → learned prosody templ
            → existing template-decoder checkpoint → lyrics
 ```
 
-It fills a supplied line skeleton with stress/vowel-length pairs. DALI line
-membership and IPA counts define the training skeleton. At inference, counts
-can be supplied or predicted by a separate melody-conditioned count head;
-the decoder does not generate line endings. All predicted phrases are passed
-to the lyric model together, preserving whole-song lyric context.
+It fills a fixed line skeleton with stress/vowel-length pairs. DALI line
+membership and lyric-derived IPA counts define the training skeleton. The only
+training loss is cross-entropy on prosody pairs; there is no count-prediction head
+or loss. At inference, MIDI markers define the phrases and each note supplies
+exactly one prosody slot. The decoder does not generate line endings. All phrase
+templates are passed to the lyric model together, preserving whole-song context.
 
 In [`configs/bridge.yaml`](configs/bridge.yaml), set `model.melody_checkpoint`
 to the current note-based two-pool contrastive checkpoint and
@@ -218,10 +219,16 @@ python -m prosodia_lyricist.infer \
 retain existing inference. Use it with `--template-only` to inspect predictions
 without loading the lyric model. Reports retain both the predicted syllable
 templates and original note arrays; reference lyrics are used only for scoring.
-`--bridge-skeleton skeleton.json` accepts `{"lines": [{"line_id": 0,
-"syllable_count": 8}, {"line_id": 1}]}`: IDs follow MIDI phrase order, and omitted
-counts are predicted. The new v2 bridge requires retraining; the existing
-prepared DALI data and template-decoder checkpoint can be reused.
+No skeleton JSON is needed; `--bridge-skeleton` has been removed. Phrase note
+counts must fit `max_syllables`; overlong input fails without truncation. Generation
+validation reports skipped overlong windows and note/IPA count differences as data
+diagnostics, rather than learned count accuracy. Reports also list the raw notes,
+bar:beat positions, and old beat-based labels as a separate comparison.
+The v3 bridge can load v2 scaffold checkpoints, discarding their obsolete count
+head; v1 LINE_END checkpoints still require retraining. Existing prepared IPA data
+and the template-decoder checkpoint can be reused. Training IPA counts can differ
+from inference note counts because of melisma; exact slot counts do not guarantee
+that the downstream lyric model produces the same number of syllables.
 
 ## MIDI inference
 

@@ -46,14 +46,11 @@ def infer(
     return_explanations=False,
     prosody_correction=True,
     bridge_checkpoint=None,
-    bridge_skeleton=None,
 ):
     if temperature <= 0 or top_k < 1 or (max_new_tokens is not None and max_new_tokens < 1):
         raise ValueError("temperature, top_k, and max_new_tokens must be positive")
     seed_everything(seed)
     checkpoint = Path(checkpoint)
-    if bridge_skeleton is not None and not bridge_checkpoint:
-        raise ValueError("bridge_skeleton requires a bridge_checkpoint")
     if bridge_checkpoint and stress_source is not None:
         raise ValueError("stress_source is a heuristic option; omit it when using a bridge")
     if bridge_checkpoint and (checkpoint / "melody.json").exists():
@@ -92,7 +89,6 @@ def infer(
             track=track,
             device=device,
             max_syllables=model.max_syllables,
-            skeleton=bridge_skeleton,
         )
         stress_source = "learned"
     else:
@@ -238,7 +234,8 @@ def template_report(midi, records, *, title, track, stress_source):
         "template_role": "model_input",
         "warnings": (
             [
-                "Stress, vowel length and syllable count are learned IPA-template predictions.",
+                "Stress and vowel length are learned IPA-template predictions. "
+                "Each MIDI note supplies one source prosody slot.",
                 "No note-to-syllable alignment is inferred; note arrays are retained separately.",
             ]
             if learned
@@ -266,11 +263,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", help="The run's best/ directory")
     parser.add_argument("--bridge-checkpoint", help="Learned melody-to-template best/ directory")
-    parser.add_argument(
-        "--bridge-skeleton",
-        metavar="JSON",
-        help="Ordered line_id entries with optional syllable_count; omitted counts are predicted",
-    )
     parser.add_argument("--midi", required=True)
     parser.add_argument("--title", default="")
     parser.add_argument("--track", type=int, default=0)
@@ -304,8 +296,6 @@ def main():
         help="Ablation: feed predicted prosody back without IPA correction",
     )
     args = parser.parse_args()
-    if args.bridge_skeleton and not args.bridge_checkpoint:
-        parser.error("--bridge-skeleton requires --bridge-checkpoint")
     if args.bridge_checkpoint and args.stress_source:
         parser.error("--stress-source is a heuristic option; omit it with --bridge-checkpoint")
     if not args.template_only and not args.checkpoint:
@@ -338,7 +328,6 @@ def main():
                 title=args.title,
                 track=args.track,
                 device=select_device(args.device),
-                skeleton=args.bridge_skeleton,
             )
             stress = "learned"
         else:

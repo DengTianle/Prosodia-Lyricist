@@ -1,7 +1,8 @@
 # Contrastive melody → IPA template → lyrics
 
-> Historical v1 design. The current v2 bridge uses supplied line prefixes and
-> optional syllable counts, with no LINE_END prediction. See the README for usage.
+> Historical v1 design. The current v3 bridge trains on IPA prosody slots and uses
+> one slot per MIDI note at inference, with no count head or LINE_END prediction.
+> See the README for usage; v2 scaffold weights remain loadable without their count head.
 
 The bridge replaces the heuristic MIDI-to-template step. It reuses the trained
 melody trunk and 177-dimensional note encoding from `prosodia-direct`, learns

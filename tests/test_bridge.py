@@ -18,7 +18,6 @@ from prosodia_lyricist.bridge_data import (
     encode_bridge_source,
     encode_bridge_targets,
 )
-from prosodia_lyricist.bridge_infer import skeleton_counts
 from prosodia_lyricist.bridge_model import ProsodyBridge
 from prosodia_lyricist.bridge_train import evaluate_templates, run_bridge_epoch
 from prosodia_lyricist.features import encode_source
@@ -112,7 +111,7 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     bridge(**batch).loss.backward()
     assert bridge.adapter[1].weight.grad.abs().sum() > 0
     assert bridge.output.weight.grad.abs().sum() > 0
-    assert bridge.count_head[1].weight.grad.abs().sum() > 0
+    assert not hasattr(bridge, "count_head")
     assert all(p.grad is None for p in bridge.melody_encoder.parameters())
     bridge.zero_grad(set_to_none=True)
     bridge.set_melody_trainable(True)
@@ -123,7 +122,13 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     future = {**batch, "labels": batch["labels"].clone()}
     future["labels"][0, 1] = 3
     after = bridge(**future)
-    assert torch.equal(output.count_logits, after.count_logits)
+    assert set(output.loss_components) == {"prosody"}
+    targets = (batch["labels"] - PAIR_OFFSET).masked_fill(batch["labels"].ge(FIRST_LINE), -100)
+    targets = targets.masked_fill(batch["labels"].eq(-100), -100)
+    assert torch.equal(
+        output.loss,
+        torch.nn.functional.cross_entropy(output.logits.flatten(0, 1), targets.flatten()),
+    )
     assert torch.equal(output.logits[:, :2], after.logits[:, :2])
     assert not torch.equal(output.logits[:, 2:], after.logits[:, 2:])
     padded = {
@@ -142,39 +147,30 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     assert any(key.startswith("melody_encoder.") for key in restored.state_dict())
 
 
-def test_skeleton_counts_and_line_ids_are_fixed(lines, bridge):
+def test_note_counts_fix_slots_and_line_ids_in_padded_batches(lines, bridge):
     batch = bridge_collate([encode_bridge_source(lines), encode_bridge_source(lines[:1])])
     bridge.eval()
     with torch.no_grad():
         bridge.output.weight.zero_()
         bridge.output.bias.fill_(-1000)
         bridge.output.bias[0] = 1000
-        bridge.count_head[1].weight.zero_()
-        bridge.count_head[1].bias.fill_(-1000)
-        bridge.count_head[1].bias[1] = 1000  # Two syllables per line, independent of note counts.
     result = bridge.generate(**batch)
-    assert result.syllable_counts.tolist() == [[2, 2], [2, 0]]
+    assert result.syllable_counts.tolist() == [[4, 1], [4, 0]]
     assert len(decode_bridge_tokens(result.sequences[1].tolist())) == 1
-    mixed = bridge.generate(**batch, syllable_counts=torch.tensor([[0, 5], [8, 0]]))
-    assert mixed.syllable_counts.tolist() == [[2, 5], [8, 0]]
-    assert mixed.predicted_syllable_counts.tolist() == [[2, 2], [2, 0]]
-    first = mixed.sequences[0].tolist()
-    assert first == [FIRST_LINE, PAIR_OFFSET, PAIR_OFFSET, FIRST_LINE + 1] + [PAIR_OFFSET] * 5
+    assert not hasattr(result, "predicted_syllable_counts")
+    first = result.sequences[0].tolist()
+    assert first == [FIRST_LINE] + [PAIR_OFFSET] * 4 + [FIRST_LINE + 1, PAIR_OFFSET]
     assert bridge.output.out_features == 4
     assert "line_end" not in bridge.vocabulary and "eos" not in bridge.vocabulary
 
 
-def test_training_requires_consistent_skeleton_and_validation_predicts_counts(
+def test_training_uses_ipa_skeleton_and_validation_uses_notes(
     monkeypatch, lines, bridge
 ):
     batch = bridge_collate([example(lines)])
     broken = {**batch, "syllable_counts": torch.tensor([[2, 2]])}
     with pytest.raises(ValueError, match="skeleton"):
         bridge(**broken)
-    with torch.no_grad():
-        bridge.count_head[1].weight.zero_()
-        bridge.count_head[1].bias.fill_(-1000)
-        bridge.count_head[1].bias[1] = 1000
     original = bridge.generate
     called = []
 
@@ -185,8 +181,10 @@ def test_training_requires_consistent_skeleton_and_validation_predicts_counts(
 
     monkeypatch.setattr(bridge, "generate", generate)
     scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
-    assert called and scores["syllable_count_accuracy"] == 0
-    assert scores["syllable_count_mae"] == 1
+    assert called and scores["note_ipa_count_match_rate"] == 0.5
+    assert scores["note_ipa_count_mae"] == 0.5
+    assert scores["slot_count_source"] == "notes"
+    assert scores["skipped_slot_limit_windows"] == 0
 
 
 def test_token_weighted_accumulation_and_partial_group(lines, bridge):
@@ -233,47 +231,51 @@ def test_saved_limits_and_checkpoint_validation(tmp_path, lines, bridge):
         ProsodyBridge.load(tmp_path)
 
 
-@pytest.mark.parametrize(
-    "skeleton",
-    [
-        {},
-        {"lines": []},
-        {"lines": [{"line_id": 1}, {"line_id": 0}]},
-        {"lines": [{"line_id": 0}, {"line_id": 0}]},
-        {"lines": [{"line_id": 0, "syllable_count": 0}, {"line_id": 1}]},
-        {"lines": [{"line_id": 0, "syllable_count": 9}, {"line_id": 1}]},
-        {"lines": [{"line_id": 0, "syllable_count": True}, {"line_id": 1}]},
-        {"lines": [{"line_id": 0, "syllable_count": 1.5}, {"line_id": 1}]},
-    ],
-)
-def test_invalid_user_skeletons_are_rejected(skeleton):
-    with pytest.raises(ValueError, match="[Ss]keleton"):
-        skeleton_counts(skeleton, 2, 8)
+def test_v2_checkpoint_reuses_prosody_weights_without_count_head(tmp_path, lines, bridge):
+    bridge.eval().save(tmp_path)
+    batch = bridge_collate([encode_bridge_source(lines)])
+    expected = bridge.generate(**batch)
+    metadata_path = tmp_path / "bridge.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update(format_version=2, target_scheme="line_skeleton_v2")
+    metadata.pop("inference_count_source")
+    metadata_path.write_text(json.dumps(metadata))
+    state = bridge.state_dict()
+    # Recreate the exact v2-only parameters; a biased count head cannot affect v3 slots.
+    head = torch.nn.Sequential(torch.nn.LayerNorm(8), torch.nn.Linear(8, 8))
+    state.update({f"count_head.{key}": value for key, value in head.state_dict().items()})
+    torch.save(state, tmp_path / "bridge_weights.pt")
+    restored = ProsodyBridge.load(tmp_path).eval()
+    assert not hasattr(restored, "count_head")
+    assert torch.equal(restored.generate(**batch).sequences, expected.sequences)
+    for key, value in bridge.state_dict().items():
+        assert torch.equal(value, restored.state_dict()[key])
+    restored.save(tmp_path / "converted")
+    assert json.loads((tmp_path / "converted" / "bridge.json").read_text())["format_version"] == 3
+    state.pop("output.weight")
+    torch.save(state, tmp_path / "bridge_weights.pt")
+    with pytest.raises(RuntimeError, match="output.weight"):
+        ProsodyBridge.load(tmp_path)
 
 
-def test_user_skeleton_accepts_optional_counts_and_json(tmp_path):
-    skeleton = {"lines": [{"line_id": 0, "syllable_count": 5}, {"line_id": 1}]}
-    assert skeleton_counts(skeleton, 2, 8) == [5, 0]
-    path = tmp_path / "skeleton.json"
-    path.write_text(json.dumps(skeleton))
-    assert skeleton_counts(path, 2, 8) == [5, 0]
-    assert skeleton_counts(None, 2, 8) == [0, 0]
+def test_generation_rejects_overlong_note_phrases_and_validation_reports_skips(lines, bridge):
+    bridge.max_syllables = 3
+    batch = bridge_collate([example(lines), example(lines[1:])])
+    with pytest.raises(ValueError, match="slot limit 3; no truncation"):
+        bridge.eval().generate(**bridge_collate([encode_bridge_source(lines)]))
+    scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
+    assert scores["phrases"] == 1
+    assert scores["skipped_slot_limit_windows"] == 1
+    assert scores["skipped_slot_limit_phrases"] == 2
+    assert scores["note_ipa_count_match_rate"] == pytest.approx(2 / 3)
+    skipped = evaluate_templates(bridge, [bridge_collate([example(lines)])], torch.device("cpu"))
+    assert skipped["phrases"] == 0 and skipped["exact_template_accuracy"] is None
 
 
-def test_count_head_does_not_see_skeleton_lengths(lines, bridge):
-    changed = copy.deepcopy(lines)
-    changed[0]["syllables"] = changed[0]["syllables"][:1]
-    changed[1]["syllables"] *= 3
-    bridge.eval()
-    before = bridge(**bridge_collate([example(lines)]))
-    after = bridge(**bridge_collate([example(changed)]))
-    assert torch.equal(before.count_logits, after.count_logits)
-
-
-def test_skeleton_option_requires_bridge(monkeypatch):
+def test_removed_skeleton_option_is_rejected(monkeypatch):
     from prosodia_lyricist.infer import infer, main
 
-    with pytest.raises(ValueError, match="requires a bridge_checkpoint"):
+    with pytest.raises(TypeError, match="bridge_skeleton"):
         infer("unused", "unused.mid", bridge_skeleton={"lines": []})
     monkeypatch.setattr(
         "sys.argv",
@@ -291,7 +293,7 @@ def test_skeleton_option_requires_bridge(monkeypatch):
     assert exc.value.code == 2
 
 
-def test_custom_skeleton_spans_encoder_windows_and_tail(tmp_path, bridge):
+def test_note_skeleton_spans_encoder_windows_and_tail(tmp_path, bridge):
     from prosodia_lyricist.bridge_infer import predict_templates
 
     midi = pytest.importorskip("miditoolkit")
@@ -303,15 +305,11 @@ def test_custom_skeleton_spans_encoder_windows_and_tail(tmp_path, bridge):
     path = tmp_path / "song.mid"
     song.dump(str(path))
     bridge.save(tmp_path / "bridge")
-    skeleton = {
-        "lines": [
-            {"line_id": index, "syllable_count": count} for index, count in enumerate([1, 3, 2])
-        ]
-    }
-    records, metadata = predict_templates(tmp_path / "bridge", path, skeleton=skeleton)
+    records, metadata = predict_templates(tmp_path / "bridge", path)
     assert metadata["encoder_windows"] == 2
-    assert metadata["syllable_counts"] == [1, 3, 2]
-    assert metadata["skeleton"] == skeleton
+    assert metadata["syllable_counts"] == metadata["note_counts"] == [1, 1, 1]
+    assert metadata["count_sources"] == ["notes"] * 3
+    assert "predicted_syllable_counts" not in metadata
     assert [line["line_id"] for line in records] == [0, 1, 2]
     assert records[-1]["unmarked_tail"]
 
@@ -509,7 +507,9 @@ def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pret
     output = train(config, smoke_test=True)
     metrics = json.loads((output / "metrics.jsonl").read_text())
     assert metrics["train"]["loss"] > 0
-    assert 0 <= metrics["valid"]["generation"]["syllable_count_accuracy"] <= 1
+    assert 0 <= metrics["valid"]["generation"]["note_ipa_count_match_rate"] <= 1
+    assert set(metrics["train"]["components"]) == {"prosody"}
+    assert metrics["train"]["loss"] == metrics["train"]["components"]["prosody"]
     restored = ProsodyBridge.load(output / "best")
     ds = BridgeDataset(tmp_path / "data", "valid", lines_per_window=2, max_notes=32)
     assert len(ds[0]["note_line_ids"]) == 4  # Retains the DALI melisma note.
@@ -553,7 +553,6 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     )
     bridge.save(tmp_path / "bridge")
     original_decode = ProsodyBridge.decode
-    original_counts = ProsodyBridge.predict_counts
 
     def decode(self, tokens, memory, mask, skeleton):
         values = original_decode(self, tokens, memory, mask, skeleton)
@@ -561,15 +560,7 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
         values[:, -1, 0] = 1000
         return values
 
-    def predict_counts(self, memory, note_line_ids, line_counts):
-        values = original_counts(self, memory, note_line_ids, line_counts)
-        values.fill_(-1000)
-        values[:, 0, 0] = 1000
-        values[:, 1, 1] = 1000
-        return values
-
     monkeypatch.setattr(ProsodyBridge, "decode", decode)
-    monkeypatch.setattr(ProsodyBridge, "predict_counts", predict_counts)
     song = midi.MidiFile(ticks_per_beat=480)
     instrument = midi.Instrument(0)
     instrument.notes = [
@@ -614,8 +605,8 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     assert result["lyrics"] == ["hello", "world"]
     assert result["stress_source"] == "learned"
     assert result["bridge"]["note_counts"] == [2, 1]
-    assert result["bridge"]["syllable_counts"] == [1, 2]
-    assert result["bridge"]["count_sources"] == ["predicted", "predicted"]
+    assert result["bridge"]["syllable_counts"] == [2, 1]
+    assert result["bridge"]["count_sources"] == ["notes", "notes"]
     assert result["note_comparison"]["method"] is None
     assert "only 4/4" in result["note_comparison"]["warning"]
     assert result["note_comparison"]["lines"][0]["syllables"][0]["note"]["pitch"] == 60
@@ -642,17 +633,6 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
         infer(checkpoint, path, bridge_checkpoint=tmp_path / "bridge", stress_source="supplement")
     prefix = tmp_path / "report"
     explanations = tmp_path / "explanations.json"
-    skeleton_path = tmp_path / "skeleton.json"
-    skeleton_path.write_text(
-        json.dumps(
-            {
-                "lines": [
-                    {"line_id": 0, "syllable_count": 3},
-                    {"line_id": 1},
-                ]
-            }
-        )
-    )
     monkeypatch.setattr(
         "sys.argv",
         [
@@ -661,8 +641,6 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
             str(checkpoint),
             "--bridge-checkpoint",
             str(tmp_path / "bridge"),
-            "--bridge-skeleton",
-            str(skeleton_path),
             "--midi",
             str(path),
             "--device",
@@ -678,10 +656,10 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     script()
     main()
     report = json.loads(prefix.with_suffix(".json").read_text())
-    assert report["bridge"]["syllable_counts"] == [3, 2]
-    assert report["bridge"]["count_sources"] == ["provided", "predicted"]
+    assert report["bridge"]["syllable_counts"] == [2, 1]
+    assert report["bridge"]["count_sources"] == ["notes", "notes"]
     assert report["decoder_explanation"] == json.loads(explanations.read_text())
-    assert "one note per syllable" not in prefix.with_suffix(".md").read_text()
+    assert "one prosody slot per note" in prefix.with_suffix(".md").read_text()
     assert "| 1 | 60 | 0–240 | — | — |" in prefix.with_suffix(".md").read_text()
     monkeypatch.setattr(
         "sys.argv",
@@ -689,8 +667,6 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
             "infer",
             "--bridge-checkpoint",
             str(tmp_path / "bridge"),
-            "--bridge-skeleton",
-            str(skeleton_path),
             "--midi",
             str(path),
             "--device",
@@ -702,6 +678,6 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     )
     main()
     assert json.loads((tmp_path / "templates.json").read_text())["bridge"]["syllable_counts"] == [
-        3,
         2,
+        1,
     ]
