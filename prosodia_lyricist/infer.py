@@ -11,7 +11,7 @@ from transformers import AutoTokenizer
 
 from .evaluation import conditional_perplexity, evaluate_prosody, reference_targets, text_prosody
 from .features import encode_source
-from .midi import midi_records
+from .midi import midi_note_comparison, midi_records
 from .model import ProsodyBart
 from .prepare import SCHEMA_VERSION
 from .report import markdown_report, write_report
@@ -226,7 +226,7 @@ def infer(
 
 def template_report(midi, records, *, title, track, stress_source):
     learned = stress_source == "learned"
-    return {
+    report = {
         "report_version": 1,
         "unit": "whole_song",
         "title": title,
@@ -255,6 +255,11 @@ def template_report(midi, records, *, title, track, stress_source):
             else []
         ),
     }
+    if learned:
+        report["note_comparison"] = midi_note_comparison(midi, title=title, track=track)
+        if report["note_comparison"]["warning"]:
+            report["warnings"].append(report["note_comparison"]["warning"])
+    return report
 
 
 def main():

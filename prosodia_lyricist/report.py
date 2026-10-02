@@ -148,6 +148,43 @@ def markdown_report(report):
             )
         else:
             rows.append("**Extra generated phrase; no corresponding input phrase.**")
+        comparison = report.get("note_comparison")
+        if learned and comparison and index < len(comparison["lines"]):
+            musical = comparison["lines"][index]
+            rows.extend(["", "### MIDI notes and beat-based comparison", ""])
+            if comparison["method"]:
+                rows.append(
+                    "Old `supplement` formula: duration-dependent beat stress; "
+                    f"long means duration > {musical['length_threshold_ticks']:.3f} ticks "
+                    "(whole-melody mean). Comparison only; these labels do not enter the model "
+                    "or replace its predicted template in scoring."
+                )
+            else:
+                rows.append(comparison["warning"])
+            rows.extend(
+                [
+                    "",
+                    "Notes are listed in MIDI order, independently of predicted syllable slots.",
+                    "",
+                    "| Note # | Note | Start–end ticks | Bar:beat | Beat-based prosody |",
+                    "| --- | --- | --- | --- | --- |",
+                ]
+            )
+            for note_index, label in enumerate(musical["syllables"], 1):
+                note = label["note"]
+                position = (
+                    f"{note['measure']}:{note['quarter_beat']:g}"
+                    if note["measure"] is not None
+                    else "—"
+                )
+                cells = [
+                    note_index,
+                    note["pitch"],
+                    f"{note['start_tick']}–{note['end_tick']}",
+                    position,
+                    pattern([label]) if comparison["method"] else "—",
+                ]
+                rows.append("| " + " | ".join(escaped(c) for c in cells) + " |")
         if entry:
             rows.extend(
                 [
@@ -185,11 +222,20 @@ def markdown_report(report):
                 "",
                 "Position-by-position inspection only; this is not a fitted lyric/note alignment.",
                 "",
-                "| Slot | Note | Start–end ticks | Bar:beat | Input | Word / IPA | Output |"
+                (
+                    "| Slot | Input | Word / IPA | Output |"
+                    if learned
+                    else "| Slot | Note | Start–end ticks | Bar:beat | "
+                    "Input | Word / IPA | Output |"
+                )
                 + (
                     " Ground-truth word / IPA | Ground-truth prosody |" if reference_columns else ""
                 ),
-                "| --- | --- | --- | --- | --- | --- | --- |"
+                (
+                    "| --- | --- | --- | --- |"
+                    if learned
+                    else "| --- | --- | --- | --- | --- | --- | --- |"
+                )
                 + (" --- | --- |" if reference_columns else ""),
             ]
         )
@@ -201,9 +247,15 @@ def markdown_report(report):
             note = inp.get("note") if inp else None
             cells = [
                 slot + 1,
-                note["pitch"] if note else "—",
-                f"{note['start_tick']}–{note['end_tick']}" if note else "—",
-                f"{note['measure']}:{note['quarter_beat']:g}" if note else "—",
+                *(
+                    []
+                    if learned
+                    else [
+                        note["pitch"] if note else "—",
+                        f"{note['start_tick']}–{note['end_tick']}" if note else "—",
+                        f"{note['measure']}:{note['quarter_beat']:g}" if note else "—",
+                    ]
+                ),
                 pattern([inp]) if inp else "—",
                 f"{out['word']} / {out['ipa']}" if out else "—",
                 pattern([out]) if out else "—",

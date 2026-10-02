@@ -153,3 +153,40 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
             }
         )
     return records
+
+
+def midi_note_comparison(path, *, title="", track=0):
+    """Old musical templates for reporting only, independent of learned slot counts."""
+    import miditoolkit
+
+    midi = miditoolkit.MidiFile(str(path))
+    supported = all(
+        (sig.numerator, sig.denominator) == (4, 4) for sig in midi.time_signature_changes
+    )
+    records = midi_records(
+        path,
+        title=title,
+        track=track,
+        # Reporting must retain all notes, even when a phrase exceeds the model's slot limit.
+        max_syllables=max(1, sum(len(inst.notes) for inst in midi.instruments)),
+        stress_source="supplement" if supported else "unknown",
+    )
+    if not supported:
+        # Preserve note timing without inventing 4/4 positions or unsupported musical labels.
+        for record in records:
+            record["length_threshold_ticks"] = None
+            record["meter"] = "unsupported"
+            for syllable in record["syllables"]:
+                syllable["stress"] = syllable["length"] = None
+                syllable["note"]["measure"] = syllable["note"]["quarter_beat"] = None
+    return {
+        "role": "comparison_only",
+        "method": "supplement" if supported else None,
+        "warning": (
+            None
+            if supported
+            else "Beat-based comparison and bar:beat positions are unavailable: "
+            "the old formula supports only 4/4 MIDI. Raw note pitches and ticks are retained."
+        ),
+        "lines": records,
+    }

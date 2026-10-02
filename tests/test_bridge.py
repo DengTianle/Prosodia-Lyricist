@@ -3,6 +3,7 @@
 import copy
 import csv
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,6 +28,29 @@ from prosodia_lyricist.melody_encoder.encoding import MELODY_REPRESENTATION
 from prosodia_lyricist.melody_encoder.modeling import MelodyTransformerEncoder
 from prosodia_lyricist.midi import midi_melody_record
 from prosodia_lyricist.model import ProsodyBart
+
+
+def test_learned_report_shows_all_midi_notes_without_aligning_slots():
+    from prosodia_lyricist.infer import template_report
+    from prosodia_lyricist.midi import midi_records
+    from prosodia_lyricist.report import markdown_report
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "imagine.mid"
+    lines = midi_melody_record(path)["lines"]
+    for line in lines:
+        line["syllables"] = [{"stress": "strong", "length": "long"}]
+    original = copy.deepcopy(lines)
+    report = template_report(path, lines, title="Imagine", track=0, stress_source="learned")
+    assert lines == original
+    assert report["note_comparison"]["lines"] == midi_records(path, title="Imagine")
+    markdown = markdown_report(report)
+    assert markdown.count("### MIDI notes and beat-based comparison") == 17
+    # Seven raw notes must remain visible even though the first phrase has just one slot.
+    phrase = markdown.split("## Phrase 1\n")[1].split("## Phrase 2\n")[0]
+    assert "| 7 | 69 | 1800–1920 | 1:4.75 | <weak,short> |" in phrase
+    assert "| Slot | Input | Word / IPA | Output |" in phrase
+    assert "| 1 | <strong,long> | — | — |" in phrase
+    assert "Comparison only" in phrase
 
 
 @pytest.fixture
@@ -592,6 +616,9 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     assert result["bridge"]["note_counts"] == [2, 1]
     assert result["bridge"]["syllable_counts"] == [1, 2]
     assert result["bridge"]["count_sources"] == ["predicted", "predicted"]
+    assert result["note_comparison"]["method"] is None
+    assert "only 4/4" in result["note_comparison"]["warning"]
+    assert result["note_comparison"]["lines"][0]["syllables"][0]["note"]["pitch"] == 60
     assert result["encoded_source"] == encode_source(
         {"title": "", "lines": result["template"]}, tokenizer, 8
     )
@@ -655,6 +682,7 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
     assert report["bridge"]["count_sources"] == ["provided", "predicted"]
     assert report["decoder_explanation"] == json.loads(explanations.read_text())
     assert "one note per syllable" not in prefix.with_suffix(".md").read_text()
+    assert "| 1 | 60 | 0–240 | — | — |" in prefix.with_suffix(".md").read_text()
     monkeypatch.setattr(
         "sys.argv",
         [

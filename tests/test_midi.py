@@ -1,6 +1,6 @@
 import pytest
 
-from prosodia_lyricist.midi import midi_records, supplement_stress
+from prosodia_lyricist.midi import midi_note_comparison, midi_records, supplement_stress
 
 miditoolkit = pytest.importorskip("miditoolkit")
 
@@ -87,3 +87,18 @@ def test_imagine_all_notes_and_marker_onsets_preserved():
     assert {r["length_threshold_ticks"] for r in records} == {
         sum(s["note"]["duration_ticks"] for r in records for s in r["syllables"]) / 113
     }
+
+
+def test_note_comparison_retains_phrases_above_model_slot_limit(tmp_path):
+    path = tmp_path / "many-notes.mid"
+    midi = miditoolkit.MidiFile(ticks_per_beat=480)
+    instrument = miditoolkit.Instrument(0)
+    instrument.notes = [miditoolkit.Note(80, 60, i * 120, (i + 1) * 120) for i in range(70)]
+    midi.instruments = [instrument]
+    midi.markers = [miditoolkit.Marker("end", 8400)]
+    midi.dump(str(path))
+    comparison = midi_note_comparison(path)
+    assert comparison["method"] == "supplement"
+    assert comparison["role"] == "comparison_only"
+    assert comparison["lines"] == midi_records(path, max_syllables=70)
+    assert len(comparison["lines"][0]["syllables"]) == 70
