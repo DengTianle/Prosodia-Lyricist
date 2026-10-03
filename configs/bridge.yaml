@@ -13,16 +13,22 @@ data:
   include_melody: true
   # Set BEFORE preparation to the original CSV used for contrastive training.
   pretraining_manifest: ../../try-contrastive/600_2line_window12/segments_manifest.csv
-  lines_per_window: 2 # Must match that manifest; final shorter window is retained.
+  lines_per_window: 2 # Pretrained tower's window size; retain existing prepared data.
 
 model:
   conditioning: bridge
   # Current note-based two-pool contrastive checkpoint (same format as prosodia-direct).
   melody_checkpoint: ../../try-contrastive/checkpoints/600_2line_window12/22Sep_1mig/best.pt
-  max_notes: 512 # Skip overlong windows, never truncate.
+  bridge_scope: song
+  encoder_lines_per_window: 2 # Must match data.lines_per_window and pretraining.
+  max_window_notes: 512
+  max_song_notes: 2048
+  max_song_lines: 256
+  max_target_length: 4096 # Includes fixed line prefixes. Skip whole songs; never truncate.
+  song_encoder_layers: 2
   bridge_decoder:
     d_model: 256
-    num_layers: 2
+    num_layers: 4
     num_heads: 4
     dim_feedforward: 1024
     dropout: 0.1
@@ -32,11 +38,11 @@ training:
   device: cuda
   seed: 1234
   epochs: 100
-  batch_size: 16
+  batch_size: 8 # Songs per batch (each song includes all of its encoder windows).
   num_workers: 0
   precision: bf16 #fp32 bf16 is also supported on CUDA hardware with BF16 support.
-  gradient_accumulation_steps: 1
-  # Zero-based: 1 warms up the new decoder for one epoch, then fine-tunes the trunk.
+  gradient_accumulation_steps: 2
+  # Zero-based: 1 warms up the new song encoder/decoder, then fine-tunes the trunk.
   # null keeps the pretrained trunk frozen; 0 fine-tunes immediately.
   melody_unfreeze_epoch: 1
   learning_rate: 0.0001

@@ -49,13 +49,16 @@ def bridge():
         dropout=0,
     )
     with torch.no_grad():
-        model.output.weight.zero_()
-        model.output.bias.copy_(torch.tensor([10.0, -10.0, -10.0, -10.0]))
+        for head in (model.strength_head, model.length_head):
+            head.weight.zero_()
+            head.bias.copy_(torch.tensor([10.0, -10.0]))
     return model
 
 
 def test_teacher_forced_accuracies_ignore_prefixes_padding_and_weight_by_slots():
     class FixedLogits(torch.nn.Module):
+        output_design = "joint_pair"
+
         def forward(self, **batch):
             labels = batch["labels"]
             logits = torch.zeros(*labels.shape, 4)
@@ -63,7 +66,7 @@ def test_teacher_forced_accuracies_ignore_prefixes_padding_and_weight_by_slots()
             for index, pair in enumerate(predicted):
                 logits[0, index, pair] = 10
             loss = torch.tensor(2.0 if len(predicted) == 6 else 4.0)
-            return SimpleNamespace(logits=logits, loss=loss)
+            return SimpleNamespace(logits=logits, loss=loss, loss_components={"prosody": loss})
 
     batches = [
         {
@@ -112,6 +115,36 @@ def test_generation_bleu_and_accuracy_include_missing_extra_slots(bridge, monkey
     assert scores["note_ipa_count_match_rate"] == 0.5
     assert scores["note_ipa_count_mae"] == 0.5
     assert scores["count_diagnostic_phrases"] == 4
+
+
+def test_teacher_forced_two_head_accuracies_and_component_weighting():
+    class FixedHeads(torch.nn.Module):
+        output_design = "separate"
+
+        def forward(self, **batch):
+            n = batch["labels"].shape[-1]
+            strength = torch.tensor([[[0.0, 1.0]]] * n).transpose(0, 1)
+            length = torch.tensor([[[10000.0, 0.0]]] * n).transpose(0, 1)
+            # Rounding these scores loses the small strength difference. Metrics
+            # must use the binary predictions, as generation does.
+            logits = (strength.unsqueeze(-1) + length.unsqueeze(-2)).flatten(-2).bfloat16()
+            components = {"strength": torch.tensor(2.0), "length": torch.tensor(3.0)}
+            return SimpleNamespace(
+                strength_logits=strength, length_logits=length, logits=logits,
+                loss=sum(components.values()), loss_components=components,
+            )
+
+    batch = {
+        "labels": torch.tensor([[FIRST_LINE, 5, 6, -100]]),
+        "syllable_counts": torch.tensor([[2]]),
+        "line_counts": torch.tensor([1]),
+    }
+    scores = run_bridge_epoch(FixedHeads(), [batch], torch.device("cpu"))
+    assert scores["loss"] == 5
+    assert scores["components"] == {"strength": 2, "length": 3}
+    assert scores["teacher_forced_strength_accuracy"] == 1
+    assert scores["teacher_forced_length_accuracy"] == 0.5
+    assert scores["teacher_forced_pair_accuracy"] == 0.5
 
 
 @pytest.fixture
@@ -166,6 +199,9 @@ def test_cli_defaults_to_test_and_preserves_checkpoint_and_data_provenance(
     assert report["teacher_forced"]["slots"] == 13
     assert report["teacher_forced"]["accuracy"] == dict(strength=1.0, length=1.0, combined=1.0)
     assert report["teacher_forced"]["loss"] < 0.001
+    assert set(report["teacher_forced"]["loss_components"]) == {"strength", "length"}
+    assert report["output_design"] == "separate"
+    assert report["target_scheme"] == "line_skeleton_v4"
     assert report["generation"]["phrases"] == 3
     assert report["generation"]["skipped_slot_limit_windows"] == 1
     assert report["generation"]["skipped_slot_limit_phrases"] == 1
@@ -189,3 +225,13 @@ def test_cli_defaults_to_test_and_preserves_checkpoint_and_data_provenance(
 def test_invalid_settings_fail_before_loading_checkpoint(kwargs):
     with pytest.raises(ValueError):
         evaluate_bridge("unused", "unused", **kwargs)
+
+
+def test_evaluation_rejects_ipa_targets_above_checkpoint_limit(tmp_path, prepared, bridge):
+    bridge = ProsodyBridge(
+        bridge.melody_config, **bridge.decoder_config, max_syllables=3, lines_per_window=2
+    )
+    checkpoint = tmp_path / "bridge"
+    bridge.save(checkpoint)
+    with pytest.raises(ValueError, match="IPA targets.*slot limit"):
+        evaluate_bridge(checkpoint, prepared, device="cpu")

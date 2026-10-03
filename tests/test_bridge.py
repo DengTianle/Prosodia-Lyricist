@@ -110,7 +110,8 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     assert not bridge.melody_encoder.training
     bridge(**batch).loss.backward()
     assert bridge.adapter[1].weight.grad.abs().sum() > 0
-    assert bridge.output.weight.grad.abs().sum() > 0
+    assert bridge.strength_head.weight.grad.abs().sum() > 0
+    assert bridge.length_head.weight.grad.abs().sum() > 0
     assert not hasattr(bridge, "count_head")
     assert all(p.grad is None for p in bridge.melody_encoder.parameters())
     bridge.zero_grad(set_to_none=True)
@@ -122,13 +123,21 @@ def test_gradients_freezing_causality_padding_and_self_contained_reload(tmp_path
     future = {**batch, "labels": batch["labels"].clone()}
     future["labels"][0, 1] = 3
     after = bridge(**future)
-    assert set(output.loss_components) == {"prosody"}
+    assert set(output.loss_components) == {"strength", "length"}
     targets = (batch["labels"] - PAIR_OFFSET).masked_fill(batch["labels"].ge(FIRST_LINE), -100)
     targets = targets.masked_fill(batch["labels"].eq(-100), -100)
-    assert torch.equal(
-        output.loss,
-        torch.nn.functional.cross_entropy(output.logits.flatten(0, 1), targets.flatten()),
+    slots = targets.ne(-100)
+    strength_targets = (targets // 2).masked_fill(~slots, -100)
+    length_targets = (targets % 2).masked_fill(~slots, -100)
+    expected_strength = torch.nn.functional.cross_entropy(
+        output.strength_logits.flatten(0, 1), strength_targets.flatten()
     )
+    expected_length = torch.nn.functional.cross_entropy(
+        output.length_logits.flatten(0, 1), length_targets.flatten()
+    )
+    assert torch.equal(output.loss_components["strength"], expected_strength)
+    assert torch.equal(output.loss_components["length"], expected_length)
+    assert torch.equal(output.loss, expected_strength + expected_length)
     assert torch.equal(output.logits[:, :2], after.logits[:, :2])
     assert not torch.equal(output.logits[:, 2:], after.logits[:, 2:])
     padded = {
@@ -151,17 +160,50 @@ def test_note_counts_fix_slots_and_line_ids_in_padded_batches(lines, bridge):
     batch = bridge_collate([encode_bridge_source(lines), encode_bridge_source(lines[:1])])
     bridge.eval()
     with torch.no_grad():
-        bridge.output.weight.zero_()
-        bridge.output.bias.fill_(-1000)
-        bridge.output.bias[0] = 1000
+        for head in (bridge.strength_head, bridge.length_head):
+            head.weight.zero_()
+            head.bias.copy_(torch.tensor([1000.0, -1000.0]))
     result = bridge.generate(**batch)
     assert result.syllable_counts.tolist() == [[4, 1], [4, 0]]
     assert len(decode_bridge_tokens(result.sequences[1].tolist())) == 1
     assert not hasattr(result, "predicted_syllable_counts")
     first = result.sequences[0].tolist()
     assert first == [FIRST_LINE] + [PAIR_OFFSET] * 4 + [FIRST_LINE + 1, PAIR_OFFSET]
-    assert bridge.output.out_features == 4
+    assert bridge.strength_head.out_features == bridge.length_head.out_features == 2
+    assert not hasattr(bridge, "output")
     assert "line_end" not in bridge.vocabulary and "eos" not in bridge.vocabulary
+
+
+@pytest.mark.parametrize("strength,length", [(0, 0), (0, 1), (1, 0), (1, 1)])
+def test_two_heads_feed_back_both_labels_and_encode_template_input(
+    strength, length, bridge, lines, tokenizer, monkeypatch
+):
+    with torch.no_grad():
+        for head, selected in ((bridge.strength_head, strength), (bridge.length_head, length)):
+            head.weight.zero_()
+            head.bias.fill_(-10)
+            head.bias[selected] = 10
+    prefixes = []
+    original_decode = bridge.decode
+
+    def decode(tokens, *args):
+        prefixes.append(tokens.clone())
+        return original_decode(tokens, *args)
+
+    monkeypatch.setattr(bridge, "decode", decode)
+    result = bridge.eval().generate(**bridge_collate([encode_bridge_source(lines)]))
+    predicted = decode_bridge_tokens(result.sequences[0].tolist())
+    pair_token = PAIR_OFFSET + 2 * strength + length
+    assert prefixes[1][0, -1] == pair_token  # Both predictions enter the next step.
+    expected_pair = {
+        "stress": ("strong", "weak")[strength], "length": ("long", "short")[length]
+    }
+    assert all(s == expected_pair for line in predicted for s in line["syllables"])
+    encoded = encode_source({"lines": predicted}, tokenizer, 8)
+    active_lengths = [value for value in encoded["length_ids"] if value]
+    assert active_lengths == [length + 1] * 5
+    stress_token = tokenizer.convert_tokens_to_ids(f"<{expected_pair['stress']}>")
+    assert encoded["input_ids"].count(stress_token) == 5
 
 
 def test_training_uses_ipa_skeleton_and_validation_uses_notes(
@@ -232,6 +274,10 @@ def test_saved_limits_and_checkpoint_validation(tmp_path, lines, bridge):
 
 
 def test_v2_checkpoint_reuses_prosody_weights_without_count_head(tmp_path, lines, bridge):
+    bridge = ProsodyBridge(
+        bridge.melody_config, **bridge.decoder_config, max_syllables=8,
+        lines_per_window=2, output_design="joint_pair",
+    )
     bridge.eval().save(tmp_path)
     batch = bridge_collate([encode_bridge_source(lines)])
     expected = bridge.generate(**batch)
@@ -255,6 +301,45 @@ def test_v2_checkpoint_reuses_prosody_weights_without_count_head(tmp_path, lines
     state.pop("output.weight")
     torch.save(state, tmp_path / "bridge_weights.pt")
     with pytest.raises(RuntimeError, match="output.weight"):
+        ProsodyBridge.load(tmp_path)
+
+
+def test_v3_checkpoint_preserves_joint_distribution_and_note_lengths(tmp_path, lines, bridge):
+    legacy = ProsodyBridge(
+        bridge.melody_config, **bridge.decoder_config, max_syllables=8,
+        lines_per_window=2, output_design="joint_pair",
+    ).eval()
+    # The joint argmax differs from the product of marginal argmaxes.
+    with torch.no_grad():
+        legacy.output.weight.zero_()
+        legacy.output.bias.copy_(torch.tensor([0.0, 1.0, 0.9, -10.0]))
+    legacy.save(tmp_path)
+    restored = ProsodyBridge.load(tmp_path).eval()
+    assert restored.output_design == "joint_pair"
+    batch = bridge_collate([example(lines)])
+    assert torch.equal(legacy(**batch).logits, restored(**batch).logits)
+    assert set(restored(**batch).loss_components) == {"prosody"}
+    source = bridge_collate([encode_bridge_source(lines)])
+    predicted = restored.generate(**source)
+    assert predicted.syllable_counts.tolist() == [[4, 1]]
+    pairs = decode_bridge_tokens(predicted.sequences[0].tolist())
+    assert pairs[0]["syllables"] == [{"stress": "strong", "length": "short"}] * 4
+
+
+def test_v4_checkpoint_rejects_wrong_heads_and_label_order(tmp_path, bridge):
+    bridge.save(tmp_path)
+    path = tmp_path / "bridge.json"
+    metadata = json.loads(path.read_text())
+    assert metadata["format_version"] == 4
+    metadata["output_labels"]["strength"].reverse()
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="feature rules"):
+        ProsodyBridge.load(tmp_path)
+    bridge.save(tmp_path)
+    state = bridge.state_dict()
+    state.pop("length_head.weight")
+    torch.save(state, tmp_path / "bridge_weights.pt")
+    with pytest.raises(RuntimeError, match="length_head.weight"):
         ProsodyBridge.load(tmp_path)
 
 
@@ -508,8 +593,8 @@ def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pret
     metrics = json.loads((output / "metrics.jsonl").read_text())
     assert metrics["train"]["loss"] > 0
     assert 0 <= metrics["valid"]["generation"]["note_ipa_count_match_rate"] <= 1
-    assert set(metrics["train"]["components"]) == {"prosody"}
-    assert metrics["train"]["loss"] == metrics["train"]["components"]["prosody"]
+    assert set(metrics["train"]["components"]) == {"strength", "length"}
+    assert metrics["train"]["loss"] == pytest.approx(sum(metrics["train"]["components"].values()))
     restored = ProsodyBridge.load(output / "best")
     ds = BridgeDataset(tmp_path / "data", "valid", lines_per_window=2, max_notes=32)
     assert len(ds[0]["note_line_ids"]) == 4  # Retains the DALI melisma note.
@@ -556,8 +641,9 @@ def test_combined_inference_and_reports(tmp_path, monkeypatch, bridge, tiny_mode
 
     def decode(self, tokens, memory, mask, skeleton):
         values = original_decode(self, tokens, memory, mask, skeleton)
-        values[:, -1] = -1000
-        values[:, -1, 0] = 1000
+        for logits in (values.strength_logits, values.length_logits):
+            logits[:, -1] = -1000
+            logits[:, -1, 0] = 1000
         return values
 
     monkeypatch.setattr(ProsodyBridge, "decode", decode)

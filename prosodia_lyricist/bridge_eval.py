@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .bridge_data import BridgeDataset, bridge_collate
+from .bridge_data import BridgeDataset, bridge_collate, decode_bridge_tokens
 from .bridge_model import ProsodyBridge
 from .bridge_train import evaluate_templates, run_bridge_epoch
 from .data import read_manifest
@@ -46,10 +46,15 @@ def evaluate_bridge(
     dataset = BridgeDataset(
         prepared_dir,
         split,
-        lines_per_window=model.lines_per_window,
-        max_notes=model.max_notes,
+        **model.dataset_options,
         limit=limit,
     )
+    if any(
+        len(line["syllables"]) > model.max_syllables
+        for example in dataset.examples
+        for line in decode_bridge_tokens(example["labels"])
+    ):
+        raise ValueError("Prepared IPA targets exceed the checkpoint's per-phrase slot limit")
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -68,7 +73,7 @@ def evaluate_bridge(
         "combined": generated.pop("pair_accuracy"),
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "checkpoint_weights_sha256": file_sha256(checkpoint / "bridge_weights.pt"),
@@ -77,10 +82,17 @@ def evaluate_bridge(
             "split": split,
             "split_sha256": manifest["sha256"][f"{split}.jsonl"],
             "reference_labels": "prepared IPA stress/vowel length",
-            "limit_windows": limit,
+            "example_scope": model.bridge_scope,
+            "limit_examples": limit,
+            "examples": len(dataset),
             "songs": len(dataset.songs),
-            "windows": len(dataset),
-            "skipped_note_limit_windows": dataset.skipped,
+            "encoder_windows": dataset.encoder_windows,
+            "skipped_examples": dataset.skipped,
+            "skipped_limits": dataset.skipped_limits,
+            **({
+                "limit_windows": limit, "windows": len(dataset),
+                "skipped_note_limit_windows": dataset.skipped_limits["window_notes"],
+            } if model.bridge_scope == "window" else {}),
         },
         "runtime": {
             "device": str(device),
@@ -92,9 +104,19 @@ def evaluate_bridge(
             "lines_per_window": model.lines_per_window,
             "max_notes": model.max_notes,
             "max_syllables": model.max_syllables,
+            "max_target_length": model.max_target_length,
+            **({
+                "encoder_lines_per_window": model.encoder_lines_per_window,
+                "max_window_notes": model.max_notes,
+                "max_song_notes": model.max_song_notes, "max_song_lines": model.max_song_lines,
+            } if model.bridge_scope == "song" else {}),
         },
+        "bridge_scope": model.bridge_scope,
+        "output_design": model.output_design,
+        "target_scheme": model.target_scheme,
         "teacher_forced": {
             "loss": teacher["loss"],
+            "loss_components": teacher["components"],
             "accuracy": {
                 "strength": teacher["teacher_forced_strength_accuracy"],
                 "length": teacher["teacher_forced_length_accuracy"],
@@ -107,7 +129,12 @@ def evaluate_bridge(
         },
         "generation": generated,
         "metric_definitions": {
-            "loss": "Mean prosody-pair cross-entropy per IPA slot; prefixes/padding excluded.",
+            "loss": (
+                "Sum of mean binary strength and length cross-entropies per IPA slot; "
+                "prefixes/padding excluded."
+                if model.output_design == "separate"
+                else "Mean joint pair cross-entropy per IPA slot; prefixes/padding excluded."
+            ),
             "teacher_forced_accuracy": "Micro accuracy over IPA slots with gold prior labels.",
             "generation_accuracy": (
                 "Greedy predictions compared by phrase/slot order; denominator sums "
@@ -120,8 +147,9 @@ def evaluate_bridge(
                 "shorter than four slots scores zero."
             ),
             "coverage": (
-                "Teacher forcing excludes windows above the encoder note limit. Generation "
-                "also excludes whole windows with a phrase above the slot limit. Count "
+                "Teacher forcing excludes entire examples above checkpoint source/target "
+                "limits. A song example is never partially retained. Generation also excludes "
+                "examples above the per-phrase slot or total target limit. Count "
                 "diagnostics cover all teacher-forced phrases. Skips are reported separately. "
                 "With --limit, counts cover only the scanned subset."
             ),
@@ -138,7 +166,9 @@ def main(argv=None):
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--limit", type=int, help="Evaluate only the first N retained windows")
+    parser.add_argument(
+        "--limit", type=int, help="First N retained songs (windows for legacy checkpoints)"
+    )
     parser.add_argument("--output", type=Path, help="Also save the JSON summary to this path")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)

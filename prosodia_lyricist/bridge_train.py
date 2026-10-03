@@ -19,7 +19,7 @@ from .bridge_data import (
     bridge_collate,
     decode_bridge_tokens,
 )
-from .bridge_model import TARGET_SCHEME, ProsodyBridge
+from .bridge_model import ProsodyBridge
 from .data import read_manifest
 from .evaluation import prosody_bleu
 from .melody_checkpoint import file_sha256, load_contrastive_melody
@@ -45,6 +45,7 @@ def run_bridge_epoch(
     training = optimizer is not None
     model.train(training)
     total_loss = 0.0
+    component_totals = {}
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
     strength_correct, length_correct = 0, 0
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
@@ -69,13 +70,20 @@ def run_bridge_epoch(
                 if training:
                     # Weight by valid prosody slots, including partial accumulation groups.
                     (output.loss * (count / group_tokens)).backward()
-                predicted = output.logits.argmax(-1)[active]
+                if model.output_design == "separate":
+                    predicted = (
+                        2 * output.strength_logits.argmax(-1) + output.length_logits.argmax(-1)
+                    )[active]
+                else:
+                    predicted = output.logits.argmax(-1)[active]
                 expected = batch["labels"][active] - PAIR_OFFSET
                 correct += int(predicted.eq(expected).sum())
                 # PAIRS groups strong/weak by quotient and long/short by remainder.
                 strength_correct += int((predicted // 2).eq(expected // 2).sum())
                 length_correct += int((predicted % 2).eq(expected % 2).sum())
                 total_loss += output.loss.item() * count
+                for name, value in output.loss_components.items():
+                    component_totals[name] = component_totals.get(name, 0.0) + value.item() * count
                 tokens += count
                 phrases += line_count
                 batches += 1
@@ -94,7 +102,7 @@ def run_bridge_epoch(
     loss = total_loss / tokens
     return {
         "loss": loss,
-        "components": {"prosody": loss},
+        "components": {name: value / tokens for name, value in component_totals.items()},
         "teacher_forced_strength_accuracy": strength_correct / tokens,
         "teacher_forced_length_accuracy": length_correct / tokens,
         "teacher_forced_pair_accuracy": correct / tokens,
@@ -110,7 +118,8 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
     """Note-count generation accuracy; note/IPA count differences are dataset diagnostics."""
     model.eval()
     phrases, exact, count_matches, count_error, count_phrases = 0, 0, 0, 0, 0
-    skipped_windows, skipped_phrases = 0, 0
+    skipped_examples, skipped_phrases = 0, 0
+    skipped_target_examples, skipped_target_phrases = 0, 0
     bleu_sum, short_phrases = 0.0, 0
     slots, strength_correct, length_correct, pair_correct = 0, 0, 0, 0
     for batch in islice(loader, max_batches):
@@ -124,8 +133,13 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
         count_error += int((counts - ipa_counts).abs()[active].sum())
         count_phrases += int(active.sum())
         eligible = counts.le(model.max_syllables).all(-1)
-        skipped_windows += int((~eligible).sum())
+        target_eligible = (counts.sum(-1) + batch["line_counts"]).le(model.max_target_length)
+        skipped_examples += int((~eligible).sum())
         skipped_phrases += int(batch["line_counts"][~eligible].sum())
+        # Report total-target exclusions separately; slot-limit failures take precedence.
+        skipped_target_examples += int((eligible & ~target_eligible).sum())
+        skipped_target_phrases += int(batch["line_counts"][eligible & ~target_eligible].sum())
+        eligible &= target_eligible
         if not eligible.any():
             continue
         labels = labels[eligible]
@@ -167,7 +181,12 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
         "count_diagnostic_phrases": count_phrases,
         "note_ipa_count_match_rate": count_matches / count_phrases,
         "note_ipa_count_mae": count_error / count_phrases,
-        "skipped_slot_limit_windows": skipped_windows,
+        f"skipped_slot_limit_{'songs' if model.bridge_scope == 'song' else 'windows'}": (
+            skipped_examples
+        ),
+        "skipped_target_limit_examples": skipped_target_examples,
+        "skipped_target_limit_phrases": skipped_target_phrases,
+        "example_scope": model.bridge_scope,
         "skipped_slot_limit_phrases": skipped_phrases,
     }
 
@@ -201,6 +220,12 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     ):
         raise ValueError("Song allowlist changed; prepare again")
     checkpoint = cfg.get("melody_checkpoint")
+    encoder_lines = cfg.get("encoder_lines_per_window", data["lines_per_window"])
+    if encoder_lines != data["lines_per_window"]:
+        raise ValueError("encoder_lines_per_window must match the prepared pretraining windows")
+    max_window_notes = cfg.get("max_window_notes", cfg.get("max_notes"))
+    if cfg.get("max_notes") is not None and max_window_notes != cfg["max_notes"]:
+        raise ValueError("Conflicting max_notes and max_window_notes settings")
     tower = None
     if checkpoint:
         audit = manifest.get("pretraining_split_audit")
@@ -217,7 +242,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             raise ValueError("Unsupported contrastive pretraining split semantics")
         rows, _ = read_melody_manifest(data["pretraining_manifest"], require_lyrics=False)
         sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
-        if sizes and sizes != {data["lines_per_window"]}:
+        if sizes and sizes != {encoder_lines}:
             raise ValueError("lines_per_window must match the contrastive pretraining manifest")
     elif smoke_test:
         melody_config = dict(
@@ -227,7 +252,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             dim_feedforward=32,
             dropout=0.0,
             projection_dim=None,
-            max_length=cfg.get("max_notes", 512),
+            max_length=max_window_notes or 512,
         )
         provenance = {"random_smoke_test_tower": True}
     else:
@@ -238,21 +263,26 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     model = ProsodyBridge(
         melody_config,
         max_syllables=data["max_syllables"],
-        lines_per_window=data["lines_per_window"],
-        max_notes=cfg.get("max_notes"),
+        encoder_lines_per_window=encoder_lines,
+        max_window_notes=max_window_notes,
+        bridge_scope=cfg.get("bridge_scope", "song"),
+        max_song_notes=cfg.get("max_song_notes", 2048),
+        max_song_lines=cfg.get("max_song_lines", 256),
+        max_target_length=cfg.get("max_target_length"),
+        song_encoder_layers=(
+            1 if smoke_test else cfg.get("song_encoder_layers", 2)
+        ),
         provenance=provenance,
         **decoder,
     )
     if tower is not None:
         model.melody_encoder.load_state_dict(tower.state_dict(), strict=True)
         del tower
-    max_notes = model.max_notes
     datasets = {
         split: BridgeDataset(
             data["prepared_dir"],
             split,
-            lines_per_window=data["lines_per_window"],
-            max_notes=max_notes,
+            **model.dataset_options,
             limit=8 if smoke_test else None,
         )
         for split in ("train", "valid")
@@ -295,9 +325,11 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     output.mkdir(parents=True, exist_ok=False)
     run = {
         "conditioning": "bridge",
-        "bridge_target_scheme": TARGET_SCHEME,
+        "bridge_target_scheme": model.target_scheme,
+        "bridge_scope": model.bridge_scope,
         "training_count_source": "ipa",
         "inference_count_source": "notes",
+        "output_design": model.output_design,
         "config": config,
         "smoke_test": smoke_test,
         "data_schema_version": manifest["schema_version"],
@@ -307,9 +339,11 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "melody_provenance": provenance,
         "precision": precision,
         "total_steps": steps * epochs,
-        "windows": {s: len(ds) for s, ds in datasets.items()},
+        "examples": {s: len(ds) for s, ds in datasets.items()},
+        "encoder_windows": {s: ds.encoder_windows for s, ds in datasets.items()},
         "songs": {s: len(ds.songs) for s, ds in datasets.items()},
-        "skipped_note_limits": {s: ds.skipped for s, ds in datasets.items()},
+        "skipped_examples": {s: ds.skipped for s, ds in datasets.items()},
+        "skipped_limits": {s: ds.skipped_limits for s, ds in datasets.items()},
     }
     (output / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
     best, stale = math.inf, 0

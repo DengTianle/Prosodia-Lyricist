@@ -185,22 +185,40 @@ integration to predict the **syllable-level IPA templates** consumed by the
 existing template decoder:
 
 ```text
-MIDI notes → contrastively pretrained melody encoder → learned prosody template
+MIDI notes → pretrained two-line encoder windows → gather into a complete song
+           → 2-layer song encoder → 4-layer template decoder → prosody template
            → existing template-decoder checkpoint → lyrics
 ```
 
+The bridge trains and generates on complete songs. The pretrained tower keeps
+its original 177-dimensional window features and local positions. After gathering,
+notes receive global sinusoidal positions, shared song-line embeddings, and a
+projection of song-relative pitch and continuous timing features. Timing uses
+one median positive inter-onset interval per song as its scale (not a beat grid);
+window-boundary intervals are retained. See [the bridge design](docs/prosody-bridge.md)
+for the feature definitions. Generation caches decoder keys and values.
+
 It fills a fixed line skeleton with stress/vowel-length pairs. DALI line
 membership and lyric-derived IPA counts define the training skeleton. The only
-training loss is cross-entropy on prosody pairs; there is no count-prediction head
-or loss. At inference, MIDI markers define the phrases and each note supplies
+training loss is the sum of binary cross-entropies from separate strength and
+vowel-length heads; there is no count-prediction head or loss. Both heads share
+the causal decoder. Their labels are recombined into paired tokens for next-step
+feedback and the unchanged template-decoder input. At inference, MIDI markers
+define the phrases and each note supplies
 exactly one prosody slot. The decoder does not generate line endings. All phrase
 templates are passed to the lyric model together, preserving whole-song context.
 
 In [`configs/bridge.yaml`](configs/bridge.yaml), set `model.melody_checkpoint`
 to the current note-based two-pool contrastive checkpoint and
 `data.pretraining_manifest` to its original CSV **before preparation**. Match
-`data.lines_per_window` to that manifest. Preparation uses `data/dali-bridge`
+`data.lines_per_window` and `model.encoder_lines_per_window` to that manifest.
+Preparation uses `data/dali-bridge`
 and keeps shared songs and duplicate identities in their pretraining splits.
+Existing prepared data can be reused unchanged. The default training batch is
+eight songs with two accumulation steps. Source/target limits are separate:
+512 notes per encoder window, 2,048 notes and 256 lines per song, and 4,096 target
+tokens including line prefixes. Overlong training examples are skipped as whole
+songs and counted by reason; no windows are silently removed from a retained song.
 
 ```bash
 conda activate prosodia-lyricist
@@ -221,11 +239,13 @@ without loading the lyric model. Reports retain both the predicted syllable
 templates and original note arrays; reference lyrics are used only for scoring.
 No skeleton JSON is needed; `--bridge-skeleton` has been removed. Phrase note
 counts must fit `max_syllables`; overlong input fails without truncation. Generation
-validation reports skipped overlong windows and note/IPA count differences as data
+validation reports skipped overlong songs and note/IPA count differences as data
 diagnostics, rather than learned count accuracy. Reports also list the raw notes,
 bar:beat positions, and old beat-based labels as a separate comparison.
-The v3 bridge can load v2 scaffold checkpoints, discarding their obsolete count
-head; v1 LINE_END checkpoints still require retraining. Existing prepared IPA data
+New training saves v5 song-level two-head checkpoints. v2/v3/v4 checkpoints retain
+their window-level inference; v2/v3 preserve their joint four-class head and the
+obsolete v2 count head is discarded. Train a new bridge for the song architecture.
+v1 LINE_END checkpoints still require retraining. Existing prepared IPA data
 and the template-decoder checkpoint can be reused. Training IPA counts can differ
 from inference note counts because of melisma; exact slot counts do not guarantee
 that the downstream lyric model produces the same number of syllables.
@@ -240,13 +260,15 @@ python -m prosodia_lyricist.bridge_eval \
   --output outputs/bridge-eval.json
 ```
 
-The JSON reports slot-weighted cross-entropy and strength, length, and combined
+The JSON reports slot-weighted loss, separate head loss components, output design,
+and strength, length, and combined
 accuracy with teacher forcing on the IPA skeleton. A separate greedy evaluation
 uses note counts and reports the same accuracies by slot order (missing/extra
 slots count as incorrect), exact phrase accuracy, and the existing phrase-mean
 prosody-BLEU. This is unsmoothed BLEU-4, so phrases shorter than four slots score
-zero even when correct. Count mismatches and skipped windows are also reported.
-Use `--limit 100` for a quick subset check; omit it for the full split. On CPU/MPS,
+zero even when correct. Count mismatches and skipped examples are also reported.
+Use `--limit 100` for the first 100 retained songs (windows for old checkpoints);
+omit it for the full split. On CPU/MPS,
 use `--precision fp32` (the default).
 
 ## MIDI inference

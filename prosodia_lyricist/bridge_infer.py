@@ -4,8 +4,13 @@ from pathlib import Path
 
 import torch
 
-from .bridge_data import bridge_collate, decode_bridge_tokens, encode_bridge_source
-from .bridge_model import TARGET_SCHEME, ProsodyBridge
+from .bridge_data import (
+    bridge_collate,
+    decode_bridge_tokens,
+    encode_bridge_song,
+    encode_bridge_source,
+)
+from .bridge_model import ProsodyBridge
 from .features import MAX_LINES
 from .midi import midi_melody_record
 
@@ -35,25 +40,37 @@ def predict_templates(
             )
     records = []
     windows = 0
-    for offset in range(0, len(source["lines"]), model.lines_per_window):
-        lines = source["lines"][offset : offset + model.lines_per_window]
-        encoded = encode_bridge_source(lines)
-        if len(encoded["note_line_ids"]) > model.max_notes:
+    width = len(source["lines"]) if model.bridge_scope == "song" else model.lines_per_window
+    for offset in range(0, len(source["lines"]), width):
+        lines = source["lines"][offset : offset + width]
+        encoded = (
+            encode_bridge_song(lines, model.encoder_lines_per_window)
+            if model.bridge_scope == "song" else encode_bridge_source(lines)
+        )
+        if model.bridge_scope == "window" and len(encoded["note_line_ids"]) > model.max_notes:
             raise ValueError("MIDI window exceeds bridge note limit; no truncation")
         inputs = {key: value.to(device) for key, value in bridge_collate([encoded]).items()}
         result = model.generate(**inputs)
         predicted = decode_bridge_tokens(result.sequences[0].tolist())
         for index, (line, template) in enumerate(zip(lines, predicted, strict=True), offset):
             records.append({**line, **template, "line_id": index, "stress_source": "learned"})
-        windows += 1
+        windows += (
+            len(lines) + model.encoder_lines_per_window - 1
+        ) // model.encoder_lines_per_window
     return records, {
         "checkpoint": str(Path(checkpoint).resolve()),
         "melody_provenance": model.provenance,
         "lines_per_window": model.lines_per_window,
+        "encoder_lines_per_window": model.encoder_lines_per_window,
+        "bridge_scope": model.bridge_scope,
         "encoder_windows": windows,
         "max_syllables": model.max_syllables,
         "max_notes": model.max_notes,
-        "target_scheme": TARGET_SCHEME,
+        "max_song_notes": model.max_song_notes if model.bridge_scope == "song" else None,
+        "max_song_lines": model.max_song_lines if model.bridge_scope == "song" else None,
+        "max_target_length": model.max_target_length,
+        "target_scheme": model.target_scheme,
+        "output_design": model.output_design,
         "count_sources": ["notes"] * len(records),
         "skeleton": {
             "lines": [

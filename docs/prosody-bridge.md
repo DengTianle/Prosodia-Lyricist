@@ -1,8 +1,8 @@
 # Contrastive melody → IPA template → lyrics
 
-> Historical v1 design. The current v3 bridge trains on IPA prosody slots and uses
-> one slot per MIDI note at inference, with no count head or LINE_END prediction.
-> See the README for usage; v2 scaffold weights remain loadable without their count head.
+The v5 bridge models complete songs with separate strength/length heads. It trains
+on IPA prosody slots and uses one slot per MIDI note at inference. v2/v3/v4
+checkpoints retain their original window-level architectures; v1 requires retraining.
 
 The bridge replaces the heuristic MIDI-to-template step. It reuses the trained
 melody trunk and 177-dimensional note encoding from `prosodia-direct`, learns
@@ -11,39 +11,63 @@ four-stream lyric checkpoint intact. No HuBERT/audio model is loaded.
 
 ## Supervision and model
 
-Each training example is a window of consecutive DALI phrases. Melody inputs
+Each training example is a complete song of consecutive DALI phrases. Melody inputs
 contain pitch, onset, duration, and phrase membership. Targets are the ordered
 IPA stress/length pairs in each phrase. Words, lyric text, IPA labels and their
 counts never enter the melody source. The title is supplied only to the existing
 lyric model at inference.
 
 The melody Transformer returns contextual **note vectors before pooled
-contrastive projection**. A LayerNorm/linear/GELU adapter maps them to the small
-template decoder's hidden size. Phrase embeddings are added after the melody
-tower so the pretrained feature representation stays unchanged. A causal
-Transformer decoder cross-attends to these note vectors and predicts an
-eight-symbol vocabulary:
+contrastive projection**. It still encodes two-line windows independently, including
+the final shorter window. All real windows in a batch are packed for the tower and
+their outputs scattered into song order. The LayerNorm/linear/GELU adapter maps
+each note into bridge width 256. Global sinusoidal note positions and learned
+song-line embeddings are added after the tower. Padding never occupies a global
+note position or an encoder window.
+
+A separate 39-dimensional source channel is computed from raw notes over the
+entire song. Its seven scalar features are pitch from the song's first note and
+preceding-note pitch interval (both in octaves), log2(duration/scale),
+log2(positive IOI/scale), previous-note and positive-IOI indicators, and
+log2(scale in seconds). The scale is the median positive song IOI, falling back
+to median note duration when none exists. Missing/zero IOIs have log value zero
+and explicit indicators. The other 32 features are sine/cosine time coordinates
+for periods 2^-1 through 2^14 in scale units, measured from the song's first onset.
+This is a common timing reference, not an inferred beat or meter. Pitch/timing
+relationships across window boundaries survive; the original window-normalized
+177-dimensional pretrained inputs remain unchanged.
+
+A Linear/GELU/Linear/LayerNorm projection adds this channel to the note vectors.
+After a fusion LayerNorm, two pre-norm bidirectional song-encoder layers attend
+across the entire song. A four-layer causal decoder cross-attends to that memory.
+Both stacks use four heads, FFN width 1024, and dropout 0.1. Decoder inputs combine
+previous predictions, global target positions, shared song-line embeddings, and
+within-line slot/count embeddings. Source note and target token positions are
+separate coordinates. Set `song_encoder_layers: 0` for concatenation-only ablation.
+
+The feedback/serialization vocabulary is:
 
 ```text
-PAD, BOS, EOS, LINE_END,
-strong_long, strong_short, weak_long, weak_short
+PAD, BOS, SLOT, strong_long, strong_short, weak_long, weak_short,
+line_0, line_1, ... line_255
 ```
 
 For example, two phrases with three and one syllables become:
 
 ```text
-weak_short strong_long strong_short LINE_END weak_long LINE_END EOS
+line_0 weak_short strong_long strong_short line_1 weak_long
 ```
 
-Training uses next-token cross-entropy with all targets shifted right behind
-BOS. Padding is excluded from the loss. This jointly learns stress, vowel length,
-and the decision to end a phrase. These are **source syllable labels**, distinct
+Training shifts targets right behind BOS and sums separate binary stress/length
+cross-entropies at syllable slots. Fixed line prefixes and padding are excluded
+from the loss. There is no count head or end-of-line prediction. These are
+**source syllable labels**, distinct
 from the existing lyric decoder's word-level explanation heads.
 
 All notes, including melisma, are retained. There is no forced note-to-syllable
-alignment. Training windows never cross songs or data splits. A final shorter
-window is retained. Template prediction has local window context; the lyric
-decoder still receives all predicted phrases as one complete song.
+alignment. Encoder windows never cross songs or data splits. Both bridge and
+lyric generation operate on complete songs. The bridge retains causal prediction
+history across window boundaries and caches source/target attention K/V at inference.
 
 ## Configure and train
 
@@ -54,12 +78,17 @@ Set these paths before preparing:
 | --- | --- |
 | `model.melody_checkpoint` | Original contrastive checkpoint with `mlm_note_177d_v1` and `audio_pooling: note`. This is not a fine-tuned direct-lyrics checkpoint. |
 | `data.pretraining_manifest` | Immutable CSV actually used for that contrastive run. |
-| `data.lines_per_window` | Match the pretraining manifest's line count; default 2. |
+| `data.lines_per_window` | Prepared-data provenance: pretraining window line count, default 2. |
+| `model.encoder_lines_per_window` | Must match the prepared/pretraining count, independently of song scope. |
+| `model.bridge_scope` | `song` by default for new training; `window` retains the legacy architecture. |
 | `data.prepared_dir` | Separate bridge dataset, default `data/dali-bridge`. |
-| `model.max_notes` | Maximum notes per window; overlong training windows are counted and skipped. |
+| `model.max_window_notes` | Maximum notes per pretrained window, default 512. |
+| `model.max_song_notes`, `model.max_song_lines` | Source limits, default 2048 notes / 256 lines. |
+| `model.max_target_length` | Total template length including prefixes, default config 4096. |
+| `model.song_encoder_layers` | Two by default; zero bypasses global source attention. |
 | `data.max_syllables` | Maximum IPA syllables per phrase; must fit the lyric checkpoint at inference. |
 | `training.melody_unfreeze_epoch` | Zero-based epoch to fine-tune the trunk; 1 warms up the new decoder for one epoch, 0 starts immediately, null freezes throughout. |
-| `training.learning_rate` | Adapter and template decoder learning rate. |
+| `training.learning_rate` | Adapter, feature projection, song encoder and template decoder rate. |
 | `training.melody_learning_rate` | Separate, lower rate for the pretrained trunk. |
 
 The vendored encoder and strict importer are taken from `prosodia-direct`,
@@ -75,6 +104,11 @@ python -m prosodia_lyricist.prepare --config configs/bridge.yaml
 python -m prosodia_lyricist.train --config configs/bridge.yaml --smoke-test
 python -m prosodia_lyricist.train --config configs/bridge.yaml
 ```
+
+Existing prepared IPA data can be reused; the data configuration and hashes stay
+unchanged. Song grouping and the new source features are constructed when loading
+the bridge dataset. Any exceeded source/target limit skips the entire song, with
+per-reason counts; inference rejects overlong songs without truncation.
 
 Preparation retains note arrays alongside the existing IPA annotations. It
 preserves contrastive pretraining assignments for shared song IDs and duplicate
@@ -101,12 +135,12 @@ checkpoint selection. Optimizer resume and distributed training are not included
 Each new run contains:
 
 - `run.json`: configuration, split audit, checkpoint hash, dataset hashes,
-  window/song counts, skipped windows, and smoke-test status.
+  song/example/encoder-window counts, skipped examples by limit, and smoke-test status.
 - `metrics.jsonl`: training/validation loss, teacher-forced token accuracy,
   learning rates, freeze state, and free-running validation metrics (exact
-  phrase template accuracy, syllable-count accuracy/MAE, forced boundaries).
+  phrase template accuracy, head accuracies, and note/IPA count diagnostics).
 - `best/bridge.json` and `best/bridge_weights.pt`: label vocabulary, IPA rules,
-  architecture, length limits, provenance, melody trunk, adapter and decoder.
+  architecture, feature scheme, length limits, provenance, melody trunk and bridge weights.
   `best/run.json` retains the training context.
 
 No original template checkpoint is loaded or updated during bridge training.
@@ -134,10 +168,11 @@ are retained. Tempo changes are converted to seconds before upstream feature
 encoding. Learned inference does not use a beat-grid heuristic and accepts
 non-4/4 meters. `--stress-source` is rejected with a bridge to avoid ambiguity.
 
-Templates are decoded greedily. The supplied phrase count constrains generation
-to that many nonempty phrases. A learned `LINE_END` determines each phrase's
-syllable count; counts are bounded by `max_syllables`. If a boundary must be forced
-at that cap, its zero-based phrase index is reported in `bridge.forced_line_endings`.
+Templates are decoded greedily against a fixed whole-song skeleton. Phrase note
+counts determine its slots; each must fit `max_syllables`. Line IDs never reset
+between encoder windows. Forced prefixes also advance the decoder cache so they
+condition subsequent slots. Training still uses IPA counts, which may differ
+from note counts because of melisma.
 Malformed or overlong inputs fail instead of being truncated. Predicted templates
 are passed through the existing `encode_source` function with the lyric checkpoint's
 tokenizer. The lyric model's source/target limits and IPA correction remain active.
@@ -153,7 +188,7 @@ python -m prosodia_lyricist.infer \
 ```
 
 JSON reports and explanations retain the original note arrays, predicted
-syllable templates, note/syllable counts, bridge checkpoint and forced boundaries.
+syllable templates, note/syllable counts, bridge scope and checkpoint metadata.
 They do not assign predicted syllables to individual notes. Report prosody-BLEU
 measures lyric agreement with the **predicted** template, not bridge accuracy
 against ground truth. Optional `--reference` lyrics supply scoring targets only
@@ -162,8 +197,9 @@ bridge data are the relevant first check of template prediction quality.
 
 ## Verification
 
-Offline tests exercise causal shifting, padding, gradients, trunk freezing,
-token-weighted accumulation, variable syllable counts, forced boundaries, strict
+Offline tests exercise song coordinates, exact local feature preservation,
+global context, cached/full-decoder equivalence, causal shifting, padding,
+gradients, trunk freezing, token-weighted accumulation, fixed skeletons, strict
 contrastive import, source/target separation, split reuse, melisma retention,
 window tails, preparation, training, reload, and combined inference with actual
 template-model generation and perplexity scoring. They also cover tempo changes,
