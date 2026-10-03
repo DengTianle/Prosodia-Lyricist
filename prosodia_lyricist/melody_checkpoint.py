@@ -7,6 +7,7 @@ import torch
 
 from .melody_encoder.encoding import MELODY_REPRESENTATION
 from .melody_encoder.modeling import MelodyTransformerEncoder
+from .runtime import log_stage
 
 UPSTREAM_REVISION = "ff6247f2613fd5e1d1f06c44b73f9dadfa6cb257"
 
@@ -25,7 +26,10 @@ def load_contrastive_melody(path):
     Upstream saves argparse Path values. Allow only those extra types, retaining
     weights_only loading rather than executing arbitrary checkpoint pickle code.
     """
-    with torch.serialization.safe_globals([Path, PosixPath, WindowsPath]):
+    with (
+        log_stage("Reading contrastive checkpoint metadata: %s", path),
+        torch.serialization.safe_globals([Path, PosixPath, WindowsPath]),
+    ):
         checkpoint = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
     if checkpoint.get("melody_representation") != MELODY_REPRESENTATION:
         raise ValueError("Expected a current note-based two-pool contrastive checkpoint")
@@ -43,21 +47,25 @@ def load_contrastive_melody(path):
         max_length=args.get("melody_max_length", 4096),
     )
     # Existing upstream runs omit pooling/max_length and use cls/4096 defaults.
-    tower = MelodyTransformerEncoder(**config)
-    state = {
-        key.removeprefix("melody_encoder."): value
-        for key, value in checkpoint["model_state_dict"].items()
-        if key.startswith("melody_encoder.")
-    }
-    tower.load_state_dict(state, strict=True)
+    with log_stage("Loading melody tower weights"):
+        tower = MelodyTransformerEncoder(**config)
+        state = {
+            key.removeprefix("melody_encoder."): value
+            for key, value in checkpoint["model_state_dict"].items()
+            if key.startswith("melody_encoder.")
+        }
+        tower.load_state_dict(state, strict=True)
+    del state, checkpoint
     # The projection operates AFTER pooling; applying it to each note is not the
     # representation trained by contrastive learning. Keep only the trained trunk.
     tower.projection = None
     tower.projection_dim = None
     config["projection_dim"] = None
+    with log_stage("Hashing complete contrastive checkpoint: %s", path):
+        checksum = file_sha256(path)
     provenance = {
         "checkpoint": str(Path(path).resolve()),
-        "sha256": file_sha256(path),
+        "sha256": checksum,
         "upstream_revision": UPSTREAM_REVISION,
         "audio_pooling": args["audio_pooling"],
         "pretraining_manifest": str(args.get("manifest", "")),

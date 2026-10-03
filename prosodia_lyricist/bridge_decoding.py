@@ -6,6 +6,7 @@ same layers one position at a time, caching source projections and target K/V.
 
 import torch
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 
 def _heads(x, count):
@@ -45,6 +46,11 @@ class DecoderCache:
                 "target_value": value.new_empty(shape),
             })
 
+    # The growing K/V prefix changes attention shapes at every token. cuDNN can
+    # build and retain a separate host-side execution plan for each shape/stride.
+    # Exclude that backend only during cached decoding; sdpa_kernel restores the
+    # caller's backend settings on return or error. Math supports fallback masks.
+    @sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
     def step(self, x, active):
         position = self.step_index
         self.target_keep[:, position] = active

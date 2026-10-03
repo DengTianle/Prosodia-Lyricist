@@ -1,15 +1,20 @@
 """Window-preserving melody inputs and whole-song IPA template supervision."""
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 from .data import read_manifest
 from .melody_checkpoint import file_sha256
 from .melody_encoder.encoding import MELODY_FEATURE_DIM, encode_note_sequence
+from .runtime import log_stage
+
+logger = logging.getLogger(__name__)
 
 PAD, BOS, SLOT = range(3)
 PAIRS = (("strong", "long"), ("strong", "short"), ("weak", "long"), ("weak", "short"))
@@ -177,13 +182,14 @@ class BridgeDataset(Dataset):
         if not data.get("include_melody") or data["stress_source"] != "ipa":
             raise ValueError("Prepare with include_melody: true and stress_source: ipa")
         path = Path(directory) / f"{split}.jsonl"
-        if file_sha256(path) != manifest["sha256"][path.name]:
-            raise ValueError("Prepared data differs from its manifest; prepare again")
+        with log_stage("Verifying prepared %s checksum: %s", split, path):
+            if file_sha256(path) != manifest["sha256"][path.name]:
+                raise ValueError("Prepared data differs from its manifest; prepare again")
         self.examples, self.skipped, self.songs = [], 0, set()
         self.bridge_scope, self.encoder_windows = bridge_scope, 0
         self.skipped_limits = dict(window_notes=0, song_notes=0, song_lines=0, target_tokens=0)
-        with path.open(encoding="utf-8") as handle:
-            for row in handle:
+        with log_stage("Encoding bridge %s data", split), path.open(encoding="utf-8") as handle:
+            for row in tqdm(handle, desc=f"Encoding {split}", unit="song", leave=False):
                 song = json.loads(row)
                 if manifest["songs"][song["song_id"]]["split"] != split:
                     raise ValueError("Song appears in incorrect split")
@@ -224,6 +230,15 @@ class BridgeDataset(Dataset):
                     break
         if not self.examples:
             raise ValueError(f"No usable bridge {bridge_scope} examples in {split}; inspect limits")
+        array_bytes = sum(
+            value.nbytes for example in self.examples for value in example.values()
+            if isinstance(value, np.ndarray)
+        )
+        logger.info(
+            "%s: %d %s examples, %d encoder windows, %.1f MiB feature arrays; skipped %s",
+            split, len(self.examples), bridge_scope, self.encoder_windows,
+            array_bytes / 1024**2, self.skipped_limits,
+        )
 
     def __len__(self):
         return len(self.examples)

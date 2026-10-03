@@ -7,6 +7,7 @@ from contextlib import nullcontext
 import numpy as np
 import pytest
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from prosodia_lyricist.bridge_data import (
     BOS,
@@ -167,11 +168,20 @@ def test_song_gradients_freezing_global_context_and_padding(song, model):
 
 
 @pytest.mark.parametrize("precision", ["fp32", "bf16"])
-def test_cached_logits_and_generation_match_full_decoder(song, model, precision):
-    model.eval()
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("cuda", marks=pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA is unavailable"
+    )),
+])
+def test_cached_logits_and_generation_match_full_decoder(song, model, precision, device):
+    if device == "cuda" and precision == "bf16" and not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA BF16 is unavailable")
+    model.to(device).eval()
     batch = bridge_collate([example(song), example(song[:1])])
+    batch = {key: value.to(device) for key, value in batch.items()}
     source = {k: v for k, v in batch.items() if k not in ("labels", "syllable_counts")}
-    context = torch.autocast("cpu", dtype=torch.bfloat16) if precision == "bf16" else nullcontext()
+    context = torch.autocast(device, dtype=torch.bfloat16) if precision == "bf16" else nullcontext()
     # Disabling the CPU fused encoder fast path also matches CUDA's autocast path.
     fastpath = torch.backends.mha.get_fastpath_enabled()
     torch.backends.mha.set_fastpath_enabled(False)
@@ -205,6 +215,43 @@ def test_cached_logits_and_generation_match_full_decoder(song, model, precision)
             assert len(decode_bridge_tokens(cached.sequences[1].tolist())) == 1
     finally:
         torch.backends.mha.set_fastpath_enabled(fastpath)
+
+
+@pytest.mark.parametrize("cudnn_enabled", [False, True])
+@pytest.mark.parametrize("attention_fails", [False, True])
+def test_cached_attention_backend_is_scoped_and_restored(
+    model, monkeypatch, cudnn_enabled, attention_fails,
+):
+    from prosodia_lyricist import bridge_decoding
+
+    model.eval()
+    memory = torch.randn(2, 3, model.decoder_config["d_model"])
+    query = memory[:, :1]
+    keep = torch.tensor([[True, True, True], [True, False, False]])
+    attention = bridge_decoding.F.scaled_dot_product_attention
+    calls = []
+
+    def checked_attention(*args, **kwargs):
+        calls.append(True)
+        assert not torch.backends.cuda.cudnn_sdp_enabled()
+        if attention_fails:
+            raise RuntimeError("attention failed")
+        return attention(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_decoding.F, "scaled_dot_product_attention", checked_attention)
+    backends = [SDPBackend.MATH] + ([SDPBackend.CUDNN_ATTENTION] if cudnn_enabled else [])
+    with torch.inference_mode(), sdpa_kernel(backends):
+        cache = DecoderCache(model.decoder, memory, keep, max_length=2)
+        if attention_fails:
+            with pytest.raises(RuntimeError, match="attention failed"):
+                cache.step(query, torch.ones(2, dtype=torch.bool))
+        else:
+            assert torch.isfinite(cache.step(query, torch.ones(2, dtype=torch.bool))).all()
+        assert calls
+        assert torch.backends.cuda.cudnn_sdp_enabled() == cudnn_enabled
+        assert torch.backends.cuda.math_sdp_enabled()
+        assert not torch.backends.cuda.flash_sdp_enabled()
+        assert not torch.backends.cuda.mem_efficient_sdp_enabled()
 
 
 def test_song_checkpoint_roundtrip_and_feature_validation(tmp_path, song, model):

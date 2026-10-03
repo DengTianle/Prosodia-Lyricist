@@ -3,6 +3,7 @@
 import json
 import logging
 import math
+import os
 from contextlib import nullcontext
 from datetime import datetime, timezone
 from itertools import islice, zip_longest
@@ -24,7 +25,7 @@ from .data import read_manifest
 from .evaluation import prosody_bleu
 from .melody_checkpoint import file_sha256, load_contrastive_melody
 from .melody_data import read_melody_manifest
-from .runtime import seed_everything, select_device
+from .runtime import log_stage, seed_everything, select_device
 from .train import build_scheduler
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,11 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
 
 def train_bridge(config, *, output_dir=None, smoke_test=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
+    logger.info(
+        "Starting bridge training: pid=%d torch=%s source=%s batch_size=%s workers=%s",
+        os.getpid(), torch.__version__, __file__, settings["batch_size"],
+        0 if smoke_test else settings.get("num_workers", 0),
+    )
     for key in ("epochs", "batch_size", "patience", "gradient_accumulation_steps"):
         if not isinstance(settings.get(key, 1), int) or settings.get(key, 1) < 1:
             raise ValueError(f"{key} must be a positive integer")
@@ -205,14 +211,17 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     clip = settings.get("gradient_clip", 1.0)
     if clip is not None and not 0 < clip < math.inf:
         raise ValueError("gradient_clip must be positive and finite")
-    seed_everything(settings["seed"])
-    device = select_device(settings["device"])
-    precision = "fp32" if smoke_test else settings.get("precision", "fp32")
-    if precision not in ("fp32", "bf16") or (
-        precision == "bf16" and (device.type != "cuda" or not torch.cuda.is_bf16_supported())
-    ):
-        raise ValueError("Use fp32 on CPU/MPS; bf16 requires supported CUDA hardware")
-    manifest = read_manifest(data["prepared_dir"])
+    with log_stage("Initializing bridge device and random seed"):
+        seed_everything(settings["seed"])
+        device = select_device(settings["device"])
+        precision = "fp32" if smoke_test else settings.get("precision", "fp32")
+        if precision not in ("fp32", "bf16") or (
+            precision == "bf16" and (device.type != "cuda" or not torch.cuda.is_bf16_supported())
+        ):
+            raise ValueError("Use fp32 on CPU/MPS; bf16 requires supported CUDA hardware")
+    logger.info("Using %s with %s precision", device, precision)
+    with log_stage("Reading prepared manifest: %s", data["prepared_dir"]):
+        manifest = read_manifest(data["prepared_dir"])
     if manifest["config"] != data:
         raise ValueError("Data configuration differs from preparation; prepare again")
     if data.get("song_ids_file") and (
@@ -229,21 +238,29 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     tower = None
     if checkpoint:
         audit = manifest.get("pretraining_split_audit")
-        if (
-            not data.get("pretraining_manifest")
-            or not audit
-            or (audit["sha256"] != file_sha256(data["pretraining_manifest"]))
+        with log_stage(
+            "Verifying pretraining manifest checksum: %s", data.get("pretraining_manifest")
         ):
-            raise ValueError("Prepare with the unchanged melody pretraining manifest")
+            if (
+                not data.get("pretraining_manifest")
+                or not audit
+                or (audit["sha256"] != file_sha256(data["pretraining_manifest"]))
+            ):
+                raise ValueError("Prepare with the unchanged melody pretraining manifest")
         tower, melody_config, provenance = load_contrastive_melody(checkpoint)
         if provenance["pretraining_train_split"] != "train" or (
             provenance["pretraining_valid_split"] not in ("val", "valid", "validation")
         ):
             raise ValueError("Unsupported contrastive pretraining split semantics")
-        rows, _ = read_melody_manifest(data["pretraining_manifest"], require_lyrics=False)
-        sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
-        if sizes and sizes != {encoder_lines}:
-            raise ValueError("lines_per_window must match the contrastive pretraining manifest")
+        with log_stage("Auditing pretraining CSV: %s", data["pretraining_manifest"]):
+            rows, upstream_songs = read_melody_manifest(
+                data["pretraining_manifest"], require_lyrics=False
+            )
+            sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
+            if sizes and sizes != {encoder_lines}:
+                raise ValueError("lines_per_window must match the contrastive pretraining manifest")
+            # These potentially large Python containers are not used during training.
+            del rows, upstream_songs
     elif smoke_test:
         melody_config = dict(
             d_model=16,
@@ -260,24 +277,25 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     decoder = cfg.get("bridge_decoder", {})
     if smoke_test:
         decoder = dict(d_model=16, num_layers=1, num_heads=2, dim_feedforward=32, dropout=0.0)
-    model = ProsodyBridge(
-        melody_config,
-        max_syllables=data["max_syllables"],
-        encoder_lines_per_window=encoder_lines,
-        max_window_notes=max_window_notes,
-        bridge_scope=cfg.get("bridge_scope", "song"),
-        max_song_notes=cfg.get("max_song_notes", 2048),
-        max_song_lines=cfg.get("max_song_lines", 256),
-        max_target_length=cfg.get("max_target_length"),
-        song_encoder_layers=(
-            1 if smoke_test else cfg.get("song_encoder_layers", 2)
-        ),
-        provenance=provenance,
-        **decoder,
-    )
-    if tower is not None:
-        model.melody_encoder.load_state_dict(tower.state_dict(), strict=True)
-        del tower
+    with log_stage("Building bridge model"):
+        model = ProsodyBridge(
+            melody_config,
+            max_syllables=data["max_syllables"],
+            encoder_lines_per_window=encoder_lines,
+            max_window_notes=max_window_notes,
+            bridge_scope=cfg.get("bridge_scope", "song"),
+            max_song_notes=cfg.get("max_song_notes", 2048),
+            max_song_lines=cfg.get("max_song_lines", 256),
+            max_target_length=cfg.get("max_target_length"),
+            song_encoder_layers=(
+                1 if smoke_test else cfg.get("song_encoder_layers", 2)
+            ),
+            provenance=provenance,
+            **decoder,
+        )
+        if tower is not None:
+            model.melody_encoder.load_state_dict(tower.state_dict(), strict=True)
+            del tower
     datasets = {
         split: BridgeDataset(
             data["prepared_dir"],
@@ -298,7 +316,8 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         )
         for split, ds in datasets.items()
     }
-    model.to(device)
+    with log_stage("Moving bridge model to %s", device):
+        model.to(device)
     optimizer = torch.optim.AdamW(
         [
             {
@@ -346,6 +365,10 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "skipped_limits": {s: ds.skipped_limits for s, ds in datasets.items()},
     }
     (output / "run.json").write_text(json.dumps(run, indent=2), encoding="utf-8")
+    logger.info(
+        "Bridge ready: %d train / %d valid batches, accumulation=%d; output=%s",
+        len(loaders["train"]), len(loaders["valid"]), accumulation, output,
+    )
     best, stale = math.inf, 0
     with (output / "metrics.jsonl").open("w", encoding="utf-8") as handle:
         for epoch in tqdm(range(epochs), desc="Bridge epochs"):
@@ -353,31 +376,45 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 bool(provenance.get("random_smoke_test_tower"))
                 or (unfreeze is not None and epoch >= unfreeze)
             )
-            training = run_bridge_epoch(
-                model,
-                loaders["train"],
-                device,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                accumulation_steps=accumulation,
-                precision=precision,
-                gradient_clip=clip,
-                max_batches=max_batches,
+            logger.info(
+                "Epoch %d/%d starting; melody frozen=%s", epoch + 1, epochs, model.melody_frozen
             )
-            validation = run_bridge_epoch(
-                model,
-                loaders["valid"],
-                device,
-                precision=precision,
-                max_batches=max_batches,
+            with tqdm(loaders["train"], desc="Bridge train", leave=False) as progress:
+                training = run_bridge_epoch(
+                    model,
+                    progress,
+                    device,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    accumulation_steps=accumulation,
+                    precision=precision,
+                    gradient_clip=clip,
+                    max_batches=max_batches,
+                )
+            with tqdm(loaders["valid"], desc="Bridge validate", leave=False) as progress:
+                validation = run_bridge_epoch(
+                    model,
+                    progress,
+                    device,
+                    precision=precision,
+                    max_batches=max_batches,
+                )
+            logger.info(
+                "Epoch %d train %.4f valid %.4f; starting template generation "
+                "(cached decoder cuDNN SDPA disabled)",
+                epoch + 1, training["loss"], validation["loss"],
             )
-            validation["generation"] = evaluate_templates(
-                model,
-                loaders["valid"],
-                device,
-                max_batches=max_batches,
-                precision=precision,
-            )
+            with (
+                log_stage("Epoch %d template generation", epoch + 1),
+                tqdm(loaders["valid"], desc="Bridge generate", leave=False) as progress,
+            ):
+                validation["generation"] = evaluate_templates(
+                    model,
+                    progress,
+                    device,
+                    max_batches=max_batches,
+                    precision=precision,
+                )
             handle.write(
                 json.dumps(
                     {

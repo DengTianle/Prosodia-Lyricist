@@ -322,7 +322,8 @@ def main():
     )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    logger.info("Loading training config: %s", args.config)
     train(
         load_config(args.config),
         output_dir=args.output_dir,
