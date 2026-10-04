@@ -524,7 +524,10 @@ def test_window_tail_note_limits_and_checksums(tmp_path, lines):
 
 
 @pytest.mark.parametrize("pretrained", [False, True])
-def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pretrained):
+@pytest.mark.parametrize("history_mask_probability", [0.0, 0.5])
+def test_prepare_train_and_reload_bridge(
+    tmp_path, monkeypatch, annotation, pretrained, history_mask_probability
+):
     from prosodia_lyricist import ipa
     from prosodia_lyricist.prepare import prepare
     from prosodia_lyricist.train import train
@@ -590,6 +593,7 @@ def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pret
             learning_rate=0.001,
             melody_learning_rate=0.0001,
             melody_unfreeze_epoch=None,
+            history_mask_probability=history_mask_probability,
             warmup_steps=0,
             schedule="constant_after_warmup",
         ),
@@ -601,6 +605,10 @@ def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pret
     output = train(config, smoke_test=True)
     metrics = json.loads((output / "metrics.jsonl").read_text())
     assert metrics["train"]["loss"] > 0
+    assert metrics["train"]["history_mask_probability"] == history_mask_probability
+    assert metrics["valid"]["history_mask_probability"] == 0
+    run = json.loads((output / "run.json").read_text())
+    assert run["config"]["training"]["history_mask_probability"] == history_mask_probability
     assert 0 <= metrics["valid"]["generation"]["note_ipa_count_match_rate"] <= 1
     assert set(metrics["train"]["components"]) == {"strength", "length"}
     assert metrics["train"]["loss"] == pytest.approx(sum(metrics["train"]["components"].values()))

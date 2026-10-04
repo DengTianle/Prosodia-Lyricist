@@ -362,7 +362,13 @@ class ProsodyBridge(nn.Module):
         labels,
         syllable_counts,
         song_features=None,
+        *,
+        history_mask_probability=0.0,
     ):
+        if not isinstance(history_mask_probability, (int, float)) or not (
+            0 <= history_mask_probability <= 1
+        ):
+            raise ValueError("history_mask_probability must be a number between 0 and 1")
         if (
             labels.ndim != 2
             or labels.shape[0] != len(melody_features)
@@ -386,6 +392,13 @@ class ProsodyBridge(nn.Module):
         tokens = torch.full_like(labels, PAD)
         tokens[:, 0] = BOS
         tokens[:, 1:] = labels[:, :-1].masked_fill(labels[:, :-1].eq(-100), PAD)
+        if self.training and history_mask_probability > 0:
+            # Mask the shifted feedback, never the targets or structural tokens. A
+            # pair before a line prefix is still history; padded queries are unused.
+            mask = tokens.ge(PAIR_OFFSET) & tokens.lt(FIRST_LINE) & skeleton["tokens"].ne(PAD)
+            if history_mask_probability < 1:
+                mask &= torch.rand(tokens.shape, device=tokens.device) < history_mask_probability
+            tokens = tokens.masked_fill(mask, SLOT)
         output = self.decode(tokens, memory, melody_attention_mask, skeleton)
         pair_targets = (labels - PAIR_OFFSET).masked_fill(~slots, -100)
         if self.output_design == "separate":

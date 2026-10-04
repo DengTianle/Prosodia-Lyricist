@@ -42,9 +42,14 @@ def run_bridge_epoch(
     precision="fp32",
     gradient_clip=1.0,
     max_batches=None,
+    history_mask_probability=0.0,
 ):
     training = optimizer is not None
     model.train(training)
+    forward_options = (
+        {"history_mask_probability": history_mask_probability}
+        if training and history_mask_probability else {}
+    )
     total_loss = 0.0
     component_totals = {}
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
@@ -65,7 +70,7 @@ def run_bridge_epoch(
                     if precision == "bf16"
                     else (nullcontext())
                 ):
-                    output = model(**batch)
+                    output = model(**batch, **forward_options)
                 if not torch.isfinite(output.loss):
                     raise FloatingPointError("Non-finite bridge loss")
                 if training:
@@ -111,6 +116,7 @@ def run_bridge_epoch(
         "phrases": phrases,
         "batches": batches,
         "optimizer_steps": updates,
+        "history_mask_probability": history_mask_probability if training else 0.0,
     }
 
 
@@ -212,6 +218,12 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     clip = settings.get("gradient_clip", 1.0)
     if clip is not None and not 0 < clip < math.inf:
         raise ValueError("gradient_clip must be positive and finite")
+    history_mask_probability = settings.get("history_mask_probability", 0.0)
+    if not isinstance(history_mask_probability, (int, float)) or not (
+        0 <= history_mask_probability <= 1
+    ):
+        raise ValueError("history_mask_probability must be a number between 0 and 1")
+    logger.info("Training label-history masking probability: %.3f", history_mask_probability)
     with log_stage("Initializing bridge device and random seed"):
         seed_everything(settings["seed"])
         device = select_device(settings["device"])
@@ -391,6 +403,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                     precision=precision,
                     gradient_clip=clip,
                     max_batches=max_batches,
+                    history_mask_probability=history_mask_probability,
                 )
             with tqdm(loaders["valid"], desc="Bridge validate", leave=False) as progress:
                 validation = run_bridge_epoch(

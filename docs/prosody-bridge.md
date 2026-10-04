@@ -64,6 +64,13 @@ from the loss. There is no count head or end-of-line prediction. These are
 **source syllable labels**, distinct
 from the existing lyric decoder's word-level explanation heads.
 
+`training.history_mask_probability` independently replaces previous prosody-pair
+inputs with the existing `SLOT` token during training (0.3 in the example config;
+0 or omission disables it). Gold loss targets, BOS/line prefixes, padding, and
+slot/count embeddings are preserved. Training loss and accuracies reflect the
+masked history; `metrics.jsonl` records the probability. Validation, generation,
+checkpoint selection, and the checkpoint format are unchanged.
+
 All notes, including melisma, are retained. There is no forced note-to-syllable
 alignment. Encoder windows never cross songs or data splits. Both bridge and
 lyric generation operate on complete songs. The bridge retains causal prediction
@@ -90,6 +97,7 @@ Set these paths before preparing:
 | `training.melody_unfreeze_epoch` | Zero-based epoch to fine-tune the trunk; 1 warms up the new decoder for one epoch, 0 starts immediately, null freezes throughout. |
 | `training.learning_rate` | Adapter, feature projection, song encoder and template decoder rate. |
 | `training.melody_learning_rate` | Separate, lower rate for the pretrained trunk. |
+| `training.history_mask_probability` | Probability in [0, 1] of masking each previous prosody pair during training; default 0. |
 
 The vendored encoder and strict importer are taken from `prosodia-direct`,
 whose upstream integration pins `try-contrastive` revision
