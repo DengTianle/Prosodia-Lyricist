@@ -420,17 +420,21 @@ class ProsodyBridge(nn.Module):
         line_counts,
         song_features=None,
         *,
+        syllable_counts=None,
         use_cache=None,
     ):
-        """Fill exactly one prosody slot per note in each supplied melody phrase."""
+        """Generate labels with optional known counts; default to one slot per note."""
         memory = self.encode(
             melody_features, melody_attention_mask, note_line_ids, line_counts, song_features
         )
-        counts = self.note_counts(note_line_ids, line_counts)
-        if counts.gt(self.max_syllables).any():
-            raise ValueError(
-                f"Phrase note count exceeds bridge slot limit {self.max_syllables}; no truncation"
-            )
+        counts = syllable_counts
+        if counts is None:
+            counts = self.note_counts(note_line_ids, line_counts)
+            if counts.gt(self.max_syllables).any():
+                raise ValueError(
+                    f"Phrase note count exceeds bridge slot limit {self.max_syllables}; "
+                    "no truncation"
+                )
         self.validate_counts(counts, line_counts)
         skeleton = self.make_skeleton(counts)
         size, device = len(memory), memory.device

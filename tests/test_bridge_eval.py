@@ -88,7 +88,7 @@ def test_teacher_forced_accuracies_ignore_prefixes_padding_and_weight_by_slots()
     assert scores["tokens"] == 5
 
 
-def test_generation_bleu_and_accuracy_include_missing_extra_slots(bridge, monkeypatch):
+def test_generation_uses_ipa_slots_without_gold_labels(bridge, monkeypatch):
     lines = [
         line([("strong", "long")] * 4),
         line([("strong", "long")] * 3, start=10),
@@ -99,16 +99,18 @@ def test_generation_bleu_and_accuracy_include_missing_extra_slots(bridge, monkey
     original = bridge.generate
 
     def generate(**source):
-        assert "labels" not in source and "syllable_counts" not in source
+        assert "labels" not in source
+        assert source["syllable_counts"].tolist() == [[4, 3], [3, 1]]
         return original(**source)
 
     monkeypatch.setattr(bridge, "generate", generate)
     scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
     assert "labels" in batch  # Evaluation must not consume the caller's batch.
-    assert scores["compared_slots"] == 12
-    assert scores["strength_accuracy"] == pytest.approx(8 / 12)
-    assert scores["length_accuracy"] == pytest.approx(8 / 12)
-    assert scores["pair_accuracy"] == pytest.approx(7 / 12)
+    assert scores["slot_count_source"] == "ipa"
+    assert scores["compared_slots"] == 11
+    assert scores["strength_accuracy"] == pytest.approx(8 / 11)
+    assert scores["length_accuracy"] == pytest.approx(8 / 11)
+    assert scores["pair_accuracy"] == pytest.approx(7 / 11)
     assert scores["exact_template_accuracy"] == 0.5
     assert scores["prosody_bleu"] == 0.25  # Exactly the unsmoothed phrase-mean BLEU-4.
     assert scores["bleu_short_phrases"] == 3
@@ -192,6 +194,7 @@ def test_cli_defaults_to_test_and_preserves_checkpoint_and_data_provenance(
         "--device", "cpu", "--batch-size", "2", "--output", str(output), "--no-progress",
     ])
     assert json.loads(output.read_text()) == report == json.loads(capsys.readouterr().out)
+    assert report["schema_version"] == 3
     assert report["data"]["split"] == "test"
     assert report["data"]["windows"] == 3
     assert report["data"]["songs"] == 2
@@ -202,10 +205,12 @@ def test_cli_defaults_to_test_and_preserves_checkpoint_and_data_provenance(
     assert set(report["teacher_forced"]["loss_components"]) == {"strength", "length"}
     assert report["output_design"] == "separate"
     assert report["target_scheme"] == "line_skeleton_v4"
-    assert report["generation"]["phrases"] == 3
-    assert report["generation"]["skipped_slot_limit_windows"] == 1
-    assert report["generation"]["skipped_slot_limit_phrases"] == 1
-    assert report["generation"]["prosody_bleu"] == pytest.approx(1 / 3)
+    assert report["generation"]["phrases"] == 4
+    assert report["generation"]["compared_slots"] == report["teacher_forced"]["slots"]
+    assert report["generation"]["slot_count_source"] == "ipa"
+    assert report["generation"]["skipped_slot_limit_windows"] == 0
+    assert report["generation"]["skipped_slot_limit_phrases"] == 0
+    assert report["generation"]["prosody_bleu"] == 0.5
     assert report["generation"]["accuracy"]["combined"] == 1.0
     assert report["generation"]["count_diagnostic_phrases"] == 4
     assert report["checkpoint_weights_sha256"] == file_sha256(checkpoint / "bridge_weights.pt")

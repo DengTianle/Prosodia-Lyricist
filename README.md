@@ -263,10 +263,13 @@ python -m prosodia_lyricist.bridge_eval \
 The JSON reports slot-weighted loss, separate head loss components, output design,
 and strength, length, and combined
 accuracy with teacher forcing on the IPA skeleton. A separate greedy evaluation
-uses note counts and reports the same accuracies by slot order (missing/extra
-slots count as incorrect), exact phrase accuracy, and the existing phrase-mean
+uses the same IPA counts, feeds back its own predicted labels, and reports
+the same accuracies, exact phrase accuracy, and the existing phrase-mean
 prosody-BLEU. This is unsmoothed BLEU-4, so phrases shorter than four slots score
-zero even when correct. Count mismatches and skipped examples are also reported.
+zero even when correct. JSON schema v3 marks the switch from note-count evaluation;
+MIDI inference still uses one slot per note. Count mismatches and skipped examples
+are also reported. Epoch logs display free-generation strength/length/pair accuracies;
+checkpoint selection and early stopping still use teacher-forced validation loss.
 Use `--limit 100` for the first 100 retained songs (windows for old checkpoints);
 omit it for the full split. On CPU/MPS,
 use `--precision fp32` (the default).

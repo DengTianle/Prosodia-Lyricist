@@ -116,7 +116,7 @@ def run_bridge_epoch(
 
 @torch.inference_mode()
 def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp32"):
-    """Note-count generation accuracy; note/IPA count differences are dataset diagnostics."""
+    """Free-running labels with IPA counts; note/IPA differences remain diagnostics."""
     model.eval()
     phrases, exact, count_matches, count_error, count_phrases = 0, 0, 0, 0, 0
     skipped_examples, skipped_phrases = 0, 0
@@ -126,12 +126,12 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
     for batch in islice(loader, max_batches):
         batch = dict(batch)
         labels = batch.pop("labels")
-        # Inference uses actual notes, never ground-truth IPA slot lengths.
-        ipa_counts = batch.pop("syllable_counts")
-        counts = model.note_counts(batch["note_line_ids"], batch["line_counts"])
-        active = ipa_counts.gt(0)
-        count_matches += int((counts.eq(ipa_counts) & active).sum())
-        count_error += int((counts - ipa_counts).abs()[active].sum())
+        # Supply the reference skeleton, but never feed gold prosody labels to generation.
+        counts = batch["syllable_counts"]
+        note_counts = model.note_counts(batch["note_line_ids"], batch["line_counts"])
+        active = counts.gt(0)
+        count_matches += int((note_counts.eq(counts) & active).sum())
+        count_error += int((note_counts - counts).abs()[active].sum())
         count_phrases += int(active.sum())
         eligible = counts.le(model.max_syllables).all(-1)
         target_eligible = (counts.sum(-1) + batch["line_counts"]).le(model.max_target_length)
@@ -146,6 +146,7 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
         labels = labels[eligible]
         batch = {key: value[eligible] for key, value in batch.items()}
         # A filtered batch can have fewer phrases than its original padding width.
+        batch["syllable_counts"] = batch["syllable_counts"][:, :int(batch["line_counts"].max())]
         batch = {key: value.to(device) for key, value in batch.items()}
         with (
             torch.autocast("cuda", dtype=torch.bfloat16)
@@ -171,7 +172,7 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
                         pair_correct += predicted_slot == expected_slot
     return {
         "phrases": phrases,
-        "slot_count_source": "notes",
+        "slot_count_source": "ipa",
         "strength_accuracy": strength_correct / slots if slots else None,
         "length_accuracy": length_correct / slots if slots else None,
         "pair_accuracy": pair_correct / slots if slots else None,
@@ -428,8 +429,13 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 + "\n"
             )
             handle.flush()
+            generation = validation["generation"]
             logger.info(
-                "Epoch %d train %.4f valid %.4f", epoch + 1, training["loss"], validation["loss"]
+                "Epoch %d train %.4f valid %.4f; free generation accuracy (IPA counts): "
+                "strength=%s length=%s pair=%s",
+                epoch + 1, training["loss"], validation["loss"],
+                *(f"{generation[key]:.4f}" if generation[key] is not None else "n/a"
+                  for key in ("strength_accuracy", "length_accuracy", "pair_accuracy")),
             )
             if validation["loss"] < best:
                 best, stale = validation["loss"], 0

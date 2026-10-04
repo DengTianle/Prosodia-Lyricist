@@ -30,7 +30,7 @@ def evaluate_bridge(
     limit=None,
     progress=False,
 ):
-    """Return teacher-forced and greedy note-count metrics without training config."""
+    """Return teacher-forced and free-running IPA-count metrics without training config."""
     if split not in ("valid", "test"):
         raise ValueError("Use the prepared valid or test split")
     if batch_size < 1 or num_workers < 0 or (limit is not None and limit < 1):
@@ -65,7 +65,7 @@ def evaluate_bridge(
     model.to(device)
     with tqdm(loader, desc="Teacher-forced evaluation", unit="batch", disable=not progress) as bar:
         teacher = run_bridge_epoch(model, bar, device, precision=precision)
-    with tqdm(loader, desc="Note-count generation", unit="batch", disable=not progress) as bar:
+    with tqdm(loader, desc="IPA-count generation", unit="batch", disable=not progress) as bar:
         generated = evaluate_templates(model, bar, device, precision=precision)
     generated["accuracy"] = {
         "strength": generated.pop("strength_accuracy"),
@@ -73,7 +73,7 @@ def evaluate_bridge(
         "combined": generated.pop("pair_accuracy"),
     }
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "checkpoint_weights_sha256": file_sha256(checkpoint / "bridge_weights.pt"),
@@ -137,8 +137,9 @@ def evaluate_bridge(
             ),
             "teacher_forced_accuracy": "Micro accuracy over IPA slots with gold prior labels.",
             "generation_accuracy": (
-                "Greedy predictions compared by phrase/slot order; denominator sums "
-                "max(reference slots, predicted slots). Missing/extra slots are incorrect."
+                "Greedy free-running labels with reference IPA counts, without gold prior labels. "
+                "Micro accuracy over IPA slots, compared by phrase/slot order. "
+                "MIDI inference still uses note counts."
             ),
             "combined_accuracy": "Both strength and length must match at the same slot.",
             "prosody_bleu": (
@@ -149,7 +150,7 @@ def evaluate_bridge(
             "coverage": (
                 "Teacher forcing excludes entire examples above checkpoint source/target "
                 "limits. A song example is never partially retained. Generation also excludes "
-                "examples above the per-phrase slot or total target limit. Count "
+                "examples whose IPA counts exceed the per-phrase slot or total target limit. Count "
                 "diagnostics cover all teacher-forced phrases. Skips are reported separately. "
                 "With --limit, counts cover only the scanned subset."
             ),

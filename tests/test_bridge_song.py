@@ -168,13 +168,16 @@ def test_song_gradients_freezing_global_context_and_padding(song, model):
 
 
 @pytest.mark.parametrize("precision", ["fp32", "bf16"])
+@pytest.mark.parametrize("use_ipa_counts", [False, True])
 @pytest.mark.parametrize("device", [
     "cpu",
     pytest.param("cuda", marks=pytest.mark.skipif(
         not torch.cuda.is_available(), reason="CUDA is unavailable"
     )),
 ])
-def test_cached_logits_and_generation_match_full_decoder(song, model, precision, device):
+def test_cached_logits_and_generation_match_full_decoder(
+    song, model, precision, device, use_ipa_counts
+):
     if device == "cuda" and precision == "bf16" and not torch.cuda.is_bf16_supported():
         pytest.skip("CUDA BF16 is unavailable")
     model.to(device).eval()
@@ -207,11 +210,16 @@ def test_cached_logits_and_generation_match_full_decoder(song, model, precision,
             torch.testing.assert_close(
                 torch.cat(incremental, dim=1), full.logits, atol=tolerance, rtol=tolerance
             )
-            cached = model.generate(**source, use_cache=True)
-            ordinary = model.generate(**source, use_cache=False)
+            generation_source = dict(source)
+            if use_ipa_counts:
+                generation_source["syllable_counts"] = batch["syllable_counts"]
+            cached = model.generate(**generation_source, use_cache=True)
+            ordinary = model.generate(**generation_source, use_cache=False)
             if precision == "fp32":
                 assert torch.equal(cached.sequences, ordinary.sequences)
-            assert cached.syllable_counts[0].tolist() == [3, 2, 4, 1, 2]
+            assert cached.syllable_counts[0].tolist() == (
+                [2, 1, 3, 1, 1] if use_ipa_counts else [3, 2, 4, 1, 2]
+            )
             assert len(decode_bridge_tokens(cached.sequences[1].tolist())) == 1
     finally:
         torch.backends.mha.set_fastpath_enabled(fastpath)
@@ -300,6 +308,9 @@ def test_song_accumulation_and_limit_checks(song, model):
     assert scores["skipped_slot_limit_phrases"] == scores["skipped_slot_limit_songs"] == 0
     model.max_target_length = 64
     model.max_syllables = 3
+    scores = evaluate_templates(model, [bridge_collate([example(song), example(song[:1])])], "cpu")
+    assert scores["skipped_slot_limit_songs"] == 0 and scores["phrases"] == 6
+    model.max_syllables = 2
     scores = evaluate_templates(model, [bridge_collate([example(song), example(song[:1])])], "cpu")
     assert scores["skipped_slot_limit_songs"] == 1 and scores["phrases"] == 1
 

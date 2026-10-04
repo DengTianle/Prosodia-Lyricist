@@ -137,8 +137,10 @@ Each new run contains:
 - `run.json`: configuration, split audit, checkpoint hash, dataset hashes,
   song/example/encoder-window counts, skipped examples by limit, and smoke-test status.
 - `metrics.jsonl`: training/validation loss, teacher-forced token accuracy,
-  learning rates, freeze state, and free-running validation metrics (exact
-  phrase template accuracy, head accuracies, and note/IPA count diagnostics).
+  learning rates, freeze state, and free-running validation metrics using IPA
+  counts and predicted label history (exact phrase template accuracy, head
+  accuracies, and note/IPA count diagnostics). Epoch logs also show free-running
+  strength/length/pair accuracies; checkpoint selection still uses validation loss.
 - `best/bridge.json` and `best/bridge_weights.pt`: label vocabulary, IPA rules,
   architecture, feature scheme, length limits, provenance, melody trunk and bridge weights.
   `best/run.json` retains the training context.

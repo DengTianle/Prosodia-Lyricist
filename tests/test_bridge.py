@@ -175,8 +175,9 @@ def test_note_counts_fix_slots_and_line_ids_in_padded_batches(lines, bridge):
 
 
 @pytest.mark.parametrize("strength,length", [(0, 0), (0, 1), (1, 0), (1, 1)])
+@pytest.mark.parametrize("use_ipa_counts", [False, True])
 def test_two_heads_feed_back_both_labels_and_encode_template_input(
-    strength, length, bridge, lines, tokenizer, monkeypatch
+    strength, length, use_ipa_counts, bridge, lines, tokenizer, monkeypatch
 ):
     with torch.no_grad():
         for head, selected in ((bridge.strength_head, strength), (bridge.length_head, length)):
@@ -191,7 +192,10 @@ def test_two_heads_feed_back_both_labels_and_encode_template_input(
         return original_decode(tokens, *args)
 
     monkeypatch.setattr(bridge, "decode", decode)
-    result = bridge.eval().generate(**bridge_collate([encode_bridge_source(lines)]))
+    source = bridge_collate([encode_bridge_source(lines)])
+    if use_ipa_counts:
+        source["syllable_counts"] = torch.tensor([[len(line["syllables"]) for line in lines]])
+    result = bridge.eval().generate(**source)
     predicted = decode_bridge_tokens(result.sequences[0].tolist())
     pair_token = PAIR_OFFSET + 2 * strength + length
     assert prefixes[1][0, -1] == pair_token  # Both predictions enter the next step.
@@ -201,12 +205,13 @@ def test_two_heads_feed_back_both_labels_and_encode_template_input(
     assert all(s == expected_pair for line in predicted for s in line["syllables"])
     encoded = encode_source({"lines": predicted}, tokenizer, 8)
     active_lengths = [value for value in encoded["length_ids"] if value]
-    assert active_lengths == [length + 1] * 5
+    slots = 4 if use_ipa_counts else 5
+    assert active_lengths == [length + 1] * slots
     stress_token = tokenizer.convert_tokens_to_ids(f"<{expected_pair['stress']}>")
-    assert encoded["input_ids"].count(stress_token) == 5
+    assert encoded["input_ids"].count(stress_token) == slots
 
 
-def test_training_uses_ipa_skeleton_and_validation_uses_notes(
+def test_training_and_validation_use_ipa_skeleton(
     monkeypatch, lines, bridge
 ):
     batch = bridge_collate([example(lines)])
@@ -217,7 +222,8 @@ def test_training_uses_ipa_skeleton_and_validation_uses_notes(
     called = []
 
     def generate(**kwargs):
-        assert "syllable_counts" not in kwargs and "labels" not in kwargs
+        assert "labels" not in kwargs
+        assert torch.equal(kwargs["syllable_counts"], batch["syllable_counts"])
         called.append(True)
         return original(**kwargs)
 
@@ -225,7 +231,7 @@ def test_training_uses_ipa_skeleton_and_validation_uses_notes(
     scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
     assert called and scores["note_ipa_count_match_rate"] == 0.5
     assert scores["note_ipa_count_mae"] == 0.5
-    assert scores["slot_count_source"] == "notes"
+    assert scores["slot_count_source"] == "ipa"
     assert scores["skipped_slot_limit_windows"] == 0
 
 
@@ -343,11 +349,14 @@ def test_v4_checkpoint_rejects_wrong_heads_and_label_order(tmp_path, bridge):
         ProsodyBridge.load(tmp_path)
 
 
-def test_generation_rejects_overlong_note_phrases_and_validation_reports_skips(lines, bridge):
+def test_inference_limits_notes_and_validation_limits_ipa_counts(lines, bridge):
     bridge.max_syllables = 3
     batch = bridge_collate([example(lines), example(lines[1:])])
     with pytest.raises(ValueError, match="slot limit 3; no truncation"):
         bridge.eval().generate(**bridge_collate([encode_bridge_source(lines)]))
+    scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
+    assert scores["phrases"] == 3 and scores["skipped_slot_limit_windows"] == 0
+    bridge.max_syllables = 2
     scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
     assert scores["phrases"] == 1
     assert scores["skipped_slot_limit_windows"] == 1
