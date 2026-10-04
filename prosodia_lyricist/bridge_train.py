@@ -31,6 +31,29 @@ from .train import build_scheduler
 logger = logging.getLogger(__name__)
 
 
+def _random_melody_config(config):
+    """Resolve an explicit tower architecture without opening a pretrained checkpoint."""
+    required = {"d_model", "num_layers", "num_heads", "dim_feedforward"}
+    allowed = required | {"dropout", "pooling", "max_length"}
+    if not isinstance(config, dict) or not required.issubset(config) or config.keys() - allowed:
+        raise ValueError(
+            "model.random_melody_encoder requires d_model, num_layers, num_heads, "
+            "dim_feedforward; optional keys are dropout, pooling, max_length"
+        )
+    config = {"dropout": 0.1, "pooling": "cls", "max_length": 4096, **config}
+    for name in (*sorted(required), "max_length"):
+        value = config[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"model.random_melody_encoder.{name} must be a positive integer")
+    if config["d_model"] % config["num_heads"]:
+        raise ValueError("model.random_melody_encoder.d_model must be divisible by num_heads")
+    if not isinstance(config["dropout"], (int, float)) or not 0 <= config["dropout"] < 1:
+        raise ValueError("model.random_melody_encoder.dropout must be in [0, 1)")
+    if config["pooling"] not in ("cls", "mean"):
+        raise ValueError("model.random_melody_encoder.pooling must be cls or mean")
+    return {**config, "projection_dim": None}
+
+
 def run_bridge_epoch(
     model,
     loader,
@@ -201,6 +224,13 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
 
 def train_bridge(config, *, output_dir=None, smoke_test=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
+    initialization = cfg.get("melody_initialization", "pretrained")
+    if initialization not in ("pretrained", "random"):
+        raise ValueError("model.melody_initialization must be pretrained or random")
+    random_config = (
+        _random_melody_config(cfg.get("random_melody_encoder"))
+        if initialization == "random" else None
+    )
     logger.info(
         "Starting bridge training: pid=%d torch=%s source=%s batch_size=%s workers=%s",
         os.getpid(), torch.__version__, __file__, settings["batch_size"],
@@ -249,7 +279,9 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     if cfg.get("max_notes") is not None and max_window_notes != cfg["max_notes"]:
         raise ValueError("Conflicting max_notes and max_window_notes settings")
     tower = None
-    if checkpoint:
+    # Preserve prepared-data audits in either mode; random initialization does not
+    # require pretraining provenance when the data was prepared without it.
+    if data.get("pretraining_manifest") or (initialization == "pretrained" and checkpoint):
         audit = manifest.get("pretraining_split_audit")
         with log_stage(
             "Verifying pretraining manifest checksum: %s", data.get("pretraining_manifest")
@@ -260,11 +292,6 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 or (audit["sha256"] != file_sha256(data["pretraining_manifest"]))
             ):
                 raise ValueError("Prepare with the unchanged melody pretraining manifest")
-        tower, melody_config, provenance = load_contrastive_melody(checkpoint)
-        if provenance["pretraining_train_split"] != "train" or (
-            provenance["pretraining_valid_split"] not in ("val", "valid", "validation")
-        ):
-            raise ValueError("Unsupported contrastive pretraining split semantics")
         with log_stage("Auditing pretraining CSV: %s", data["pretraining_manifest"]):
             rows, upstream_songs = read_melody_manifest(
                 data["pretraining_manifest"], require_lyrics=False
@@ -274,6 +301,20 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 raise ValueError("lines_per_window must match the contrastive pretraining manifest")
             # These potentially large Python containers are not used during training.
             del rows, upstream_songs
+    if initialization == "random":
+        melody_config = random_config
+        provenance = {
+            "initialization": "random", "weights_loaded": False,
+            "checkpoint": None, "sha256": None,
+            "architecture_source": "model.random_melody_encoder",
+        }
+    elif checkpoint:
+        tower, melody_config, provenance = load_contrastive_melody(checkpoint)
+        if provenance["pretraining_train_split"] != "train" or (
+            provenance["pretraining_valid_split"] not in ("val", "valid", "validation")
+        ):
+            raise ValueError("Unsupported contrastive pretraining split semantics")
+        provenance = {**provenance, "initialization": "pretrained", "weights_loaded": True}
     elif smoke_test:
         melody_config = dict(
             d_model=16,
@@ -284,9 +325,18 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             projection_dim=None,
             max_length=max_window_notes or 512,
         )
-        provenance = {"random_smoke_test_tower": True}
+        provenance = {
+            "random_smoke_test_tower": True, "initialization": "random", "weights_loaded": False,
+        }
     else:
-        raise ValueError("Set model.melody_checkpoint to the contrastive two-pool checkpoint")
+        raise ValueError(
+            "Set model.melody_checkpoint to the contrastive two-pool checkpoint, "
+            "or use model.melody_initialization: random with model.random_melody_encoder"
+        )
+    logger.info(
+        "Melody initialization: %s; pretrained weights loaded=%s",
+        provenance["initialization"], provenance["weights_loaded"],
+    )
     decoder = cfg.get("bridge_decoder", {})
     if smoke_test:
         decoder = dict(d_model=16, num_layers=1, num_heads=2, dim_feedforward=32, dropout=0.0)
@@ -357,6 +407,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     output.mkdir(parents=True, exist_ok=False)
     run = {
         "conditioning": "bridge",
+        "melody_initialization": provenance["initialization"],
         "bridge_target_scheme": model.target_scheme,
         "bridge_scope": model.bridge_scope,
         "training_count_source": "ipa",

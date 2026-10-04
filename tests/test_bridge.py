@@ -609,6 +609,8 @@ def test_prepare_train_and_reload_bridge(
     assert metrics["valid"]["history_mask_probability"] == 0
     run = json.loads((output / "run.json").read_text())
     assert run["config"]["training"]["history_mask_probability"] == history_mask_probability
+    assert run["melody_initialization"] == ("pretrained" if pretrained else "random")
+    assert run["melody_provenance"]["weights_loaded"] == pretrained
     assert 0 <= metrics["valid"]["generation"]["note_ipa_count_match_rate"] <= 1
     assert set(metrics["train"]["components"]) == {"strength", "length"}
     assert metrics["train"]["loss"] == pytest.approx(sum(metrics["train"]["components"].values()))

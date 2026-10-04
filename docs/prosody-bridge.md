@@ -83,7 +83,9 @@ Set these paths before preparing:
 
 | Setting | Meaning |
 | --- | --- |
-| `model.melody_checkpoint` | Original contrastive checkpoint with `mlm_note_177d_v1` and `audio_pooling: note`. This is not a fine-tuned direct-lyrics checkpoint. |
+| `model.melody_initialization` | `pretrained` (default) or `random`; random mode never reads the checkpoint file. |
+| `model.melody_checkpoint` | Original contrastive checkpoint with `mlm_note_177d_v1` and `audio_pooling: note`; required for pretrained training, ignored in random mode. |
+| `model.random_melody_encoder` | Random tower architecture: required `d_model`, `num_layers`, `num_heads`, `dim_feedforward`; optional `dropout` (0.1), `pooling` (`cls`), `max_length` (4096). No pooled projection is built. |
 | `data.pretraining_manifest` | Immutable CSV actually used for that contrastive run. |
 | `data.lines_per_window` | Prepared-data provenance: pretraining window line count, default 2. |
 | `model.encoder_lines_per_window` | Must match the prepared/pretraining count, independently of song scope. |
@@ -118,20 +120,31 @@ unchanged. Song grouping and the new source features are constructed when loadin
 the bridge dataset. Any exceeded source/target limit skips the entire song, with
 per-reason counts; inference rejects overlong songs without truncation.
 
+For a scratch comparison, set `model.melody_initialization: random`. The example
+`random_melody_encoder` matches the current pretrained tower, and no checkpoint
+file is needed, even for normal training. Keep `data` unchanged to reuse the same
+splits. Initialization follows `training.seed` and is recorded in `run.json` and
+checkpoint provenance. The existing learning rate and freeze schedule still apply:
+set `training.melody_unfreeze_epoch: 0` to train the random tower immediately, and
+choose `training.melody_learning_rate` explicitly for the comparison.
+
 Preparation retains note arrays alongside the existing IPA annotations. It
 preserves contrastive pretraining assignments for shared song IDs and duplicate
-artist/title or audio identities. Conflicting assignments fail. Real training
-requires both the pretrained checkpoint and the unchanged preparation manifest
-hash. The upstream format records a manifest path rather than its historical
+artist/title or audio identities. Conflicting assignments fail. Pretrained training
+requires both the checkpoint and the unchanged preparation manifest hash. Random
+training retains these data audits when a pretraining manifest was used during
+preparation; it also supports data prepared without one. The upstream format
+records a manifest path rather than its historical
 hash, so the supplied CSV must be the original one. These checks cannot infer
 undocumented upstream exposure. The reused lyric checkpoint may have seen songs
 from a different split; audit that overlap before claiming held-out performance
 for the combined lyric system.
 
 The smoke test runs at most two training and two validation batches with a tiny
-template decoder. It imports the supplied melody checkpoint if configured;
-otherwise it uses a tiny random melody tower and records that fact. Real
-training rejects a missing contrastive checkpoint. Neither path downloads BART
+template decoder. In random mode it keeps the configured tower architecture.
+In pretrained mode it imports the supplied melody checkpoint, or uses a tiny
+random smoke-test tower if none was supplied. Normal pretrained training rejects
+a missing contrastive checkpoint. Neither initialization mode downloads BART
 weights or a tokenizer: the template bridge has its own fixed label vocabulary.
 
 Training supports single-device FP32 or CUDA BF16, token-weighted gradient
@@ -142,7 +155,7 @@ checkpoint selection. Optimizer resume and distributed training are not included
 
 Each new run contains:
 
-- `run.json`: configuration, split audit, checkpoint hash, dataset hashes,
+- `run.json`: configuration, melody initialization, split audit, checkpoint hash, dataset hashes,
   song/example/encoder-window counts, skipped examples by limit, and smoke-test status.
 - `metrics.jsonl`: training/validation loss, teacher-forced token accuracy,
   learning rates, freeze state, and free-running validation metrics using IPA

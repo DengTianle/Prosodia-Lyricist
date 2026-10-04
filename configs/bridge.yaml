@@ -17,8 +17,18 @@ data:
 
 model:
   conditioning: bridge
+  melody_initialization: pretrained # random never opens melody_checkpoint.
   # Current note-based two-pool contrastive checkpoint (same format as prosodia-direct).
   melody_checkpoint: ../../try-contrastive/checkpoints/600_2line_window12/22Sep_1mig/best.pt
+  # Only used for random initialization; matches the current pretrained tower.
+  random_melody_encoder:
+    d_model: 256
+    num_layers: 4
+    num_heads: 4
+    dim_feedforward: 1024
+    dropout: 0.1
+    pooling: cls
+    max_length: 4096
   bridge_scope: song
   encoder_lines_per_window: 2 # Must match data.lines_per_window and pretraining.
   max_window_notes: 512
@@ -46,6 +56,7 @@ training:
   history_mask_probability: 0.3
   # Zero-based: 1 warms up the new song encoder/decoder, then fine-tunes the trunk.
   # null keeps the pretrained trunk frozen; 0 fine-tunes immediately.
+  # Also applies to a random tower; use 0 to train it from the first epoch.
   melody_unfreeze_epoch: 1
   learning_rate: 0.0001
   melody_learning_rate: 0.000002
