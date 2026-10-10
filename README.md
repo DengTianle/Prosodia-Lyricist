@@ -211,10 +211,13 @@ templates are passed to the lyric model together, preserving whole-song context.
 In [`configs/bridge.yaml`](configs/bridge.yaml), set `model.melody_checkpoint`
 to the current note-based two-pool contrastive checkpoint and
 `data.pretraining_manifest` to its original CSV. For initial preparation, set it
-before preparing if you want to inherit upstream split assignments. Match
+before preparing to protect downstream held-out splits from upstream training exposure. Match
 `data.lines_per_window` and `model.encoder_lines_per_window` to that manifest.
 Preparation uses `data/dali-bridge`
-and keeps shared songs and duplicate identities in their pretraining splits.
+and puts identity groups seen in contrastive **training** into downstream training.
+Contrastive validation/test songs otherwise retain downstream random assignments;
+using them for downstream training is allowed. Duplicate downstream identities
+always stay together, including identities connected through upstream metadata.
 Existing prepared data can be reused unchanged. The default training batch is
 eight songs with two accumulation steps. Source/target limits are separate:
 512 notes per encoder window, 2,048 notes and 256 lines per song, and 4,096 target
@@ -240,10 +243,26 @@ python -m prosodia_lyricist.audit_bridge_splits \
 
 `--dali-dir` supplies identity metadata for older prepared manifests; no IPA or
 note extraction is performed. Newly prepared manifests retain those identities.
-The report lists conflicting song groups and distinguishes upstream training
-exposure in downstream validation/test from other split disagreements. Exit codes
+The report flags upstream training exposure in downstream validation/test and
+duplicates crossing downstream splits. Other upstream/downstream split differences
+are informational (`allowed_overlaps`); `upstream_split_overlaps` identifies upstream
+groups with multiple split labels, including links discovered through DALI metadata. Exit codes
 are 0 for passed, 1 for conflicts, and 2 for unavailable/incomplete checks. The
 audit does not change prepared files or split assignments.
+
+To inspect proposed splits **before** preparing notes/IPA:
+
+```bash
+python -m prosodia_lyricist.prepare --config configs/bridge.yaml --check-splits
+```
+
+This writes `data/dali-bridge/split_preflight.json` with song IDs, artist/title/audio
+identities, upstream split overlaps, random-split conflicts, reassignments, and
+candidate split counts. Normal preparation runs the same check before extraction
+and retains its assignments even if some songs later fail lyric/note processing.
+The check reads annotations for metadata but does not extract notes or initialize
+IPA. Missing/malformed upstream manifests and window-size mismatches fail early.
+Candidate counts may decrease after full preparation rejects unusable songs.
 
 ```bash
 conda activate prosodia-lyricist

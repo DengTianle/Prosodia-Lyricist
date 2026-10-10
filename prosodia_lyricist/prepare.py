@@ -62,7 +62,79 @@ def split_for(group, seed, valid_fraction, test_fraction):
     return "train"
 
 
-def prepare(config, *, limit=None):
+def plan_pretraining_splits(data, files, requested):
+    """Plan from song metadata before any pronunciation or note processing."""
+    from .melody_checkpoint import file_sha256
+    from .melody_data import (
+        preserve_pretraining_splits,
+        pretraining_overlap_report,
+        read_melody_manifest,
+    )
+
+    path = data.get("pretraining_manifest") if data.get("include_melody") else None
+    upstream, upstream_hash = {}, None
+    if path:
+        upstream_hash = file_sha256(path)
+        rows, upstream = read_melody_manifest(
+            path, require_lyrics=False, allow_split_overlap=True,
+        )
+        sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
+        if sizes and sizes != {data["lines_per_window"]}:
+            raise ValueError("lines_per_window must match the contrastive pretraining manifest")
+        del rows
+    songs, rejections, sources = {}, [], {}
+    for filename in tqdm(files, desc="Checking split identities", unit="song"):
+        try:
+            info, _ = read_annotation(filename)
+            song = str(info["id"])
+            if requested is not None and song not in requested:
+                continue
+            language = str(info.get("metadata", {}).get("language", "")).lower()
+            if data["language"] != "all" and language != data["language"].lower():
+                continue
+            ncc = float(info.get("scores", {}).get("NCC", 0.0))
+            if not math.isfinite(ncc) or ncc < data["min_ncc"]:
+                continue
+        except (OSError, EOFError, pickle.UnpicklingError, KeyError, TypeError,
+                ValueError, AttributeError) as exc:
+            rejections.append({"file": str(filename), "reason": str(exc)})
+            continue
+        if song in songs:
+            raise ValueError(f"Duplicate DALI ID {song}: {sources[song]} and {filename}")
+        songs[song], sources[song] = info, str(filename)
+    if not songs:
+        raise ValueError("No eligible DALI song metadata for split planning")
+    groups = song_groups(songs)
+    random_splits = {
+        song: split_for(group, data["seed"], data["valid_fraction"], data["test_fraction"])
+        for song, group in groups.items()
+    }
+    before = pretraining_overlap_report(
+        {song: {**info, "split": random_splits[song]} for song, info in songs.items()}, upstream,
+    )
+    splits = preserve_pretraining_splits(songs, random_splits, path, upstream=upstream)
+    after = pretraining_overlap_report(
+        {song: {**info, "split": splits[song]} for song, info in songs.items()}, upstream,
+    )
+    report = {
+        **after, "status": "passed" if path else "not_requested",
+        "manifest": str(Path(path).resolve()) if path else None, "sha256": upstream_hash,
+        "scope": "metadata_candidates_before_line_rejection",
+        "candidate_songs": len(songs), "metadata_rejections": rejections,
+        "random_split_conflicts": before["conflicts"],
+        "upstream_split_overlaps": before["upstream_split_overlaps"],
+        "reassigned_songs": [
+            {"song_id": song, "from": random_splits[song], "to": splits[song]}
+            for song in sorted(songs) if random_splits[song] != splits[song]
+        ],
+        "split_counts": dict(Counter(splits.values())),
+        "songs": {song: {"random_split": random_splits[song], "split": splits[song],
+                         "group": groups[song]} for song in sorted(songs)},
+    }
+    return splits, groups, upstream, report
+
+
+def prepare(config, *, limit=None, check_splits=False):
     data = config["data"]
     valid, test = data["valid_fraction"], data["test_fraction"]
     if not (0 < valid < 1 and 0 <= test < 1 and valid + test < 1):
@@ -71,10 +143,6 @@ def prepare(config, *, limit=None):
         raise ValueError("max_syllables and limit must be positive")
     if data["stress_source"] not in ("ipa", "lexical", "unknown"):
         raise ValueError("stress_source must be ipa, lexical or unknown")
-    if data["stress_source"] == "ipa":
-        from .ipa import backend
-
-        backend()  # Fail before creating outputs if pronunciation support is unavailable.
     requested, selection_hash = None, None
     if data.get("song_ids_file"):
         selection = Path(data["song_ids_file"]).read_bytes()
@@ -90,6 +158,26 @@ def prepare(config, *, limit=None):
         raise ValueError(f"No DALI .gz or .json files in {source}")
     files = files[:limit] if limit else files
     output = Path(data["prepared_dir"])
+    planned_splits, planned_groups, upstream, preflight = None, None, None, None
+    if check_splits or (data.get("include_melody") and data.get("pretraining_manifest")):
+        planned_splits, planned_groups, upstream, preflight = plan_pretraining_splits(
+            data, files, requested,
+        )
+        output.mkdir(parents=True, exist_ok=True)
+        report_path = output / "split_preflight.json"
+        report_path.write_text(json.dumps(preflight, indent=2) + "\n", encoding="utf-8")
+        tqdm.write(
+            f"Split preflight: {preflight['candidate_songs']} candidates, "
+            f"{len(preflight['reassigned_songs'])} reassigned, "
+            f"{len(preflight['upstream_split_overlaps'])} upstream split-overlap groups. "
+            f"Report: {report_path}"
+        )
+        if check_splits:
+            return preflight
+    if data["stress_source"] == "ipa":
+        from .ipa import backend
+
+        backend()  # Only initialize expensive pronunciation after split validation.
     output.mkdir(parents=True, exist_ok=True)
     songs, counts = {}, Counter()
     with TemporaryDirectory(prefix=".prepare-", dir=output) as staging, ExitStack() as stack:
@@ -162,19 +250,26 @@ def prepare(config, *, limit=None):
                 rejects.write(json.dumps({"file": path.name, "reason": str(exc)}) + "\n")
         if not songs:
             raise ValueError("No usable DALI songs; check language, quality, and annotation format")
-        groups = song_groups(songs)
-        splits = {
-            song_id: split_for(group, data["seed"], valid, test)
-            for song_id, group in groups.items()
-        }
+        if planned_splits is not None:
+            # Rejected lyrics cannot change the assignments already checked before extraction.
+            groups = {song: planned_groups[song] for song in songs}
+            splits = {song: planned_splits[song] for song in songs}
+        else:
+            groups = song_groups(songs)
+            splits = {
+                song_id: split_for(group, data["seed"], valid, test)
+                for song_id, group in groups.items()
+            }
         split_audit = None
         if data.get("include_melody") and data.get("pretraining_manifest"):
-            from .melody_data import audit_pretraining_splits, preserve_pretraining_splits
+            from .melody_checkpoint import file_sha256
+            from .melody_data import audit_pretraining_splits
 
-            splits = preserve_pretraining_splits(songs, splits, data["pretraining_manifest"])
+            if file_sha256(data["pretraining_manifest"]) != preflight["sha256"]:
+                raise ValueError("Pretraining manifest changed during preparation")
             split_audit = audit_pretraining_splits(
                 {key: {**info, "split": splits[key]} for key, info in songs.items()},
-                data["pretraining_manifest"],
+                data["pretraining_manifest"], upstream=upstream,
             )
         handles = {
             split: stack.enter_context((staging / f"{split}.jsonl").open("w", encoding="utf-8"))
@@ -240,6 +335,8 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--limit", type=int, help="Scan only the first N files for a smoke test")
     parser.add_argument("--song-ids-file", help="Text file containing one exact DALI ID per line")
+    parser.add_argument("--check-splits", action="store_true",
+                        help="Write split_preflight.json from metadata; do not extract notes/IPA")
     parser.add_argument(
         "--english-only", action="store_true", help="Exclude other/unknown languages"
     )
@@ -249,8 +346,9 @@ def main():
         config["data"]["song_ids_file"] = str(Path(args.song_ids_file).expanduser().resolve())
     if args.english_only:
         config["data"]["language"] = "english"
-    manifest = prepare(config, limit=args.limit)
-    print(json.dumps(manifest["counts"], indent=2))
+    manifest = prepare(config, limit=args.limit, check_splits=args.check_splits)
+    counts = manifest["split_counts"] if args.check_splits else manifest["counts"]
+    print(json.dumps(counts, indent=2))
 
 
 if __name__ == "__main__":

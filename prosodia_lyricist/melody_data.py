@@ -1,6 +1,7 @@
 """DALI melody extraction and split provenance shared with prosodia-direct."""
 
 import csv
+import json
 from collections import defaultdict
 from pathlib import Path
 
@@ -19,7 +20,8 @@ def canonical_split(value):
     return value
 
 
-def read_melody_manifest(path, *, require_lyrics=True):
+def read_melody_manifest(path, *, require_lyrics=True, allow_split_overlap=False):
+    """Read identities; exposure audits may retain every split of an upstream song."""
     path = Path(path).resolve()
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
@@ -41,7 +43,8 @@ def read_melody_manifest(path, *, require_lyrics=True):
             raise ValueError("Manifest has empty song/sample IDs or duplicate sample IDs")
         ids.add(sample)
         row["split"] = canonical_split(row["split"])
-        if splits.setdefault(song, row["split"]) != row["split"]:
+        splits.setdefault(song, set()).add(row["split"])
+        if len(splits[song]) > 1 and not allow_split_overlap:
             raise ValueError(f"Song {song} crosses splits")
         audio = row.get("raw_audio_path") or row.get("audio_path")
         info = {
@@ -59,61 +62,110 @@ def read_melody_manifest(path, *, require_lyrics=True):
                 raise ValueError(f"Missing aligned lyric text for {sample}")
             if len(lines) != int(row["line_count"]):
                 raise ValueError(f"Lyric line_count mismatch for {sample}")
-    groups = song_groups(songs)
-    group_splits = {}
-    for song, group in groups.items():
-        if group_splits.setdefault(group, splits[song]) != splits[song]:
-            raise ValueError(f"Duplicate song/audio group {group} crosses splits")
-    return rows, {song: {**info, "split": splits[song]} for song, info in songs.items()}
-
-
-def audit_pretraining_splits(songs, manifest):
-    """Require shared songs (including duplicate identities) to keep their split.
-
-    This is conservative: it also prevents moving pretraining validation songs
-    into downstream training and does not claim to detect undocumented exposure.
-    """
-    _, upstream = read_melody_manifest(manifest, require_lyrics=False)
-    combined = {f"up:{song}": info for song, info in upstream.items()}
-    combined.update({f"down:{song}": info for song, info in songs.items()})
-    groups = song_groups(combined)
-    memberships = defaultdict(set)
-    for key, info in combined.items():
-        memberships[groups[key]].add(info["split"])
-    for song, info in songs.items():
-        if song in upstream and info["split"] != upstream[song]["split"]:
-            raise ValueError(f"Pretraining/downstream split mismatch for song {song}")
-        if len(memberships[groups[f"down:{song}"]]) != 1:
-            raise ValueError(f"Pretraining/downstream duplicate group crosses splits: {song}")
-    return {
-        "manifest": str(Path(manifest).resolve()),
-        "sha256": file_sha256(manifest),
-        "shared_songs": len(songs.keys() & upstream.keys()),
-        "downstream_only_songs": len(songs.keys() - upstream.keys()),
+    if not allow_split_overlap:
+        groups = song_groups(songs)
+        group_splits = {}
+        for song, group in groups.items():
+            if group_splits.setdefault(group, splits[song]) != splits[song]:
+                raise ValueError(f"Duplicate song/audio group {group} crosses splits")
+    return rows, {
+        song: {**info, "split": "train" if "train" in splits[song] else sorted(splits[song])[0],
+               "splits": sorted(splits[song])}
+        for song, info in songs.items()
     }
 
 
-def preserve_pretraining_splits(songs, splits, manifest):
-    """Reuse upstream assignments for shared songs and duplicate identity groups."""
-    _, upstream = read_melody_manifest(manifest, require_lyrics=False)
-    combined = {f"up:{key}": info for key, info in upstream.items()}
-    combined.update({f"down:{key}": info for key, info in songs.items()})
-    groups = song_groups(combined)
-    assigned = {}
-    for key, info in upstream.items():
-        group = groups[f"up:{key}"]
-        if assigned.setdefault(group, info["split"]) != info["split"]:
-            raise ValueError("Pretraining duplicate groups cross splits")
-    result = {}
-    for key in songs:
-        group_split = assigned.get(groups[f"down:{key}"])
-        same_id_split = upstream.get(key, {}).get("split")
-        if group_split and same_id_split and group_split != same_id_split:
-            raise ValueError(f"Conflicting pretraining identity for {key}")
-        result[key] = same_id_split or group_split or splits[key]
-    audit_pretraining_splits(
-        {key: {**info, "split": result[key]} for key, info in songs.items()}, manifest
-    )
+def pretraining_identity_groups(songs, upstream):
+    """Join IDs, artist/title, audio and persisted groups across both datasets."""
+    combined = {f"up:{song}": info for song, info in upstream.items()}
+    combined.update({f"down:{song}": info for song, info in songs.items()})
+    parents = song_groups(combined)
+
+    def root(key):
+        while parents[key] != key:
+            parents[key] = parents[parents[key]]
+            key = parents[key]
+        return key
+
+    def join(a, b):
+        parents[root(a)] = root(b)
+
+    for song in songs.keys() & upstream.keys():
+        join(f"up:{song}", f"down:{song}")
+    known_groups = {}
+    for song, info in songs.items():
+        key = f"down:{song}"
+        if "group" in info:
+            join(key, known_groups.setdefault(info["group"], key))
+    groups = defaultdict(lambda: {"upstream": [], "downstream": [], "identities": {}})
+    for side, prefix, entries in (("upstream", "up", upstream), ("downstream", "down", songs)):
+        for song, info in sorted(entries.items()):
+            key = f"{prefix}:{song}"
+            group = groups[root(key)]
+            for split in info.get("splits", [info["split"]]):
+                group[side].append({"song_id": song, "split": split})
+            group["identities"][key] = {
+                "artist": info.get("artist", ""), "title": info.get("title", ""),
+                "audio": info.get("audio", {}).get("url", ""),
+            }
+    return list(groups.values())
+
+
+def pretraining_overlap_report(songs, upstream):
+    """Only upstream training exposure threatens downstream held-out evaluation."""
+    report = {
+        "policy": "protect_downstream_heldout_v1", "conflicts": [],
+        "allowed_overlaps": [], "upstream_split_overlaps": [],
+        "shared_songs": len(songs.keys() & upstream.keys()),
+        "downstream_only_songs": len(songs.keys() - upstream.keys()),
+    }
+    for group in pretraining_identity_groups(songs, upstream):
+        up = {row["split"] for row in group["upstream"]}
+        down = {row["split"] for row in group["downstream"]}
+        if len(up) > 1:
+            report["upstream_split_overlaps"].append(group)
+        if "train" in up and down & {"valid", "test"}:
+            report["conflicts"].append({
+                "kind": "pretraining_train_in_downstream_heldout", **group,
+            })
+        elif len(down) > 1:
+            report["conflicts"].append({"kind": "downstream_duplicate_crosses_splits", **group})
+        elif up and down and len(up | down) > 1:
+            report["allowed_overlaps"].append(group)
+    return report
+
+
+def audit_pretraining_splits(songs, manifest, *, upstream=None):
+    if upstream is None:
+        _, upstream = read_melody_manifest(
+            manifest, require_lyrics=False, allow_split_overlap=True,
+        )
+    report = pretraining_overlap_report(songs, upstream)
+    if report["conflicts"]:
+        raise ValueError("Unsafe downstream split group: " + json.dumps(report["conflicts"][0]))
+    return {
+        **report,
+        "manifest": str(Path(manifest).resolve()),
+        "sha256": file_sha256(manifest),
+    }
+
+
+def preserve_pretraining_splits(songs, splits, manifest, *, upstream=None):
+    """Force upstream-trained identity groups into train; retain other random splits."""
+    if upstream is None:
+        _, upstream = read_melody_manifest(
+            manifest, require_lyrics=False, allow_split_overlap=True,
+        )
+    result = dict(splits)
+    downstream = {song: {**info, "split": splits[song]} for song, info in songs.items()}
+    for group in pretraining_identity_groups(downstream, upstream):
+        ids = sorted({row["song_id"] for row in group["downstream"]})
+        if not ids:
+            continue
+        # Upstream identities can join formerly separate downstream random groups.
+        trained = any(row["split"] == "train" for row in group["upstream"])
+        split = "train" if trained else splits[ids[0]]
+        result.update(dict.fromkeys(ids, split))
     return result
 
 

@@ -6,14 +6,13 @@ Run with python -m prosodia_lyricist.audit_bridge_splits --help.
 import argparse
 import json
 import logging
-from collections import defaultdict
 from pathlib import Path
 
 from .dali import read_annotation
 from .data import read_manifest
 from .melody_checkpoint import file_sha256
-from .melody_data import read_melody_manifest
-from .prepare import normalized_identity, song_groups
+from .melody_data import pretraining_overlap_report, read_melody_manifest
+from .prepare import normalized_identity
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,8 @@ def audit_prepared_splits(prepared_dir, pretraining_manifest, *, dali_dir=None):
             if file_sha256(prepared_dir / name) != expected:
                 raise ValueError(f"{name} differs from its preparation manifest")
     report = {
-        "audit_version": 1,
+        "audit_version": 2,
+        "policy": "protect_downstream_heldout_v1",
         "status": "unavailable",
         "prepared_manifest_sha256": file_sha256(prepared_dir / "manifest.json"),
         "data_sha256": manifest["sha256"],
@@ -57,7 +57,9 @@ def audit_prepared_splits(prepared_dir, pretraining_manifest, *, dali_dir=None):
         return report
     try:
         report["sha256"] = file_sha256(pretraining_manifest)
-        rows, upstream = read_melody_manifest(pretraining_manifest, require_lyrics=False)
+        rows, upstream = read_melody_manifest(
+            pretraining_manifest, require_lyrics=False, allow_split_overlap=True,
+        )
         report["line_counts"] = sorted({int(row["line_count"]) for row in rows
                                         if row.get("line_count")})
     except (OSError, ValueError) as exc:
@@ -79,46 +81,11 @@ def audit_prepared_splits(prepared_dir, pretraining_manifest, *, dali_dir=None):
             if not missing:
                 break
 
-    combined = {f"up:{song}": info for song, info in upstream.items()}
-    combined.update({f"down:{song}": info for song, info in downstream.items()})
-    parents = song_groups(combined)
-
-    def root(key):
-        while parents[key] != key:
-            parents[key] = parents[parents[key]]
-            key = parents[key]
-        return key
-
-    def join(a, b):
-        parents[root(a)] = root(b)
-
-    # Preserve transitive identity links through both exact IDs and known groups.
-    shared = upstream.keys() & downstream.keys()
-    for song in shared:
-        join(f"up:{song}", f"down:{song}")
-    prepared_groups = {}
-    for song, info in manifest["songs"].items():
-        key = f"down:{song}"
-        join(key, prepared_groups.setdefault(info["group"], key))
-    groups = defaultdict(lambda: {"upstream": [], "downstream": []})
-    for side, songs in (("upstream", upstream), ("downstream", manifest["songs"])):
-        prefix = "up" if side == "upstream" else "down"
-        for song, info in songs.items():
-            groups[root(f"{prefix}:{song}")][side].append({"song_id": song, "split": info["split"]})
-    for group in groups.values():
-        members = group["upstream"] + group["downstream"]
-        if not group["downstream"] or len({member["split"] for member in members}) < 2:
-            continue
-        train_exposure = any(row["split"] == "train" for row in group["upstream"]) and any(
-            row["split"] in ("valid", "test") for row in group["downstream"]
-        )
-        report["conflicts"].append({
-            "kind": "pretraining_train_in_downstream_heldout" if train_exposure
-                    else "split_mismatch",
-            **group,
-        })
-    report["shared_songs"] = len(shared)
-    report["downstream_only_songs"] = len(downstream.keys() - upstream.keys())
+    report.update(pretraining_overlap_report({
+        song: {**info, "split": manifest["songs"][song]["split"],
+               "group": manifest["songs"][song]["group"]}
+        for song, info in downstream.items()
+    }, upstream))
     report["missing_downstream_identities"] = sorted(
         song for song, info in downstream.items() if not _has_identity(info)
     )
@@ -129,7 +96,9 @@ def audit_prepared_splits(prepared_dir, pretraining_manifest, *, dali_dir=None):
     report["matches_preparation_audit"] = original_audit.get("sha256") == report["sha256"]
     if report["conflicts"]:
         report["status"] = "failed"
-        report["reason"] = f"{len(report['conflicts'])} identity groups cross splits"
+        report["reason"] = (
+            f"{len(report['conflicts'])} identity groups threaten downstream held-out evaluation"
+        )
     elif report["matches_preparation_audit"]:
         report["status"] = "passed"
         report["basis"] = "unchanged_preparation_audit"

@@ -129,9 +129,25 @@ checkpoint provenance. The existing learning rate and freeze schedule still appl
 set `training.melody_unfreeze_epoch: 0` to train the random tower immediately, and
 choose `training.melody_learning_rate` explicitly for the comparison.
 
-Preparation retains note arrays alongside the existing IPA annotations. It
-preserves contrastive pretraining assignments for shared song IDs and duplicate
-artist/title or audio identities. Conflicting assignments fail. By default, pretrained
+Preparation retains note arrays alongside the existing IPA annotations. Before
+extraction it scans eligible song metadata, generates random splits, and moves
+entire identity groups exposed to contrastive training into downstream training.
+Upstream validation/test songs may be used in any downstream split. Duplicate
+downstream identities still stay together. Shared IDs, normalized artist/title,
+exact audio identities, and transitive links are considered. Upstream duplicate
+groups spanning several upstream splits are reported; any upstream training
+membership takes precedence for downstream protection.
+
+Run `python -m prosodia_lyricist.prepare --config configs/bridge.yaml --check-splits`
+to perform only this metadata pass. `<prepared_dir>/split_preflight.json` lists
+the linked song IDs and identities, upstream split overlaps, random assignment
+conflicts, final assignments, and reassignments. Normal preparation writes the
+same report before IPA initialization or note extraction, then keeps those
+assignments for songs that survive processing. The report describes metadata
+candidates; the final preparation manifest describes accepted songs. Missing or
+invalid CSVs and incompatible window sizes fail before expensive extraction.
+
+By default, pretrained
 training requires both the checkpoint and the unchanged preparation manifest hash.
 Set `training.pretraining_audit_mode: warning` to reuse existing prepared splits
 with a changed or unavailable `data.pretraining_manifest`. Only that data setting
@@ -148,7 +164,10 @@ them by reading original annotations without extracting notes or IPA. New
 preparations retain artist/title and audio identity metadata without changing
 the dataset schema version. Checks without sufficient metadata are incomplete,
 unless the supplied CSV matches the original preparation audit. Reports list
-song IDs and splits for each conflicting identity group; exit codes are 0 for
+song IDs, splits, and artist/title/audio identities for each conflicting group.
+Only upstream training exposure in downstream validation/test or duplicates
+crossing downstream splits fail the audit. `allowed_overlaps` and
+`upstream_split_overlaps` document other differences without failing. Exit codes are 0 for
 passed, 1 for conflicts, and 2 for incomplete/unavailable checks. Audio matching
 uses exact stored paths/URLs, not content fingerprints across relocated files.
 

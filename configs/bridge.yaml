@@ -11,7 +11,9 @@ data:
   seed: 1234
   stress_source: ipa
   include_melody: true
-  # Preparation uses this CSV to establish splits. Training audits it separately.
+  # Preparation puts contrastive-trained identity groups in downstream train;
+  # upstream val/test songs otherwise retain downstream random assignments.
+  # Inspect early with: python -m prosodia_lyricist.prepare --config ... --check-splits
   # With warning mode, it may be changed or unavailable when reusing prepared data.
   pretraining_manifest: ../../try-contrastive/600_2line_window12/segments_manifest.csv
   lines_per_window: 2 # Pretrained tower's window size; retain existing prepared data.

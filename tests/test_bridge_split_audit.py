@@ -86,8 +86,51 @@ def test_audio_identity_and_non_training_mismatch(prepared, tmp_path):
     path = upstream(tmp_path, split="test")
     path.write_text(path.read_text().replace("Unrelated,2,", "Unrelated,2,audio.flac"))
     report = audit_bridge_splits.audit_prepared_splits(directory, path)
+    assert report["status"] == "passed"
+    assert report["conflicts"] == []
+    assert report["allowed_overlaps"][0]["downstream"][0]["song_id"] == "song-train"
+
+
+@pytest.mark.parametrize("upstream_split", ["train", "val", "test"])
+@pytest.mark.parametrize("downstream_split", ["train", "valid", "test"])
+def test_only_upstream_training_exposure_fails(
+    prepared, tmp_path, upstream_split, downstream_split,
+):
+    path = upstream(tmp_path, split=upstream_split, song=f"song-{downstream_split}")
+    report = audit_bridge_splits.audit_prepared_splits(prepared[0], path)
+    unsafe = upstream_split == "train" and downstream_split != "train"
+    assert report["status"] == ("failed" if unsafe else "passed")
+
+
+def test_upstream_duplicate_splits_are_diagnostic_not_a_failure(prepared, tmp_path):
+    path = upstream(tmp_path, title="song-train")
+    with path.open("a") as handle:
+        handle.write("duplicate,other-id,val,Artist,song-train,2,\n")
+    report = audit_bridge_splits.audit_prepared_splits(prepared[0], path)
+    assert report["status"] == "passed"
+    assert report["upstream_split_overlaps"][0]["upstream"] == [
+        {"song_id": "other-id", "split": "valid"}, {"song_id": "upstream", "split": "train"},
+    ]
+
+
+def test_upstream_eval_does_not_allow_duplicates_across_downstream_splits(prepared, tmp_path):
+    directory, manifest = prepared
+    manifest["songs"]["song-test"]["identity"]["title"] = "song-train"
+    (directory / "manifest.json").write_text(json.dumps(manifest))
+    report = audit_bridge_splits.audit_prepared_splits(
+        directory, upstream(tmp_path, split="val", title="song-train"),
+    )
     assert report["status"] == "failed"
-    assert report["conflicts"][0]["kind"] == "split_mismatch"
+    assert report["conflicts"][0]["kind"] == "downstream_duplicate_crosses_splits"
+
+
+def test_same_upstream_song_in_multiple_splits_still_counts_as_trained(prepared, tmp_path):
+    path = upstream(tmp_path, song="song-test", split="val")
+    with path.open("a") as handle:
+        handle.write("other-sample,song-test,train,Artist,Unrelated,2,\n")
+    report = audit_bridge_splits.audit_prepared_splits(prepared[0], path)
+    assert report["status"] == "failed"
+    assert report["upstream_split_overlaps"]
 
 
 def test_clean_audit_and_cli_leave_prepared_files_unchanged(prepared, tmp_path, monkeypatch):

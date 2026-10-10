@@ -494,9 +494,14 @@ def test_split_reuse_and_duplicate_leakage_rejection(tmp_path):
         ],
     )
     songs = {"down": {"artist": "artist", "title": "Song!"}}
-    assert preserve_pretraining_splits(songs, {"down": "train"}, path) == {"down": "test"}
-    with pytest.raises(ValueError, match="crosses splits"):
-        audit_pretraining_splits({"down": {**songs["down"], "split": "train"}}, path)
+    assert preserve_pretraining_splits(songs, {"down": "train"}, path) == {"down": "train"}
+    assert not audit_pretraining_splits(
+        {"down": {**songs["down"], "split": "train"}}, path,
+    )["conflicts"]
+    path.write_text(path.read_text().replace(",test,", ",train,"))
+    assert preserve_pretraining_splits(songs, {"down": "test"}, path) == {"down": "train"}
+    with pytest.raises(ValueError, match="pretraining_train_in_downstream_heldout"):
+        audit_pretraining_splits({"down": {**songs["down"], "split": "test"}}, path)
 
 
 def test_window_tail_note_limits_and_checksums(tmp_path, lines):
@@ -601,7 +606,8 @@ def test_prepare_train_and_reload_bridge(
     manifest = prepare(config)
     if pretrained:
         assert manifest["pretraining_split_audit"]["shared_songs"] == 20
-        assert manifest["songs"]["s-19"]["split"] == "valid"
+        assert all(manifest["songs"][f"s-{index}"]["split"] == "train" for index in range(10))
+        assert manifest["pretraining_split_audit"]["policy"] == "protect_downstream_heldout_v1"
     output = train(config, smoke_test=True)
     metrics = json.loads((output / "metrics.jsonl").read_text())
     assert metrics["train"]["loss"] > 0
