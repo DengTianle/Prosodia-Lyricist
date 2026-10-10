@@ -11,7 +11,8 @@ data:
   seed: 1234
   stress_source: ipa
   include_melody: true
-  # Set BEFORE preparation to the original CSV used for contrastive training.
+  # Preparation uses this CSV to establish splits. Training audits it separately.
+  # With warning mode, it may be changed or unavailable when reusing prepared data.
   pretraining_manifest: ../../try-contrastive/600_2line_window12/segments_manifest.csv
   lines_per_window: 2 # Pretrained tower's window size; retain existing prepared data.
 
@@ -44,6 +45,9 @@ model:
     dropout: 0.1
 
 training:
+  # strict retains the preparation-time CSV requirement; warning permits reuse
+  # with a changed/missing CSV and records the current audit status in run.json.
+  pretraining_audit_mode: strict
   output_dir: ../checkpoints/bridge
   device: cuda
   seed: 1234

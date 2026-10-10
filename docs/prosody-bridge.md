@@ -87,6 +87,7 @@ Set these paths before preparing:
 | `model.melody_checkpoint` | Original contrastive checkpoint with `mlm_note_177d_v1` and `audio_pooling: note`; required for pretrained training, ignored in random mode. |
 | `model.random_melody_encoder` | Random tower architecture: required `d_model`, `num_layers`, `num_heads`, `dim_feedforward`; optional `dropout` (0.1), `pooling` (`cls`), `max_length` (4096). No pooled projection is built. |
 | `data.pretraining_manifest` | Immutable CSV actually used for that contrastive run. |
+| `training.pretraining_audit_mode` | `strict` (default) requires the preparation CSV; `warning` audits the current CSV and permits failed, incomplete, or unavailable audits without re-preparation. |
 | `data.lines_per_window` | Prepared-data provenance: pretraining window line count, default 2. |
 | `model.encoder_lines_per_window` | Must match the prepared/pretraining count, independently of song scope. |
 | `model.bridge_scope` | `song` by default for new training; `window` retains the legacy architecture. |
@@ -130,10 +131,29 @@ choose `training.melody_learning_rate` explicitly for the comparison.
 
 Preparation retains note arrays alongside the existing IPA annotations. It
 preserves contrastive pretraining assignments for shared song IDs and duplicate
-artist/title or audio identities. Conflicting assignments fail. Pretrained training
-requires both the checkpoint and the unchanged preparation manifest hash. Random
-training retains these data audits when a pretraining manifest was used during
-preparation; it also supports data prepared without one. The upstream format
+artist/title or audio identities. Conflicting assignments fail. By default, pretrained
+training requires both the checkpoint and the unchanged preparation manifest hash.
+Set `training.pretraining_audit_mode: warning` to reuse existing prepared splits
+with a changed or unavailable `data.pretraining_manifest`. Only that data setting
+is exempted from configuration equality; prepared-file checksums, preprocessing
+settings, and window compatibility remain enforced. Training saves the current
+report as `pretraining_split_check` in the run and best checkpoint's `run.json`;
+`pretraining_split_audit` remains the historical preparation audit. Warning mode
+does not make failed or incomplete audits into evidence of clean evaluation.
+
+For an independent check, run `python -m prosodia_lyricist.audit_bridge_splits`
+with `--prepared-dir`, `--pretraining-manifest`, and optionally `--dali-dir` and
+`--output`. Older prepared manifests omit song identities; `--dali-dir` recovers
+them by reading original annotations without extracting notes or IPA. New
+preparations retain artist/title and audio identity metadata without changing
+the dataset schema version. Checks without sufficient metadata are incomplete,
+unless the supplied CSV matches the original preparation audit. Reports list
+song IDs and splits for each conflicting identity group; exit codes are 0 for
+passed, 1 for conflicts, and 2 for incomplete/unavailable checks. Audio matching
+uses exact stored paths/URLs, not content fingerprints across relocated files.
+
+Random training retains these data audits when a pretraining manifest is supplied;
+it also supports data prepared without one. The upstream format
 records a manifest path rather than its historical
 hash, so the supplied CSV must be the original one. These checks cannot infer
 undocumented upstream exposure. The reused lyric checkpoint may have seen songs

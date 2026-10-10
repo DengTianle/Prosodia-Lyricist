@@ -210,7 +210,8 @@ templates are passed to the lyric model together, preserving whole-song context.
 
 In [`configs/bridge.yaml`](configs/bridge.yaml), set `model.melody_checkpoint`
 to the current note-based two-pool contrastive checkpoint and
-`data.pretraining_manifest` to its original CSV **before preparation**. Match
+`data.pretraining_manifest` to its original CSV. For initial preparation, set it
+before preparing if you want to inherit upstream split assignments. Match
 `data.lines_per_window` and `model.encoder_lines_per_window` to that manifest.
 Preparation uses `data/dali-bridge`
 and keeps shared songs and duplicate identities in their pretraining splits.
@@ -219,6 +220,30 @@ eight songs with two accumulation steps. Source/target limits are separate:
 512 notes per encoder window, 2,048 notes and 256 lines per song, and 4,096 target
 tokens including line prefixes. Overlong training examples are skipped as whole
 songs and counted by reason; no windows are silently removed from a retained song.
+
+To reuse prepared data with a changed or not-yet-downloaded contrastive CSV, set
+`training.pretraining_audit_mode: warning`. Training reports missing, incomplete,
+or failed split audits without repeating preparation; it still enforces prepared
+data integrity and window compatibility. The default `strict` mode requires the
+unchanged CSV used during preparation. Current audit results are saved under
+`pretraining_split_check` in `run.json`, alongside the original preparation audit.
+Run an independent audit once the CSV is available:
+
+```bash
+conda activate prosodia-lyricist
+python -m prosodia_lyricist.audit_bridge_splits \
+  --prepared-dir data/dali-bridge \
+  --pretraining-manifest ../try-contrastive/600_2line_window12/segments_manifest.csv \
+  --dali-dir ../DALI_v2 \
+  --output outputs/bridge-split-audit.json
+```
+
+`--dali-dir` supplies identity metadata for older prepared manifests; no IPA or
+note extraction is performed. Newly prepared manifests retain those identities.
+The report lists conflicting song groups and distinguishes upstream training
+exposure in downstream validation/test from other split disagreements. Exit codes
+are 0 for passed, 1 for conflicts, and 2 for unavailable/incomplete checks. The
+audit does not change prepared files or split assignments.
 
 ```bash
 conda activate prosodia-lyricist

@@ -212,7 +212,14 @@ def prepare(config, *, limit=None):
             },
             "counts": dict(counts),
             "songs": {
-                song_id: {"split": splits[song_id], "group": groups[song_id]}
+                song_id: {
+                    "split": splits[song_id], "group": groups[song_id],
+                    "identity": {
+                        "artist": songs[song_id].get("artist", ""),
+                        "title": songs[song_id].get("title", ""),
+                        "audio": {"url": songs[song_id].get("audio", {}).get("url", "")},
+                    },
+                }
                 for song_id in sorted(songs)
             },
             "sha256": {},

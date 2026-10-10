@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from .audit_bridge_splits import check_training_splits
 from .bridge_data import (
     FIRST_LINE,
     PAIR_OFFSET,
@@ -24,7 +25,6 @@ from .bridge_model import ProsodyBridge
 from .data import read_manifest
 from .evaluation import prosody_bleu
 from .melody_checkpoint import file_sha256, load_contrastive_melody
-from .melody_data import read_melody_manifest
 from .runtime import log_stage, seed_everything, select_device
 from .train import build_scheduler
 
@@ -224,6 +224,9 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
 
 def train_bridge(config, *, output_dir=None, smoke_test=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
+    audit_mode = settings.get("pretraining_audit_mode", "strict")
+    if audit_mode not in ("strict", "warning"):
+        raise ValueError("training.pretraining_audit_mode must be strict or warning")
     initialization = cfg.get("melody_initialization", "pretrained")
     if initialization not in ("pretrained", "random"):
         raise ValueError("model.melody_initialization must be pretrained or random")
@@ -265,7 +268,10 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     logger.info("Using %s with %s precision", device, precision)
     with log_stage("Reading prepared manifest: %s", data["prepared_dir"]):
         manifest = read_manifest(data["prepared_dir"])
-    if manifest["config"] != data:
+    # Only the upstream audit input may change without re-preparing features.
+    ignored = {"pretraining_manifest"} if audit_mode == "warning" else set()
+    if ({key: value for key, value in manifest["config"].items() if key not in ignored}
+            != {key: value for key, value in data.items() if key not in ignored}):
         raise ValueError("Data configuration differs from preparation; prepare again")
     if data.get("song_ids_file") and (
         file_sha256(data["song_ids_file"]) != manifest["selection"]["sha256"]
@@ -279,28 +285,12 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     if cfg.get("max_notes") is not None and max_window_notes != cfg["max_notes"]:
         raise ValueError("Conflicting max_notes and max_window_notes settings")
     tower = None
-    # Preserve prepared-data audits in either mode; random initialization does not
-    # require pretraining provenance when the data was prepared without it.
-    if data.get("pretraining_manifest") or (initialization == "pretrained" and checkpoint):
-        audit = manifest.get("pretraining_split_audit")
-        with log_stage(
-            "Verifying pretraining manifest checksum: %s", data.get("pretraining_manifest")
-        ):
-            if (
-                not data.get("pretraining_manifest")
-                or not audit
-                or (audit["sha256"] != file_sha256(data["pretraining_manifest"]))
-            ):
-                raise ValueError("Prepare with the unchanged melody pretraining manifest")
-        with log_stage("Auditing pretraining CSV: %s", data["pretraining_manifest"]):
-            rows, upstream_songs = read_melody_manifest(
-                data["pretraining_manifest"], require_lyrics=False
-            )
-            sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
-            if sizes and sizes != {encoder_lines}:
-                raise ValueError("lines_per_window must match the contrastive pretraining manifest")
-            # These potentially large Python containers are not used during training.
-            del rows, upstream_songs
+    with log_stage("Checking pretraining splits (%s mode)", audit_mode):
+        split_check = check_training_splits(
+            data, manifest, mode=audit_mode,
+            required=bool(initialization == "pretrained" and checkpoint),
+            encoder_lines=encoder_lines,
+        )
     if initialization == "random":
         melody_config = random_config
         provenance = {
@@ -419,6 +409,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "pronunciation": manifest["pronunciation"],
         "data_sha256": manifest["sha256"],
         "pretraining_split_audit": manifest.get("pretraining_split_audit"),
+        "pretraining_split_check": split_check,
         "melody_provenance": provenance,
         "precision": precision,
         "total_steps": steps * epochs,
