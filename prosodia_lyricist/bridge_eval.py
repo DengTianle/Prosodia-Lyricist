@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from .bridge_baselines import evaluate_duration_baselines
 from .bridge_data import BridgeDataset, bridge_collate, decode_bridge_tokens
 from .bridge_model import ProsodyBridge
 from .bridge_train import evaluate_templates, run_bridge_epoch
@@ -67,6 +68,9 @@ def evaluate_bridge(
         teacher = run_bridge_epoch(model, bar, device, precision=precision)
     with tqdm(loader, desc="IPA-count generation", unit="batch", disable=not progress) as bar:
         generated = evaluate_templates(model, bar, device, precision=precision)
+    duration_baselines = evaluate_duration_baselines(
+        dataset.examples, lines_per_window=model.encoder_lines_per_window, generation=generated
+    )
     generated["accuracy"] = {
         "strength": generated.pop("strength_accuracy"),
         "length": generated.pop("length_accuracy"),
@@ -128,6 +132,7 @@ def evaluate_bridge(
             "slot_count_source": "ipa",
         },
         "generation": generated,
+        "duration_baselines": duration_baselines,
         "metric_definitions": {
             "loss": (
                 "Sum of mean binary strength and length cross-entropies per IPA slot; "

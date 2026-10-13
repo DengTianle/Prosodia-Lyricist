@@ -196,6 +196,10 @@ class BridgeDataset(Dataset):
                 width = len(song["lines"]) if bridge_scope == "song" else lines_per_window
                 if not width:
                     raise ValueError("Empty bridge song")
+                song_mean_duration = float(np.mean([
+                    duration for line in song["lines"]
+                    for duration in line["melody"]["note_duration_seconds"]
+                ]))
                 for offset in range(0, len(song["lines"]), width):
                     lines = song["lines"][offset : offset + width]
                     note_counts = [len(line["melody"]["midi_pitches"]) for line in lines]
@@ -220,7 +224,16 @@ class BridgeDataset(Dataset):
                         if bridge_scope == "song" else encode_bridge_source(lines)
                     )
                     self.examples.append(
-                        {**source, "labels": encode_bridge_targets(lines, data["max_syllables"])}
+                        {
+                            **source,
+                            "labels": encode_bridge_targets(lines, data["max_syllables"]),
+                            # Evaluation metadata; bridge_collate never passes it to the model.
+                            "note_duration_seconds": np.asarray([
+                                duration for line in lines
+                                for duration in line["melody"]["note_duration_seconds"]
+                            ], dtype=np.float64),
+                            "song_mean_note_duration_seconds": song_mean_duration,
+                        }
                     )
                     self.songs.add(song["song_id"])
                     self.encoder_windows += (len(lines) + lines_per_window - 1) // lines_per_window

@@ -152,6 +152,7 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
     skipped_target_examples, skipped_target_phrases = 0, 0
     bleu_sum, short_phrases = 0.0, 0
     slots, strength_correct, length_correct, pair_correct = 0, 0, 0, 0
+    equal_count_phrases, equal_count_slots, equal_count_length_correct = 0, 0, 0
     for batch in islice(loader, max_batches):
         batch = dict(batch)
         labels = batch.pop("labels")
@@ -173,6 +174,7 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
         if not eligible.any():
             continue
         labels = labels[eligible]
+        retained_note_counts = note_counts[eligible].tolist()
         batch = {key: value[eligible] for key, value in batch.items()}
         # A filtered batch can have fewer phrases than its original padding width.
         batch["syllable_counts"] = batch["syllable_counts"][:, :int(batch["line_counts"].max())]
@@ -183,10 +185,12 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
             else nullcontext()
         ):
             result = model.generate(**batch)
-        for predicted, truth in zip(result.sequences.tolist(), labels.tolist(), strict=True):
+        for predicted, truth, phrase_notes in zip(
+            result.sequences.tolist(), labels.tolist(), retained_note_counts, strict=True
+        ):
             expected = decode_bridge_tokens([token for token in truth if token != -100])
             actual = decode_bridge_tokens(predicted)
-            for a, b in zip(actual, expected, strict=True):
+            for line_index, (a, b) in enumerate(zip(actual, expected, strict=True)):
                 phrases += 1
                 exact += a == b
                 hypothesis, reference = a["syllables"], b["syllables"]
@@ -194,11 +198,19 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
                 short_phrases += min(len(reference), len(hypothesis)) < 4
                 # Compare by phrase/slot order; missing and extra slots are incorrect.
                 slots += max(len(hypothesis), len(reference))
+                equal_count = phrase_notes[line_index] == len(reference)
+                if equal_count:
+                    equal_count_phrases += 1
+                    equal_count_slots += max(len(hypothesis), len(reference))
                 for predicted_slot, expected_slot in zip_longest(hypothesis, reference):
                     if predicted_slot is not None and expected_slot is not None:
                         strength_correct += predicted_slot["stress"] == expected_slot["stress"]
                         length_correct += predicted_slot["length"] == expected_slot["length"]
                         pair_correct += predicted_slot == expected_slot
+                        if equal_count:
+                            equal_count_length_correct += (
+                                predicted_slot["length"] == expected_slot["length"]
+                            )
     return {
         "phrases": phrases,
         "slot_count_source": "ipa",
@@ -206,6 +218,13 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
         "length_accuracy": length_correct / slots if slots else None,
         "pair_accuracy": pair_correct / slots if slots else None,
         "compared_slots": slots,
+        "equal_note_ipa_count": {
+            "phrases": equal_count_phrases,
+            "compared_slots": equal_count_slots,
+            "length_accuracy": (
+                equal_count_length_correct / equal_count_slots if equal_count_slots else None
+            ),
+        },
         "exact_template_accuracy": exact / phrases if phrases else None,
         "prosody_bleu": bleu_sum / phrases if phrases else None,
         "bleu_short_phrases": short_phrases,

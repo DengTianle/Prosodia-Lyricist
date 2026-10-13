@@ -314,6 +314,15 @@ zero even when correct. JSON schema v3 marks the switch from note-count evaluati
 MIDI inference still uses one slot per note. Count mismatches and skipped examples
 are also reported. Epoch logs display free-generation strength/length/pair accuracies;
 checkpoint selection and early stopping still use teacher-forced validation loss.
+Evaluation also reports `duration_baselines`: predict long when a raw note duration
+exceeds the arithmetic mean over the evaluated notes (`global`), its whole song,
+its encoder window, or its line; ties are short. Thresholds use no IPA labels.
+All baselines use the same reference IPA counts as generation: compare notes and
+slots in phrase order, trim extra notes, and count missing-note slots as incorrect.
+The report includes always-long/short controls and a separate equal-note/IPA-count
+subset with the model's generation accuracy on those exact phrases. Equal counts
+do not establish phonetic alignment. Limits and skipped examples apply to both
+model and baseline scores; the global mean is recomputed on the retained examples.
 Use `--limit 100` for the first 100 retained songs (windows for old checkpoints);
 omit it for the full split. On CPU/MPS,
 use `--precision fp32` (the default).

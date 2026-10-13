@@ -117,6 +117,9 @@ def test_generation_uses_ipa_slots_without_gold_labels(bridge, monkeypatch):
     assert scores["note_ipa_count_match_rate"] == 0.5
     assert scores["note_ipa_count_mae"] == 0.5
     assert scores["count_diagnostic_phrases"] == 4
+    assert scores["equal_note_ipa_count"] == {
+        "phrases": 2, "compared_slots": 7, "length_accuracy": 1.0,
+    }
 
 
 def test_teacher_forced_two_head_accuracies_and_component_weighting():
@@ -147,6 +150,24 @@ def test_teacher_forced_two_head_accuracies_and_component_weighting():
     assert scores["teacher_forced_strength_accuracy"] == 1
     assert scores["teacher_forced_length_accuracy"] == 0.5
     assert scores["teacher_forced_pair_accuracy"] == 0.5
+
+
+def test_generation_equal_count_subset_excludes_skipped_examples(bridge):
+    too_long = [line([("strong", "long")] * 9, notes=1)]
+    retained = [
+        line([("strong", "long")] * 2),
+        line([("strong", "long")], notes=2, start=10),
+    ]
+    batch = bridge_collate([
+        {**encode_bridge_source(too_long), "labels": encode_bridge_targets(too_long, 9)},
+        example(retained),
+    ])
+    scores = evaluate_templates(bridge, [batch], torch.device("cpu"))
+    assert scores["skipped_slot_limit_windows"] == 1
+    assert scores["phrases"] == 2
+    assert scores["equal_note_ipa_count"] == {
+        "phrases": 1, "compared_slots": 2, "length_accuracy": 1.0,
+    }
 
 
 @pytest.fixture
@@ -213,11 +234,22 @@ def test_cli_defaults_to_test_and_preserves_checkpoint_and_data_provenance(
     assert report["generation"]["prosody_bleu"] == 0.5
     assert report["generation"]["accuracy"]["combined"] == 1.0
     assert report["generation"]["count_diagnostic_phrases"] == 4
+    baselines = report["duration_baselines"]
+    assert baselines["all_ipa_slots"]["compared_slots"] == 13
+    assert baselines["equal_note_ipa_count"]["compared_slots"] == 9
+    assert baselines["equal_note_ipa_count"]["model_generation_length_accuracy"] == 1.0
+    assert baselines["extra_notes_ignored"] == 5
+    assert baselines["missing_note_slots"] == 0
+    # Equal durations are ties (short); all fixture IPA targets are long.
+    assert baselines["all_ipa_slots"]["baselines"]["line"] == {
+        "correct_slots": 0, "length_accuracy": 0.0, "minus_model_length_accuracy": -1.0,
+    }
     assert report["checkpoint_weights_sha256"] == file_sha256(checkpoint / "bridge_weights.pt")
     valid = evaluate_bridge(checkpoint, prepared, split="valid", device="cpu", limit=1)
     assert valid["teacher_forced"]["slots"] == 2
     assert valid["data"]["limit_windows"] == 1
     assert valid["generation"]["prosody_bleu"] == 0.0
+    assert valid["duration_baselines"]["all_ipa_slots"]["compared_slots"] == 2
     (prepared / "test.jsonl").write_text("\n")
     with pytest.raises(ValueError, match="differs from its manifest"):
         evaluate_bridge(checkpoint, prepared, device="cpu")
