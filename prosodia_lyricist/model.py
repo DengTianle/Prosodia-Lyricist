@@ -81,6 +81,8 @@ class ProsodyBart(nn.Module):
         syllable_labels,
         stress_labels,
         length_labels,
+        *,
+        inputs_embeds=None,
     ):
         targets = (syllable_labels, stress_labels, length_labels)
         for target in targets:
@@ -91,7 +93,9 @@ class ProsodyBart(nn.Module):
         decoder_mask = torch.ones_like(labels)
         decoder_mask[:, 1:] = labels[:, :-1].ne(-100)
         output = self.bart(
-            inputs_embeds=self.embed_source(input_ids, length_ids),
+            inputs_embeds=(
+                self.embed_source(input_ids, length_ids) if inputs_embeds is None else inputs_embeds
+            ),
             attention_mask=attention_mask,
             decoder_inputs_embeds=self.embed_target(decoder_ids, *decoder_features),
             decoder_attention_mask=decoder_mask,

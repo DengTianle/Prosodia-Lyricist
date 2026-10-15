@@ -26,3 +26,4 @@ dist/
 /examples/
 rejected.jsonl
 AGENTS.md
+*.flac

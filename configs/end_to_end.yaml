@@ -1,0 +1,72 @@
+# Reuse prepared bridge songs. All paths are relative to this YAML.
+data:
+  dali_dir: ../../DALI_v2
+  prepared_dir: ../data/dali-bridge
+  language: english
+  song_ids_file: null
+  min_ncc: 0.0
+  max_syllables: 40
+  valid_fraction: 0.1
+  test_fraction: 0.1
+  seed: 1234
+  stress_source: ipa
+  include_melody: true
+  pretraining_manifest: ../../try-contrastive/data/max_en_2line_16s/segments_manifest.csv
+  lines_per_window: 2
+
+model:
+  conditioning: end_to_end
+  # Preserve the trained four-stream decoder, tokenizer, and feature embeddings.
+  template_checkpoint: ../checkpoints/dali/20260927T052126888961Z/best
+  melody_initialization: pretrained
+  melody_checkpoint: ../../try-contrastive/checkpoints/large_2line_16s/best.pt
+  encoder_lines_per_window: 2
+  max_window_notes: 512
+  max_song_notes: 2048
+  max_song_lines: 256
+  max_bridge_length: 4096 # Structural line prefixes plus syllable queries.
+  max_source_length: 1024 # Includes title/keywords and source template slots.
+  max_target_length: 1024 # Existing four-stream lyric decoder events.
+  song_encoder_layers: 2
+  slot_encoder:
+    d_model: 256
+    num_layers: 4
+    num_heads: 4
+    dim_feedforward: 1024
+    dropout: 0.1
+  temperature: 1.0 # Same soft probabilities at training and inference.
+
+training:
+  # Audit the NEW contrastive CSV while reusing prepared data. Use strict after
+  # preparing with that unchanged CSV; warning records unresolved overlap checks.
+  pretraining_audit_mode: warning
+  output_dir: ../checkpoints/end-to-end
+  device: cuda
+  precision: bf16
+  seed: 1234
+  epochs: 100
+  batch_size: 2
+  num_workers: 0
+  gradient_accumulation_steps: 4
+  learning_rate: 0.0001
+  melody_learning_rate: 0.000002
+  template_learning_rate: 0.000005
+  # null freezes the pretrained components for the full initial experiment.
+  # Set either to a zero-based epoch to enable a later adaptation stage.
+  melody_unfreeze_epoch: null
+  template_unfreeze_epoch: null
+  template_finetune: encoder # Only encoder layers/positions/norm and source projection.
+  # 'all' is an explicit ablation that also changes the pretrained decoder.
+  bridge_anchor_weight: 0.0 # Optional direct IPA supervision on intermediate slots.
+  loss_weights:
+    lyrics: 1.0
+    syllables: 0.1
+    stresses: 0.1
+    lengths: 0.1
+  adam_betas: [0.9, 0.98]
+  adam_epsilon: 0.00001
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: constant_after_warmup
+  gradient_clip: 1.0
+  patience: 5

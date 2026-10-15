@@ -178,6 +178,61 @@ context, enforce source/target token limits without truncation, and write strict
 self-contained checkpoints. Optimizer resume, distributed training, and mixed
 precision are not implemented.
 
+## End-to-end melody conditioning
+
+[`configs/end_to_end.yaml`](configs/end_to_end.yaml) trains a new parallel melody
+bridge through the pretrained explainable lyric model. Set `template_checkpoint`
+to the four-stream pretrain and `melody_checkpoint` to the contrastive checkpoint.
+The initial configuration freezes both pretrained models and trains only the new
+song encoder, slot attention, and stress/length heads:
+
+```text
+melody → pretrained local windows → song encoder → parallel structural slot queries
+       → soft stress/length embedding mixtures → pretrained BART encoder
+       → unchanged word/prosody-history decoder → lyric + auxiliary output losses
+```
+
+Slot queries contain line, slot, and syllable-count embeddings. They attend to
+the whole song and one another without a causal mask or prior prosody labels.
+Softmax probabilities mix the existing source stress-token and length embeddings
+before the existing concatenation/projection. There is no sampling or argmax in
+the training connection. The same soft connection is used for lyric generation.
+All four target streams, their causal shifts, `<word_end>` events, and IPA-corrected
+decoder feedback are preserved. The default loss weights are 1 for lyrics and
+0.1 for each auxiliary stream; set all four to 1 to retain pretraining's weights.
+`bridge_anchor_weight` optionally anchors the intermediate labels to reference IPA.
+
+Training joins notes and lyrics from each prepared song, uses reference IPA counts,
+and skips whole songs exceeding either model's limits. MIDI inference uses note
+counts; neither path infers melisma alignment. `melody_unfreeze_epoch` and
+`template_unfreeze_epoch` optionally enable later adaptation. With
+`template_finetune: encoder`, the decoder and shared token/length embeddings remain
+frozen. Checkpoints include both models and the tokenizer; old template and bridge
+checkpoints retain their existing loading and inference behavior.
+
+```bash
+python -m prosodia_lyricist.train --config configs/end_to_end.yaml --smoke-test
+python -m prosodia_lyricist.train --config configs/end_to_end.yaml
+python -m prosodia_lyricist.infer --checkpoint checkpoints/end-to-end/RUN/best \
+  --midi examples/imagine.mid --title Imagine --report-prefix outputs/joint-imagine
+python -m prosodia_lyricist.end_to_end_eval --checkpoint checkpoints/end-to-end/RUN/best \
+  --prepared-dir data/dali-bridge --device cuda --precision bf16 \
+  --generation-limit 16 --compare-hard --melody-controls --output outputs/joint-eval.json
+```
+
+Smoke tests use the actual configured pretrained weights, with two small training
+batches; they do not silently substitute random pretrained models. `train.sh`
+defaults to this configuration and accepts another config as its first argument.
+Validation selects checkpoints by lyric event cross-entropy and logs all losses
+plus bridge and word-event accuracies. The separate evaluator measures IPA from
+actual generated lyrics, includes duration baselines on the same generation songs,
+and optionally compares hard embeddings and wrong melodies on matched subsets.
+Use `--count-source notes` for the note-count deployment condition; the default
+`ipa` isolates conditioning with reference counts. Reference agreement and agreement
+with the bridge's hard preview are reported separately; neither establishes physical
+singability. Run metadata records both pretraining sources and split-verification
+status; different template-pretraining data hashes leave that overlap unverified.
+
 ## Learned melody-to-template bridge
 
 The bridge trains the melody encoder from the `prosodia-direct` contrastive

@@ -1,4 +1,4 @@
-"""Contrastive melody trunk → autoregressive syllable stress/length templates."""
+"""Contrastive melody trunk with legacy autoregressive or parallel structural queries."""
 
 import json
 from contextlib import nullcontext
@@ -51,6 +51,7 @@ class ProsodyBridge(nn.Module):
         max_song_lines=256,
         max_target_length=None,
         song_encoder_layers=2,
+        query_mode="autoregressive",
     ):
         super().__init__()
         if encoder_lines_per_window is not None:
@@ -75,7 +76,13 @@ class ProsodyBridge(nn.Module):
             raise ValueError("Song bridges require separate heads and a supported bridge scope")
         self.bridge_scope = bridge_scope
         self.output_design = output_design
+        if query_mode not in ("autoregressive", "parallel") or (
+            query_mode == "parallel" and bridge_scope != "song"
+        ):
+            raise ValueError("Parallel slot queries require a song bridge")
+        self.query_mode = query_mode
         self.target_scheme = (
+            "parallel_slots_v1" if query_mode == "parallel" else
             TARGET_SCHEME if bridge_scope == "song" else
             "line_skeleton_v4" if output_design == "separate" else "line_skeleton_v3"
         )
@@ -139,7 +146,12 @@ class ProsodyBridge(nn.Module):
                 for parameter in self.song_encoder.parameters():
                     if parameter.ndim > 1:
                         nn.init.xavier_uniform_(parameter)
-        self.token_embedding = nn.Embedding(len(self.vocabulary), d_model, padding_idx=PAD)
+        if query_mode == "parallel":
+            # Only structural query types exist: line prefix or syllable slot.
+            # No embedding of previous stress/length predictions is constructed.
+            self.query_type_embedding = nn.Embedding(2, d_model)
+        else:
+            self.token_embedding = nn.Embedding(len(self.vocabulary), d_model, padding_idx=PAD)
         self.slot_embedding = nn.Embedding(max_syllables + 1, d_model, padding_idx=0)
         self.count_embedding = nn.Embedding(max_syllables + 1, d_model, padding_idx=0)
         self.positions = SinusoidalPositionalEncoding(d_model, self.max_target_length)
@@ -353,6 +365,33 @@ class ProsodyBridge(nn.Module):
             logits=logits, strength_logits=strength_logits, length_logits=length_logits
         )
 
+    def predict_slots(
+        self, melody_features, melody_attention_mask, note_line_ids, line_counts,
+        syllable_counts, song_features=None,
+    ):
+        """Bidirectional structural queries; neither labels nor label history are inputs."""
+        if self.query_mode != "parallel":
+            raise ValueError("predict_slots requires a parallel bridge")
+        memory = self.encode(
+            melody_features, melody_attention_mask, note_line_ids, line_counts, song_features
+        )
+        self.validate_counts(syllable_counts, line_counts)
+        skeleton = self.make_skeleton(syllable_counts)
+        queries = (
+            self.query_type_embedding(skeleton["tokens"].eq(SLOT).long())
+            + self.line_embedding(skeleton["line_ids"])
+            + self.slot_embedding(skeleton["slot_ids"])
+            + self.count_embedding(skeleton["counts"])
+        )
+        hidden = self.decoder(
+            self.positions(queries), memory,
+            tgt_key_padding_mask=skeleton["tokens"].eq(PAD),
+            memory_key_padding_mask=~melody_attention_mask.bool(),
+        )
+        output = self.classify(hidden)
+        output.skeleton = skeleton
+        return output
+
     def forward(
         self,
         melody_features,
@@ -365,6 +404,8 @@ class ProsodyBridge(nn.Module):
         *,
         history_mask_probability=0.0,
     ):
+        if self.query_mode != "autoregressive":
+            raise ValueError("Use predict_slots for a parallel bridge; label feedback is disabled")
         if not isinstance(history_mask_probability, (int, float)) or not (
             0 <= history_mask_probability <= 1
         ):
@@ -437,6 +478,20 @@ class ProsodyBridge(nn.Module):
         use_cache=None,
     ):
         """Generate labels with optional known counts; default to one slot per note."""
+        if self.query_mode == "parallel":
+            counts = (
+                self.note_counts(note_line_ids, line_counts)
+                if syllable_counts is None else syllable_counts
+            )
+            output = self.predict_slots(
+                melody_features, melody_attention_mask, note_line_ids, line_counts,
+                counts, song_features,
+            )
+            sequences = output.skeleton["tokens"].clone()
+            slots = sequences.eq(SLOT)
+            pairs = 2 * output.strength_logits.argmax(-1) + output.length_logits.argmax(-1)
+            sequences[slots] = PAIR_OFFSET + pairs[slots]
+            return SimpleNamespace(sequences=sequences, syllable_counts=counts)
         memory = self.encode(
             melody_features, melody_attention_mask, note_line_ids, line_counts, song_features
         )
@@ -489,6 +544,7 @@ class ProsodyBridge(nn.Module):
         directory.mkdir(parents=True, exist_ok=True)
         metadata = {
             "format_version": (
+                6 if self.query_mode == "parallel" else
                 5 if self.bridge_scope == "song" else 4 if self.output_design == "separate" else 3
             ),
             "target_scheme": self.target_scheme,
@@ -508,6 +564,8 @@ class ProsodyBridge(nn.Module):
             "bridge_scope": self.bridge_scope,
             "max_target_length": self.max_target_length,
         }
+        if self.query_mode == "parallel":
+            metadata["query_mode"] = "parallel"
         if self.bridge_scope == "song":
             metadata.update(
                 encoder_lines_per_window=self.encoder_lines_per_window,
@@ -527,15 +585,18 @@ class ProsodyBridge(nn.Module):
         if meta["format_version"] == 1:
             raise ValueError("The LINE_END bridge uses format v1; retrain for the current skeleton")
         version = meta["format_version"]
-        if version == 5 and not {
+        if version >= 5 and not {
             "max_song_notes", "max_song_lines", "max_target_length", "song_encoder_layers",
             "song_feature_scheme", "song_feature_dim", "source_position_scheme",
             "encoder_lines_per_window", "max_window_notes",
         }.issubset(meta):
             raise ValueError("Incomplete song bridge checkpoint architecture/feature rules")
         if (
-            version not in (2, 3, 4, 5)
-            or meta.get("target_scheme") != f"line_skeleton_v{version}"
+            version not in (2, 3, 4, 5, 6)
+            or meta.get("target_scheme") != (
+                "parallel_slots_v1" if version == 6 else f"line_skeleton_v{version}"
+            )
+            or (version == 6 and meta.get("query_mode") != "parallel")
             or (version >= 3 and meta.get("inference_count_source") != "notes")
             or (version >= 4 and (
                 meta.get("output_design") != "separate"
@@ -543,12 +604,12 @@ class ProsodyBridge(nn.Module):
                 or meta.get("training_count_source") != "ipa"
             ))
             or meta["vocabulary"] != bridge_vocabulary(
-                meta["max_song_lines"] if version == 5 else meta["lines_per_window"]
+                meta["max_song_lines"] if version >= 5 else meta["lines_per_window"]
             )
             or (meta["melody_representation"] != MELODY_REPRESENTATION)
             or meta["prosody_rules"] != PROSODY_RULES
             or (version < 5 and meta.get("bridge_scope", "window") != "window")
-            or (version == 5 and (
+            or (version >= 5 and (
                 meta.get("bridge_scope") != "song"
                 or meta.get("song_feature_scheme") != SONG_FEATURE_SCHEME
                 or meta.get("song_feature_dim") != SONG_FEATURE_DIM
@@ -566,11 +627,12 @@ class ProsodyBridge(nn.Module):
             max_notes=meta["max_notes"],
             provenance=meta["provenance"],
             output_design="separate" if version >= 4 else "joint_pair",
-            bridge_scope="song" if version == 5 else "window",
+            bridge_scope="song" if version >= 5 else "window",
+            query_mode="parallel" if version == 6 else "autoregressive",
             max_target_length=meta.get("max_target_length"),
             **({key: meta[key] for key in (
                 "max_song_notes", "max_song_lines", "song_encoder_layers",
-            )} if version == 5 else {}),
+            )} if version >= 5 else {}),
         )
         state = torch.load(directory / "bridge_weights.pt", map_location="cpu", weights_only=True)
         if meta["format_version"] == 2:

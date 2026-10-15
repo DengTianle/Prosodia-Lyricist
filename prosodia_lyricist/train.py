@@ -104,6 +104,10 @@ def build_scheduler(optimizer, settings, total_steps):
 
 
 def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
+    if config["model"].get("conditioning") == "end_to_end":
+        from .end_to_end_train import train_end_to_end
+
+        return train_end_to_end(config, output_dir=output_dir, smoke_test=smoke_test)
     if config["model"].get("conditioning") == "bridge":
         from .bridge_train import train_bridge
 

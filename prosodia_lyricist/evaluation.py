@@ -188,7 +188,8 @@ def conditional_perplexity(model, inputs, labels, tokenizer, *, prosody_labels=N
         decoder_mask = torch.ones_like(labels)
         decoder_mask[:, 1:] = labels[:, :-1].ne(-100)
         output = model.bart(
-            inputs_embeds=model.embed_source(inputs["input_ids"], inputs["length_ids"]),
+            inputs_embeds=(inputs["inputs_embeds"] if "inputs_embeds" in inputs else
+                           model.embed_source(inputs["input_ids"], inputs["length_ids"])),
             attention_mask=inputs["attention_mask"],
             decoder_inputs_embeds=model.embed_target(
                 decoder_ids, *(model.shift_features(p) for p in prosody_labels)
