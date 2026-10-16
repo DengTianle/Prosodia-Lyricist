@@ -164,7 +164,8 @@ def test_imagine_report_cli_with_compound_checkpoint(
     assert explanation["completed"] and not report["generation"]["hit_token_limit"]
     assert all(w["correction_applied"] is correct for w in explanation["words"])
     markdown = prefix.with_suffix(".md").read_text()
-    assert "Decoder prosody feedback" in markdown
+    assert "Decoder prosody feedback" not in markdown
+    assert "Predicted count / stress / length" not in markdown
     assert report["reference_syllables"] == [
         [
             {"word": word, "ipa": "ˈeɪ", "stress": "strong", "length": "long"}

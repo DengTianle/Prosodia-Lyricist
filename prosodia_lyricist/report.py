@@ -93,40 +93,6 @@ def markdown_report(report):
             ]
         )
         rows.extend(f"{i + 1}. {escaped(line)}" for i, line in enumerate(report["lyrics"]))
-    explanation = report.get("decoder_explanation")
-    if explanation:
-        words = explanation["words"]
-        changed = sum(w["correction_applied"] for w in words)
-        rows.extend(
-            [
-                "",
-                "## Decoder prosody feedback",
-                "",
-                f"Correction enabled: {explanation['prosody_correction']}. "
-                f"Changed labels for {changed} / {len(words)} words. "
-                f"Natural EOS: {explanation['completed']}. "
-                f"Discarded unfinished word: {escaped(explanation['truncated_word']) or '(none)'}.",
-                "",
-                "These are the decoder's word-level predictions and feedback. BLEU is scored "
-                "separately from final text, not from these heads.",
-                "",
-                "| Word | Predicted count / stress / length | Feedback count / stress / length |",
-                "| --- | --- | --- |",
-            ]
-        )
-
-        def word_features(values):
-            return (
-                f"{values['syllables']} / "
-                f"{ {1: 'strong', 2: 'weak'}.get(values['stress'], 'pad') } / "
-                f"{ {1: 'long', 2: 'short'}.get(values['length'], 'pad') }"
-            )
-
-        for word in words:
-            rows.append(
-                f"| {escaped(word['text'])} | {word_features(word['predicted'])} | "
-                f"{word_features(word['corrected'])} |"
-            )
     references = report.get("reference_lines", [])
     reference_labels = report.get("reference_syllables", [])
     reference_columns = bool(references)

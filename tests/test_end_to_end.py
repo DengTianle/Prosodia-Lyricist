@@ -413,6 +413,64 @@ def test_full_training_saves_pretrained_decoder_unchanged(joint_config):
     assert metrics["template_trainable"] == "frozen"
 
 
+@pytest.mark.parametrize("overrides", [None, {"stresses": 0.5}])
+def test_training_defaults_to_equal_losses_despite_pretrained_weights(joint_config, overrides):
+    original = ProsodyBart.load(joint_config["model"]["template_checkpoint"])
+    assert original.loss_weights == dict(lyrics=1, syllables=0, stresses=0, lengths=0)
+    if overrides is not None:
+        joint_config["training"]["loss_weights"] = overrides
+    model, _ = build_model(joint_config)
+    assert model.template_model.loss_weights == {
+        **dict(lyrics=1, syllables=1, stresses=1, lengths=1),
+        **(overrides or {}),
+    }
+
+
+def test_checkpoint_selection_early_stopping_and_display_use_combined_loss(
+    joint_config, monkeypatch, caplog
+):
+    joint_config["training"].update(epochs=5, patience=1)
+    # Lyric CE worsens at epoch 2 and improves at epoch 3; combined loss does the opposite.
+    validation = iter(
+        [
+            dict(lyrics=1, syllables=1, stresses=1, lengths=1),
+            dict(lyrics=2, syllables=0.25, stresses=0.25, lengths=0.5),
+            dict(lyrics=0.5, syllables=1, stresses=1, lengths=1),
+        ]
+    )
+    validated, saved_epochs = [], []
+    original_save = EndToEndProsody.save
+
+    def run(model, loader, device, *, optimizer=None, **kwargs):
+        components = (
+            dict(lyrics=0.5, syllables=3, stresses=1.5, lengths=2)
+            if optimizer is not None
+            else next(validation)
+        )
+        metrics = dict(loss=sum(components.values()), components=components)
+        if optimizer is None:
+            validated.append(metrics)
+        return metrics
+
+    def save(model, directory, tokenizer):
+        saved_epochs.append(len(validated))
+        original_save(model, directory, tokenizer)
+
+    monkeypatch.setattr("prosodia_lyricist.end_to_end_train.run_epoch", run)
+    monkeypatch.setattr(EndToEndProsody, "save", save)
+    with caplog.at_level("INFO", logger="prosodia_lyricist.end_to_end_train"):
+        output = train_end_to_end(joint_config)
+
+    metrics = [json.loads(line) for line in (output / "metrics.jsonl").read_text().splitlines()]
+    assert [m["valid"]["loss"] for m in metrics] == [4, 3, 3.5]
+    assert saved_epochs == [1, 2]
+    assert "Epoch 2 combined loss: train=7.0000 valid=3.0000" in caplog.text
+    run = json.loads((output / "best" / "run.json").read_text())
+    assert run["checkpoint_selection"] == (
+        "combined validation loss (weighted decoder losses plus bridge anchor)"
+    )
+
+
 def test_evaluator_scores_lyrics_and_controls_same_songs(
     joint_model,
     joint_config,

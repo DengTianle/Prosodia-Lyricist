@@ -198,8 +198,8 @@ Softmax probabilities mix the existing source stress-token and length embeddings
 before the existing concatenation/projection. There is no sampling or argmax in
 the training connection. The same soft connection is used for lyric generation.
 All four target streams, their causal shifts, `<word_end>` events, and IPA-corrected
-decoder feedback are preserved. The default loss weights are 1 for lyrics and
-0.1 for each auxiliary stream; set all four to 1 to retain pretraining's weights.
+decoder feedback are preserved. The default loss weights are 1 for each of the
+four streams, matching pretraining's weights.
 `bridge_anchor_weight` optionally anchors the intermediate labels to reference IPA.
 
 Training joins notes and lyrics from each prepared song, uses reference IPA counts,
@@ -209,6 +209,13 @@ counts; neither path infers melisma alignment. `melody_unfreeze_epoch` and
 `template_finetune: encoder`, the decoder and shared token/length embeddings remain
 frozen. Checkpoints include both models and the tokenizer; old template and bridge
 checkpoints retain their existing loading and inference behavior.
+
+To fine-tune both pretrained components from the first epoch, set
+`training.melody_unfreeze_epoch: 0`, `training.template_unfreeze_epoch: 0`, and
+`training.template_finetune: all`. Use `encoder` instead of `all` to adapt only
+the BART source encoder and source projection. Epoch thresholds are zero-based;
+`null` keeps a component frozen. Their learning rates are controlled separately
+by `melody_learning_rate` and `template_learning_rate`.
 
 ```bash
 python -m prosodia_lyricist.train --config configs/end_to_end.yaml --smoke-test
@@ -223,7 +230,9 @@ python -m prosodia_lyricist.end_to_end_eval --checkpoint checkpoints/end-to-end/
 Smoke tests use the actual configured pretrained weights, with two small training
 batches; they do not silently substitute random pretrained models. `train.sh`
 defaults to this configuration and accepts another config as its first argument.
-Validation selects checkpoints by lyric event cross-entropy and logs all losses
+Validation selects checkpoints and drives early stopping by the combined weighted
+loss (all four decoder losses plus the optional bridge anchor), and displays that
+same combined score in epoch summaries. It logs all component losses
 plus bridge and word-event accuracies. The separate evaluator measures IPA from
 actual generated lyrics, includes duration baselines on the same generation songs,
 and optionally compares hard embeddings and wrong melodies on matched subsets.
@@ -483,7 +492,7 @@ prosodia_lyricist/
   midi.py          MIDI phrase/prosody conversion
   infer.py         MIDI generation CLI
   evaluation.py    independent prosody-BLEU and causal conditional perplexity
-  report.py        Markdown/JSON template, lyrics, and decoder-feedback reports
+  report.py        Markdown/JSON template and lyric evaluation reports
   config.py        configuration loading
   runtime.py       seeds and device selection
 configs/dali.yaml  project defaults

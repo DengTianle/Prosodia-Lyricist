@@ -211,7 +211,7 @@ def build_model(config):
         stress_token_ids=[token_id(tokenizer, f"<{s}>") for s in ("strong", "weak")],
         temperature=cfg.get("temperature", 1.0),
         anchor_weight=settings.get("bridge_anchor_weight", 0),
-        loss_weights=settings.get("loss_weights"),
+        loss_weights={**dict.fromkeys(LOSS_NAMES, 1.0), **(settings.get("loss_weights") or {})},
         provenance={
             "template_checkpoint": str(checkpoint.resolve()),
             "template_weights_sha256": file_sha256(checkpoint / "weights.pt"),
@@ -338,7 +338,9 @@ def train_end_to_end(config, *, output_dir=None, smoke_test=False):
         provenance=model.provenance,
         training_count_source="ipa",
         inference_count_source="notes",
-        checkpoint_selection="validation lyric cross-entropy (all decoder events)",
+        checkpoint_selection=(
+            "combined validation loss (weighted decoder losses plus bridge anchor)"
+        ),
         template_split_verification=(
             "same_prepared_data"
             if model.provenance["template_pretraining_data_sha256"] == (manifest["sha256"])
@@ -397,11 +399,11 @@ def train_end_to_end(config, *, output_dir=None, smoke_test=False):
                 + "\n"
             )
             handle.flush()
-            score = validation["components"]["lyrics"]
+            score = validation["loss"]
             logger.info(
-                "Epoch %d lyric CE: train=%.4f valid=%.4f; output=%s",
+                "Epoch %d combined loss: train=%.4f valid=%.4f; output=%s",
                 epoch + 1,
-                training["components"]["lyrics"],
+                training["loss"],
                 score,
                 output,
             )

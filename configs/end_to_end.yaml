@@ -60,9 +60,9 @@ training:
   bridge_anchor_weight: 0.0 # Optional direct IPA supervision on intermediate slots.
   loss_weights:
     lyrics: 1.0
-    syllables: 0.1
-    stresses: 0.1
-    lengths: 0.1
+    syllables: 1.0
+    stresses: 1.0
+    lengths: 1.0
   adam_betas: [0.9, 0.98]
   adam_epsilon: 0.00001
   weight_decay: 0.01
