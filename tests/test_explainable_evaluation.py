@@ -143,6 +143,10 @@ def test_imagine_report_cli_with_compound_checkpoint(
             "cpu",
             "--top-k",
             "1",
+            "--no-repeat-ngram-size",
+            "2",
+            "--repetition-penalty",
+            "1.2",
             "--report-prefix",
             str(prefix),
             "--reference",
@@ -161,11 +165,17 @@ def test_imagine_report_cli_with_compound_checkpoint(
     assert report["generated_perplexity"]["token_count"] == 4
     assert report["reference_perplexity"]["token_count"] == 17 * 3 + 1
     assert report["decoder_explanation"] == explanation
+    assert report["generation"]["no_repeat_ngram_size"] == 2
+    assert report["generation"]["repetition_penalty"] == 1.2
+    assert explanation["repetition_controls"] == {
+        "no_repeat_ngram_size": 2, "repetition_penalty": 1.2,
+    }
     assert explanation["completed"] and not report["generation"]["hit_token_limit"]
     assert all(w["correction_applied"] is correct for w in explanation["words"])
     markdown = prefix.with_suffix(".md").read_text()
     assert "Decoder prosody feedback" not in markdown
     assert "Predicted count / stress / length" not in markdown
+    assert "Text repetition settings: n-gram size `2`, penalty `1.2`" in markdown
     assert report["reference_syllables"] == [
         [
             {"word": word, "ipa": "ˈeɪ", "stress": "strong", "length": "long"}

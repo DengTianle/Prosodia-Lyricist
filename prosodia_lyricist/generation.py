@@ -1,5 +1,6 @@
 """Word-complete sampling with IPA correction before subsequent decoder steps."""
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -35,6 +36,52 @@ def sample(logits, *, do_sample, temperature, top_k, allowed=None):
     return int(indices[torch.multinomial(values.softmax(-1), 1)])
 
 
+def resolve_repetition_settings(model, no_repeat_ngram_size=None, repetition_penalty=None):
+    config = model.bart.generation_config
+    if no_repeat_ngram_size is None:
+        no_repeat_ngram_size = config.no_repeat_ngram_size
+    if repetition_penalty is None:
+        repetition_penalty = config.repetition_penalty
+    if (
+        isinstance(no_repeat_ngram_size, bool)
+        or not isinstance(no_repeat_ngram_size, int)
+        or no_repeat_ngram_size < 0
+    ):
+        raise ValueError("no_repeat_ngram_size must be a nonnegative integer")
+    if (
+        isinstance(repetition_penalty, bool)
+        or not isinstance(repetition_penalty, (int, float))
+        or not math.isfinite(repetition_penalty)
+        or repetition_penalty <= 0
+    ):
+        raise ValueError("repetition_penalty must be positive and finite")
+    return {
+        "no_repeat_ngram_size": no_repeat_ngram_size,
+        "repetition_penalty": repetition_penalty,
+    }
+
+
+def apply_text_repetition(logits, history, *, no_repeat_ngram_size, repetition_penalty):
+    """Adjust lyric BPE logits; history excludes all structural/special events."""
+    scores = logits.clone()
+    if repetition_penalty != 1 and history:
+        ids = sorted(set(history))
+        values = scores[ids]
+        scores[ids] = torch.where(
+            values < 0, values * repetition_penalty, values / repetition_penalty
+        )
+    size = no_repeat_ngram_size
+    if size and len(history) >= size - 1:
+        prefix = history[-(size - 1):] if size > 1 else []
+        banned = [
+            history[i + size - 1]
+            for i in range(len(history) - size + 1)
+            if history[i:i + size - 1] == prefix
+        ]
+        scores[banned] = -torch.inf
+    return scores
+
+
 def generate_templates(
     model,
     tokenizer,
@@ -49,6 +96,8 @@ def generate_templates(
     prosody_correction=True,
     pronunciation=None,
     inputs_embeds=None,
+    no_repeat_ngram_size=None,
+    repetition_penalty=None,
 ):
     """Generate one independent song per batch row, preserving four aligned streams.
 
@@ -64,10 +113,12 @@ def generate_templates(
         raise ValueError("temperature and top_k must be positive")
     if model.training:
         raise ValueError("Call model.eval() before generation")
+    repetition = resolve_repetition_settings(model, no_repeat_ngram_size, repetition_penalty)
     pronunciation = pronunciation or ipa.parse_words
     end_word = token_id(tokenizer, WORD_END)
     eos, bos = tokenizer.eos_token_id, tokenizer.bos_token_id
-    forbidden = set(tokenizer.all_special_ids) - {end_word, eos}
+    special_ids = set(tokenizer.all_special_ids)
+    forbidden = special_ids - {end_word, eos}
     # Token text comes from decoding the real tokenizer, not BPE spelling guesses.
     text_by_id = [
         tokenizer.decode([i], clean_up_tokenization_spaces=False) for i in range(len(tokenizer))
@@ -98,6 +149,7 @@ def generate_templates(
         pending = []
         pending_start = None
         words = []
+        text_history = []
         complete = False
         for step in range(max_new_tokens):
             last = [torch.tensor([[s[-1]]], device=input_ids.device) for s in streams]
@@ -125,12 +177,14 @@ def generate_templates(
             else:
                 allowed.discard(end_word)
             chosen = sample(
-                output.logits[0, -1],
+                apply_text_repetition(output.logits[0, -1], text_history, **repetition),
                 do_sample=do_sample,
                 temperature=temperature,
                 top_k=top_k,
                 allowed=sorted(allowed),
             )
+            if chosen not in special_ids:
+                text_history.append(chosen)
             features = (0, 0, 0)
             if chosen == end_word:
                 hidden = output.decoder_hidden_states[-1][0, -1]
@@ -207,6 +261,7 @@ def generate_templates(
                 "hit_token_limit": not complete,
                 "truncated_word": unfinished,
                 "prosody_correction": prosody_correction,
+                "repetition_controls": repetition,
                 "label_vocabulary": {
                     "stress": {0: "pad", 1: "strong", 2: "weak"},
                     "length": {0: "pad", 1: "long", 2: "short"},

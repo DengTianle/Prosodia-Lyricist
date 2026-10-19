@@ -243,6 +243,77 @@ def test_generation_actual_cache_and_batch(tokenizer, song, model):
     assert result.attention_mask.shape == result.sequences.shape
 
 
+@pytest.mark.parametrize("override", [None, 0])
+def test_checkpoint_trigram_filter_preserves_word_events(
+    monkeypatch, model, tokenizer, song, override
+):
+    from prosodia_lyricist.generation import generate_templates
+
+    model.bart.generation_config.no_repeat_ngram_size = 3
+    hello = tokenizer.convert_tokens_to_ids("hello")
+    world = tokenizer.convert_tokens_to_ids("world")
+    end = tokenizer.convert_tokens_to_ids(WORD_END)
+    step = 0
+
+    def forward(**kwargs):
+        nonlocal step
+        logits = torch.full((1, 1, len(tokenizer)), -1000.0)
+        logits[0, 0, hello], logits[0, 0, world] = 10, 9
+        if step == 9:
+            logits[0, 0, tokenizer.eos_token_id] = 1000
+        step += 1
+        return SimpleNamespace(
+            logits=logits,
+            decoder_hidden_states=[torch.zeros(1, 1, model.bart.config.d_model)],
+            past_key_values=None,
+        )
+
+    monkeypatch.setattr(model.bart, "forward", forward)
+    inputs = {k: torch.tensor([v]) for k, v in encode_source(song, tokenizer, 8).items()}
+    result = generate_templates(
+        model.eval(), tokenizer, **inputs, max_new_tokens=10,
+        prosody_correction=False, no_repeat_ngram_size=override,
+    )
+    words = [hello, hello, hello, world if override is None else hello]
+    expected = [model.bart.config.decoder_start_token_id, tokenizer.bos_token_id]
+    for word in words:
+        expected.extend((word, end))
+    expected.append(tokenizer.eos_token_id)
+    assert result.sequences[0].tolist() == expected
+    events = result.sequences.eq(end)
+    assert int(events.sum()) == 4
+    for features in (result.syllable_ids, result.stress_ids, result.length_ids):
+        assert features[events].gt(0).all()
+        assert features[~events].eq(0).all()
+    assert result.explanations[0]["repetition_controls"] == {
+        "no_repeat_ngram_size": 3 if override is None else 0,
+        "repetition_penalty": 1.0,
+    }
+
+
+def test_text_repetition_penalty_adjusts_positive_and_negative_logits():
+    from prosodia_lyricist.generation import apply_text_repetition
+
+    logits = torch.tensor([2.0, -2.0, 3.0])
+    adjusted = apply_text_repetition(
+        logits, [0, 1, 0], no_repeat_ngram_size=0, repetition_penalty=2.0
+    )
+    torch.testing.assert_close(adjusted, torch.tensor([1.0, -4.0, 3.0]))
+    torch.testing.assert_close(logits, torch.tensor([2.0, -2.0, 3.0]))
+
+
+@pytest.mark.parametrize("name,value", [
+    ("no_repeat_ngram_size", -1), ("no_repeat_ngram_size", True),
+    ("no_repeat_ngram_size", 1.5), ("repetition_penalty", 0),
+    ("repetition_penalty", float("inf")), ("repetition_penalty", float("nan")),
+])
+def test_invalid_repetition_settings_are_rejected(model, name, value):
+    from prosodia_lyricist.generation import resolve_repetition_settings
+
+    with pytest.raises(ValueError, match=name):
+        resolve_repetition_settings(model, **{name: value})
+
+
 def test_ipa_diphthongs_secondary_stress_and_punctuation():
     from prosodia_lyricist.ipa import syllable_features
 

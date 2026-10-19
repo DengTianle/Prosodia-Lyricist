@@ -11,6 +11,7 @@ from transformers import AutoTokenizer
 
 from .evaluation import conditional_perplexity, evaluate_prosody, reference_targets, text_prosody
 from .features import encode_source
+from .generation import resolve_repetition_settings
 from .midi import midi_note_comparison, midi_records
 from .model import ProsodyBart
 from .prepare import SCHEMA_VERSION
@@ -47,6 +48,8 @@ def infer(
     prosody_correction=True,
     bridge_checkpoint=None,
     template_mode="soft",
+    no_repeat_ngram_size=None,
+    repetition_penalty=None,
 ):
     if temperature <= 0 or top_k < 1 or (max_new_tokens is not None and max_new_tokens < 1):
         raise ValueError("temperature, top_k, and max_new_tokens must be positive")
@@ -138,9 +141,11 @@ def infer(
     inputs = {key: torch.tensor([value], device=device) for key, value in encoded.items()}
     if joint:
         inputs["inputs_embeds"] = source_embeddings
+    repetition = resolve_repetition_settings(model, no_repeat_ngram_size, repetition_penalty)
     generation = {
         "max_new_tokens": max_new_tokens,
         "do_sample": top_k > 1,
+        **repetition,
     }
     if top_k > 1:
         generation.update(temperature=temperature, top_k=top_k)
@@ -197,6 +202,7 @@ def infer(
             "temperature": temperature,
             "max_new_tokens": max_new_tokens,
             "device": str(device),
+            **repetition,
             "hit_token_limit": explanation["hit_token_limit"]
             if explainable
             else len(tokens[0]) - 1 >= max_new_tokens,
@@ -303,6 +309,14 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument(
+        "--no-repeat-ngram-size", type=int,
+        help="Lyric BPE n-gram filter; defaults to the checkpoint setting, 0 disables it",
+    )
+    parser.add_argument(
+        "--repetition-penalty", type=float,
+        help="Text repetition penalty; defaults to the checkpoint setting, 1 disables it",
+    )
     parser.add_argument(
         "--max-new-tokens", type=int, help="Defaults to the checkpoint's target limit minus one"
     )

@@ -447,6 +447,11 @@ uses the same independent extractor and formula in both branches; see the
 guide for limitations relative to the paper. Output paths must be new.
 
 `--top-k 1` uses greedy decoding; larger values use top-k temperature sampling.
+The four-stream generator honors the checkpoint's `no_repeat_ngram_size` and
+`repetition_penalty`. These controls act on lyric BPE tokens and punctuation;
+word-end events and auxiliary feature streams are excluded. Override them with
+`--no-repeat-ngram-size N` and `--repetition-penalty P`; use `0` and `1` respectively
+to disable them. Effective settings are recorded in reports and explanations.
 At each `<word_end>`, all three prosody heads sample a non-pad label. The IPA
 parser recomputes the completed word's labels, replaces disagreements, and
 feeds the corrected compound event into the cached decoder **before** the next

@@ -49,6 +49,12 @@ def markdown_report(report):
         rows.append(f"- Checkpoint: `{report['checkpoint']}`")
         if report.get("decoder_mode"):
             rows.append(f"- Decoder: `{report['decoder_mode']}`")
+    generation = report.get("generation", {})
+    if "no_repeat_ngram_size" in generation:
+        rows.append(
+            f"- Text repetition settings: n-gram size `{generation['no_repeat_ngram_size']}`, "
+            f"penalty `{generation['repetition_penalty']:g}`."
+        )
     for warning in report.get("warnings", []):
         rows.append(f"- **Note:** {warning}")
     metrics = report.get("metrics")
