@@ -173,6 +173,7 @@ def conditional_perplexity(model, inputs, labels, tokenizer, *, prosody_labels=N
     """
     from .features import WORD_END, token_id
     from .model import ProsodyBart
+    from .xai_model import XAILyricist
 
     explainable = isinstance(model, ProsodyBart)
     excluded = ()
@@ -198,6 +199,14 @@ def conditional_perplexity(model, inputs, labels, tokenizer, *, prosody_labels=N
             use_cache=False,
         )
         excluded = (token_id(tokenizer, WORD_END),)
+    elif isinstance(model, XAILyricist):
+        if prosody_labels is not None:
+            raise ValueError("The XAI checkpoint accepts only a lyric stream")
+        output = model(
+            input_ids=inputs["input_ids"], length_ids=inputs["length_ids"],
+            remainder_ids=inputs["remainder_ids"], attention_mask=inputs["attention_mask"],
+            inputs_embeds=inputs.get("inputs_embeds"), labels=labels,
+        )
     else:
         if prosody_labels is not None:
             raise ValueError("Legacy checkpoints do not accept compound decoder streams")

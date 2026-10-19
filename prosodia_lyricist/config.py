@@ -11,7 +11,8 @@ def load_config(path):
         config = yaml.safe_load(handle)
     for section, keys in {
         "data": ("dali_dir", "prepared_dir", "song_ids_file", "pretraining_manifest"),
-        "model": ("melody_checkpoint", "template_checkpoint"),
+        "model": ("melody_checkpoint", "template_checkpoint", "xai_tokenizer_dir",
+                  "xai_bart_config", "xai_cache_dir"),
         "training": ("output_dir",),
     }.items():
         for key in keys:

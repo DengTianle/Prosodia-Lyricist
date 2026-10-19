@@ -1,4 +1,4 @@
-"""Train melody slot queries through a pretrained, four-stream lyric generator."""
+"""Train melody slot queries through the selected pretrained lyric generator."""
 
 import json
 import logging
@@ -21,9 +21,10 @@ from .end_to_end_data import EndToEndCollator, EndToEndDataset
 from .end_to_end_model import EndToEndProsody
 from .features import token_id
 from .melody_checkpoint import file_sha256, load_contrastive_melody
-from .model import LOSS_NAMES, ProsodyBart
+from .model import ProsodyBart
 from .runtime import log_stage, seed_everything, select_device
 from .train import build_scheduler
+from .xai_model import XAILyricist, load_template
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +57,8 @@ def run_epoch(
     if accumulation_steps < 1 or (training and template_mode != "soft"):
         raise ValueError("Use positive accumulation and soft embeddings for training")
     model.train(training)
-    totals = dict.fromkeys((*LOSS_NAMES, "bridge_anchor"), 0.0)
+    loss_names = model.loss_names
+    totals = dict.fromkeys((*loss_names, "bridge_anchor"), 0.0)
     tokens, anchor_slots, word_events, batches, updates, songs = 0, 0, 0, 0, 0, 0
     correct = dict.fromkeys(("strength", "length", "pair"), 0)
     word_correct = dict.fromkeys(("syllables", "stresses", "lengths"), 0)
@@ -77,18 +79,18 @@ def run_epoch(
                 if not torch.isfinite(output.loss):
                     raise FloatingPointError("Non-finite end-to-end loss")
                 if training:
-                    # The four decoder streams have identical padding. The optional
-                    # anchor has a DIFFERENT denominator: valid source prosody slots.
+                    # Decoder losses share the same target padding. The optional
+                    # anchor uses a different denominator: valid source prosody slots.
                     loss = sum(
                         model.template_model.loss_weights[name] * output.loss_components[name]
-                        for name in LOSS_NAMES
+                        for name in loss_names
                     ) * (n / group_tokens)
                     if model.anchor_weight and group_slots:
                         loss = loss + model.anchor_weight * output.loss_components[
                             "bridge_anchor"
                         ] * (k / group_slots)
                     loss.backward()
-                for name in LOSS_NAMES:
+                for name in loss_names:
                     totals[name] += output.loss_components[name].item() * n
                 totals["bridge_anchor"] += output.loss_components["bridge_anchor"].item() * k
                 predicted = output.bridge_output
@@ -98,14 +100,16 @@ def run_epoch(
                 correct["strength"] += int(stress.eq(truth // 2).sum())
                 correct["length"] += int(length.eq(truth % 2).sum())
                 correct["pair"] += int((2 * stress + length).eq(truth).sum())
-                events = batch["syllable_labels"].gt(0)
-                for name, key in zip(
-                    word_correct, ("syllable_labels", "stress_labels", "length_labels"), strict=True
-                ):
-                    word_correct[name] += int(
-                        output.prosody_logits[name].argmax(-1)[events].eq(batch[key][events]).sum()
-                    )
-                word_events += int(events.sum())
+                if model.decoder_mode == "explainable":
+                    events = batch["syllable_labels"].gt(0)
+                    for name, key in zip(
+                        word_correct,
+                        ("syllable_labels", "stress_labels", "length_labels"), strict=True
+                    ):
+                        word_correct[name] += int(
+                            output.prosody_logits[name].argmax(-1)[events].eq(batch[key][events]).sum()
+                        )
+                    word_events += int(events.sum())
                 tokens += n
                 anchor_slots += k
                 batches += 1
@@ -123,10 +127,10 @@ def run_epoch(
                 updates += 1
     if not tokens:
         raise ValueError("No lyric targets")
-    components = {name: totals[name] / tokens for name in LOSS_NAMES}
+    components = {name: totals[name] / tokens for name in loss_names}
     components["bridge_anchor"] = totals["bridge_anchor"] / anchor_slots if anchor_slots else 0.0
     return {
-        "loss": sum(model.template_model.loss_weights[k] * components[k] for k in LOSS_NAMES)
+        "loss": sum(model.template_model.loss_weights[k] * components[k] for k in loss_names)
         + model.anchor_weight * components["bridge_anchor"],
         "components": components,
         "tokens": tokens,
@@ -137,28 +141,42 @@ def run_epoch(
             name: n / anchor_slots if anchor_slots else None for name, n in correct.items()
         },
         "bridge_compared_slots": anchor_slots,
-        "teacher_forced_word_event_accuracy": {
+        **({"teacher_forced_word_event_accuracy": {
             name: n / word_events if word_events else None for name, n in word_correct.items()
         },
-        "word_events": word_events,
+        "word_events": word_events} if model.decoder_mode == "explainable" else {}),
     }
 
 
-def build_model(config):
+def build_model(config, *, local_files_only=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
     checkpoint = cfg.get("template_checkpoint")
     if not checkpoint:
-        raise ValueError("Set model.template_checkpoint to a pretrained explainable checkpoint")
+        raise ValueError("Set model.template_checkpoint to the pretrained lyric checkpoint")
     checkpoint = Path(checkpoint)
     with log_stage("Loading pretrained template decoder: %s", checkpoint):
-        template = ProsodyBart.load(checkpoint)
-        if not isinstance(template, ProsodyBart) or (checkpoint / "melody.json").exists():
+        xai = (cfg.get("decoder_mode") == "xai" or checkpoint.is_file()
+               or (checkpoint / "xai.json").exists())
+        if xai:
+            template, tokenizer = load_template(
+                checkpoint, tokenizer_dir=cfg.get("xai_tokenizer_dir"),
+                bart_config=cfg.get("xai_bart_config"), cache_dir=cfg.get("xai_cache_dir"),
+                local_files_only=local_files_only or cfg.get("local_files_only", False),
+                max_syllables=data["max_syllables"],
+            )
+        else:
+            template = ProsodyBart.load(checkpoint)
+            tokenizer = AutoTokenizer.from_pretrained(
+                checkpoint / "tokenizer", local_files_only=True
+            )
+        if not isinstance(template, (ProsodyBart, XAILyricist)) or (
+            checkpoint / "melody.json"
+        ).exists():
             raise ValueError(
-                "Use an explainable template-only checkpoint, not a legacy/direct model"
+                "Use a template-only XAI or explainable checkpoint, not a legacy/direct model"
             )
         if (checkpoint / "end_to_end.json").exists():
             raise ValueError("template_checkpoint must be the original template-only pretrain")
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint / "tokenizer", local_files_only=True)
     if data["max_syllables"] != template.max_syllables:
         raise ValueError("Prepared data and template checkpoint syllable vocabularies differ")
     if len(tokenizer) != template.bart.config.vocab_size:
@@ -211,18 +229,23 @@ def build_model(config):
         stress_token_ids=[token_id(tokenizer, f"<{s}>") for s in ("strong", "weak")],
         temperature=cfg.get("temperature", 1.0),
         anchor_weight=settings.get("bridge_anchor_weight", 0),
-        loss_weights={**dict.fromkeys(LOSS_NAMES, 1.0), **(settings.get("loss_weights") or {})},
+        loss_weights={**dict.fromkeys(template.loss_weights, 1.0),
+                      **(settings.get("loss_weights") or {})},
         provenance={
             "template_checkpoint": str(checkpoint.resolve()),
-            "template_weights_sha256": file_sha256(checkpoint / "weights.pt"),
+            "template_weights_sha256": file_sha256(
+                checkpoint if checkpoint.is_file() else checkpoint / "weights.pt"
+            ),
             "template_pretraining_data_sha256": template_run.get("data_sha256"),
+            "template_architecture": "xai_single_stream" if xai else "explainable_four_stream",
+            "template_import": template.provenance if xai else None,
             "melody": provenance,
         },
     )
     return model, tokenizer
 
 
-def train_end_to_end(config, *, output_dir=None, smoke_test=False):
+def train_end_to_end(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
     for key in ("epochs", "batch_size", "patience", "gradient_accumulation_steps"):
         value = settings.get(key, 1)
@@ -268,7 +291,7 @@ def train_end_to_end(config, *, output_dir=None, smoke_test=False):
         required=cfg.get("melody_initialization", "pretrained") == "pretrained",
         encoder_lines=data["lines_per_window"],
     )
-    model, tokenizer = build_model(config)
+    model, tokenizer = build_model(config, local_files_only=local_files_only)
     datasets = {
         split: EndToEndDataset(
             data["prepared_dir"],
@@ -329,6 +352,7 @@ def train_end_to_end(config, *, output_dir=None, smoke_test=False):
     output.mkdir(parents=True, exist_ok=False)
     run = dict(
         conditioning="end_to_end",
+        decoder_mode=model.decoder_mode,
         config=config,
         smoke_test=smoke_test,
         data_schema_version=manifest["schema_version"],

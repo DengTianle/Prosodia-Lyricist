@@ -15,6 +15,7 @@ from prosodia_lyricist.features import TARGET_KEYS, encode_source, token_id
 from prosodia_lyricist.melody_checkpoint import file_sha256
 from prosodia_lyricist.model import ProsodyBart
 from prosodia_lyricist.prepare import SCHEMA_VERSION
+from prosodia_lyricist.xai_model import XAILyricist
 
 
 @pytest.fixture
@@ -89,6 +90,107 @@ def encoded(song, tokenizer, **kwargs):
 
 def batch(song, tokenizer):
     return EndToEndCollator(tokenizer.pad_token_id)([encoded(song, tokenizer)])
+
+
+def as_xai(model, tokenizer):
+    return EndToEndProsody(
+        model.bridge,
+        XAILyricist(model.template_model.bart, max_syllables=8),
+        stress_token_ids=[token_id(tokenizer, f"<{s}>") for s in ("strong", "weak")],
+    )
+
+
+def test_xai_lyric_loss_trains_bridge_and_hard_projection_matches_reference(
+    joint_model, joint_song, tokenizer
+):
+    model = as_xai(joint_model, tokenizer).eval()
+    example = encoded(joint_song, tokenizer, decoder_mode="xai")
+    assert set(example["targets"]) == {"labels"}
+    assert [v for v in example["source"]["remainder_ids"] if v] == [3, 2, 1, 1]
+    inputs = EndToEndCollator(tokenizer.pad_token_id)([example])
+    hard = model.condition_source(**condition_inputs(inputs), template_mode="hard")
+    from prosodia_lyricist.xai_features import encode_source as xai_source
+
+    preview = decode_bridge_tokens(hard.sequences[0].tolist())
+    record = {**joint_song, "lines": [
+        {**line, **predicted}
+        for line, predicted in zip(joint_song["lines"], preview, strict=True)
+    ]}
+    discrete = {k: torch.tensor([v]) for k, v in xai_source(record, tokenizer, 8).items()}
+    torch.testing.assert_close(
+        hard.inputs_embeds,
+        model.template_model.embed_source(
+            discrete["input_ids"], discrete["length_ids"], discrete["remainder_ids"]
+        ),
+    )
+    changed = copy.deepcopy(joint_song)
+    for line in changed["lines"]:
+        line["text"], line["words"] = "secret", []
+        for syllable in line["syllables"]:
+            syllable.update(stress="weak", length="short")
+    assert example["source"] == encoded(
+        changed, tokenizer, decoder_mode="xai", with_targets=False
+    )["source"]
+    output = model(**inputs)
+    assert set(output.loss_components) == {"lyrics", "bridge_anchor"}
+    assert "prosody_logits" not in output
+    output.loss.backward()
+    for module in (model.bridge.strength_head, model.bridge.length_head,
+                   model.bridge.song_features[0]):
+        assert module.weight.grad is not None and module.weight.grad.abs().sum() > 0
+    assert all(p.grad is None for p in model.template_model.parameters())
+    model.set_template_trainable("encoder")
+    assert model.template_model.remainder_embedding.weight.requires_grad
+    assert model.template_model.length_embedding.weight.requires_grad
+    assert not model.template_model.bart.get_decoder().embed_tokens.weight.requires_grad
+
+
+def test_xai_joint_training_save_reload_and_generation(
+    joint_config, joint_model, tokenizer, tmp_path
+):
+    model = as_xai(joint_model, tokenizer)
+    template = tmp_path / "xai-template"
+    model.template_model.save(template, tokenizer)
+    original = model.template_model.bart.get_decoder().layers[0].fc1.weight.detach().clone()
+    config = copy.deepcopy(joint_config)
+    config["model"].update(template_checkpoint=str(template), decoder_mode="xai")
+    config["training"].update(
+        template_unfreeze_epoch=0, template_finetune="all", loss_weights={"lyrics": 1}
+    )
+    output = train_end_to_end(config, smoke_test=True)
+    restored = EndToEndProsody.load(output / "best").eval()
+    assert isinstance(restored.template_model, XAILyricist)
+    assert not torch.equal(
+        original, restored.template_model.bart.get_decoder().layers[0].fc1.weight
+    )
+    metrics = json.loads((output / "metrics.jsonl").read_text())
+    assert set(metrics["train"]["components"]) == {"lyrics", "bridge_anchor"}
+    assert "teacher_forced_word_event_accuracy" not in metrics["valid"]
+    ds = EndToEndDataset(
+        config["data"]["prepared_dir"], "valid", tokenizer, **restored.dataset_options,
+        max_source_length=64, max_target_length=64,
+    )
+    inputs = EndToEndCollator(tokenizer.pad_token_id)([ds[0]])
+    generated = restored.generate(
+        **condition_inputs(inputs), tokenizer=tokenizer, max_new_tokens=6, do_sample=False
+    )
+    assert generated.explanations[0]["decoder_mode"] == "xai_single_stream"
+    assert generated.explanations[0]["melody_conditioning"]["mode"] == "soft"
+    assert not hasattr(generated, "stress_ids")
+    from prosodia_lyricist.evaluation import conditional_perplexity
+
+    source = restored.condition_source(**condition_inputs(inputs))
+    ordinary = {
+        k: inputs[k] for k in ("input_ids", "length_ids", "remainder_ids", "attention_mask")
+    }
+    score = conditional_perplexity(
+        restored.template_model, {**ordinary, "inputs_embeds": source.inputs_embeds},
+        inputs["labels"], tokenizer,
+    )
+    direct = restored.template_model(
+        **ordinary, inputs_embeds=source.inputs_embeds, labels=inputs["labels"]
+    )
+    assert score["mean_nll"] == pytest.approx(direct.loss.item(), abs=1e-6)
 
 
 def test_lyrics_alone_train_bridge_through_frozen_pretrained_decoder(
@@ -471,12 +573,14 @@ def test_checkpoint_selection_early_stopping_and_display_use_combined_loss(
     )
 
 
+@pytest.mark.parametrize("decoder_mode", ["explainable", "xai"])
 def test_evaluator_scores_lyrics_and_controls_same_songs(
     joint_model,
     joint_config,
     tokenizer,
     tmp_path,
     monkeypatch,
+    decoder_mode,
 ):
     from prosodia_lyricist import ipa
     from prosodia_lyricist.end_to_end_eval import evaluate_end_to_end
@@ -489,6 +593,8 @@ def test_evaluator_scores_lyrics_and_controls_same_songs(
         ]
 
     monkeypatch.setattr(ipa, "parse_words", pronounce)
+    if decoder_mode == "xai":
+        joint_model = as_xai(joint_model, tokenizer)
     checkpoint = tmp_path / "joint"
     joint_model.eval().save(checkpoint, tokenizer)
     report = evaluate_end_to_end(
@@ -501,6 +607,7 @@ def test_evaluator_scores_lyrics_and_controls_same_songs(
         melody_controls=True,
     )
     assert report["data"]["songs"] == 3
+    assert report["decoder_mode"] == decoder_mode
     assert report["generation"]["songs"] == 2
     assert report["hard_template_ablation"]["generation"]["songs"] == 2
     assert report["generation"]["compared_slots"] > 0
@@ -513,6 +620,7 @@ def test_evaluator_scores_lyrics_and_controls_same_songs(
     json.dumps(report, allow_nan=False)
 
 
+@pytest.mark.parametrize("decoder_mode", ["explainable", "xai"])
 def test_midi_inference_uses_soft_embeddings_for_generation_and_perplexity(
     joint_model,
     joint_config,
@@ -520,10 +628,13 @@ def test_midi_inference_uses_soft_embeddings_for_generation_and_perplexity(
     tokenizer,
     tmp_path,
     monkeypatch,
+    decoder_mode,
 ):
     from prosodia_lyricist import infer as inference
     from prosodia_lyricist import midi
 
+    if decoder_mode == "xai":
+        joint_model = as_xai(joint_model, tokenizer)
     checkpoint = tmp_path / "joint-midi"
     joint_model.eval().save(checkpoint, tokenizer)
     (checkpoint / "run.json").write_text(
@@ -548,7 +659,8 @@ def test_midi_inference_uses_soft_embeddings_for_generation_and_perplexity(
         inference, "midi_note_comparison", lambda *args, **kwargs: {"warning": None}
     )
     seen = []
-    original = ProsodyBart.generate
+    model_class = XAILyricist if decoder_mode == "xai" else ProsodyBart
+    original = model_class.generate
 
     def capture(self, *args, **kwargs):
         seen.append(kwargs["inputs_embeds"].clone())
@@ -558,7 +670,7 @@ def test_midi_inference_uses_soft_embeddings_for_generation_and_perplexity(
         assert torch.equal(inputs["inputs_embeds"], seen[0])
         return dict(perplexity=2, token_count=1)
 
-    monkeypatch.setattr(ProsodyBart, "generate", capture)
+    monkeypatch.setattr(model_class, "generate", capture)
     monkeypatch.setattr(inference, "conditional_perplexity", score)
     monkeypatch.setattr(inference, "evaluate_prosody", lambda *args: {})
     path = tmp_path / "example.mid"
@@ -575,6 +687,9 @@ def test_midi_inference_uses_soft_embeddings_for_generation_and_perplexity(
     assert seen and report["template_role"] == "argmax_preview"
     assert report["bridge"]["count_sources"] == ["notes", "notes"]
     assert report["bridge"]["syllable_counts"] == [4, 1]
+    assert report["decoder_mode"] == (
+        "xai_single_stream" if decoder_mode == "xai" else "explainable"
+    )
 
 
 def test_literal_stress_tokens_in_prompts_do_not_become_slots(joint_song, tokenizer, joint_model):

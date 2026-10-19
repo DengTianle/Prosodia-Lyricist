@@ -107,7 +107,10 @@ def train(config, *, output_dir=None, smoke_test=False, local_files_only=False):
     if config["model"].get("conditioning") == "end_to_end":
         from .end_to_end_train import train_end_to_end
 
-        return train_end_to_end(config, output_dir=output_dir, smoke_test=smoke_test)
+        return train_end_to_end(
+            config, output_dir=output_dir, smoke_test=smoke_test,
+            local_files_only=local_files_only,
+        )
     if config["model"].get("conditioning") == "bridge":
         from .bridge_train import train_bridge
 
@@ -322,7 +325,7 @@ def main():
     parser.add_argument(
         "--smoke-test",
         action="store_true",
-        help="Two train/valid batches with tiny random BART; no pretrained weights",
+        help="Two train/valid batches; joint training loads its configured pretrained weights",
     )
     parser.add_argument("--local-files-only", action="store_true")
     args = parser.parse_args()

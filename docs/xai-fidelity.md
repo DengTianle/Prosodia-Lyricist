@@ -1,5 +1,11 @@
 # Explainable Prosody implementation notes
 
+This page describes the earlier **four-stream Prosodia** path selected by
+`configs/dali.yaml`. The current branch's `configs/end_to_end.yaml` instead
+loads the supplied original `bestM2LCkpt.pt`, whose trained decoder has one
+lyric stream. See the [README](../README.md#end-to-end-melody-conditioning) for
+its strict importer, direct training, and tokenizer/config recovery assumptions.
+
 The specification for the default model is the paper's Sections 3.1, 3.3,
 3.4, and Eq. (1), together with the supplement's IPA rules. The adjacent
 `../XAI-Lyricist` checkout is a partial implementation, not the final-model
@@ -89,8 +95,9 @@ and loss weights.
 Old song-level Prosodia checkpoints still load through `legacy_model.py` and use
 `legacy_features.py` at inference. `model.decoder_mode: lyrics` explicitly selects
 that historical architecture for new experiments. Its old loss names are valid
-only in that mode. Checkpoints from the adjacent research checkout have never
-been compatible with this project's checkpoint format.
+only in that mode. Original research checkpoints now have a separate
+`XAILyricist` importer and `xai.json` format. They do not contain this page's
+four-stream decoder heads.
 
 ## Validation
 

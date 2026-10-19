@@ -224,6 +224,7 @@ def evaluate_end_to_end(
     report = dict(
         schema_version=1,
         conditioning="parallel_soft_template",
+        decoder_mode=model.decoder_mode,
         checkpoint=str(checkpoint.resolve()),
         checkpoint_sha256={
             "template": file_sha256(checkpoint / "weights.pt"),
@@ -255,8 +256,11 @@ def evaluate_end_to_end(
             "generation_accuracy": "Actual generated IPA versus reference IPA, by phrase/slot. "
             "Missing/extra slots and failed songs count as incorrect. This is reference agreement, "
             "not a measure of all acceptable lyrics or physical singability.",
-            "teacher_forced": "Reference word/prosody history enters ONLY the lyric decoder. "
-            "The parallel bridge never receives reference prosody labels as input.",
+            "teacher_forced": (
+                "Reference word history enters only the lyric decoder. "
+                if model.decoder_mode == "xai"
+                else "Reference word/prosody history enters only the lyric decoder. "
+            ) + "The parallel bridge never receives reference prosody labels as input.",
             "bridge_accuracy": "Hard argmax of parallel slots, with no label history. "
             "With note counts, only equal note/IPA count phrases have aligned reference labels.",
             "source_agreement": "Diagnostic agreement with the argmax input preview; "

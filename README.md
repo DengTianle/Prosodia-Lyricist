@@ -1,12 +1,14 @@
 # Prosodia Lyricist
 
-Explainable prosody-conditioned lyric generation with BART, trained on the
-**DALI music annotation dataset**. The default implements XAI-Lyricist's four
-aligned decoder streams, compound decoder feedback, equal-weight four-part
-cross-entropy loss, and IPA prosody correction before the next word is generated.
-See the [paper implementation notes](docs/xai-fidelity.md) for the BART subword
-adaptation and differences from the published experiment. Previous song-level
-lyrics-only checkpoints remain loadable through an explicit legacy path.
+Prosody-conditioned lyric generation with BART, trained on the **DALI music
+annotation dataset**. On this branch, `train.sh` and `configs/end_to_end.yaml`
+use the supplied original XAI-Lyricist `bestM2LCkpt.pt`: a **single lyric output
+stream**, with compound meter/length/remainder source embeddings. The melody
+encoder and parallel soft prosody bridge remain the input path. See
+[end-to-end training](#end-to-end-melody-conditioning) below for commands and
+the recovered tokenizer's limitations. Earlier four-stream Prosodia checkpoints
+and their explicit `configs/dali.yaml` training path remain supported; the
+[paper implementation notes](docs/xai-fidelity.md) describe that older path.
 
 ## Setup
 
@@ -180,60 +182,92 @@ precision are not implemented.
 
 ## End-to-end melody conditioning
 
-[`configs/end_to_end.yaml`](configs/end_to_end.yaml) trains a new parallel melody
-bridge through the pretrained explainable lyric model. Set `template_checkpoint`
-to the four-stream pretrain and `melody_checkpoint` to the contrastive checkpoint.
-The initial configuration freezes both pretrained models and trains only the new
-song encoder, slot attention, and stress/length heads:
+[`configs/end_to_end.yaml`](configs/end_to_end.yaml) loads
+`checkpoints/bestM2LCkpt.pt` directly. Its 272 state entries identify BART-base
+dimensions (768 hidden units, 6 encoder/decoder layers, 3072 FFN units, 1024
+positions, 50,322 vocabulary rows), a 3-class length embedding, a 42-class
+remainder embedding, and a `2304 → 768` source projection. There are no trained
+auxiliary decoder heads, decoder feature embeddings, or word-end events.
+Import maps exact parameter names, verifies tied aliases, and loads strictly.
 
 ```text
 melody → pretrained local windows → song encoder → parallel structural slot queries
-       → soft stress/length embedding mixtures → pretrained BART encoder
-       → unchanged word/prosody-history decoder → lyric + auxiliary output losses
+       → soft stress/length mixtures + fixed per-line remainder embeddings
+       → checkpoint's three-part source projection → BART encoder/decoder → lyric CE
 ```
 
 Slot queries contain line, slot, and syllable-count embeddings. They attend to
 the whole song and one another without a causal mask or prior prosody labels.
-Softmax probabilities mix the existing source stress-token and length embeddings
-before the existing concatenation/projection. There is no sampling or argmax in
-the training connection. The same soft connection is used for lyric generation.
-All four target streams, their causal shifts, `<word_end>` events, and IPA-corrected
-decoder feedback are preserved. The default loss weights are 1 for each of the
-four streams, matching pretraining's weights.
-`bridge_anchor_weight` optionally anchors the intermediate labels to reference IPA.
+Softmax probabilities mix the checkpoint's source stress-token and length
+embeddings before its original concatenation/projection. Remainder IDs count
+down independently in every phrase (`count..1`, with `Remain_0` at ID 1).
+Prompts follow the reference's title/count/template/keywords/period format.
+The same soft connection is used for training and generation. Lyric targets
+contain plain BPE text, period phrase separators, and EOS. Generation starts
+with BOS, as in reference inference; training shifts labels right with that
+same BOS prefix. The public reference forward instead feeds unshifted target
+embeddings while predicting those targets; that target leakage is not reproduced.
+The only decoder objective is lyric CE. `bridge_anchor_weight` optionally adds
+IPA supervision on intermediate source slots. Greedy/top-k generation has no
+default repetition penalty, n-gram filter, forced BOS/EOS, or IPA correction.
 
 Training joins notes and lyrics from each prepared song, uses reference IPA counts,
 and skips whole songs exceeding either model's limits. MIDI inference uses note
-counts; neither path infers melisma alignment. `melody_unfreeze_epoch` and
-`template_unfreeze_epoch` optionally enable later adaptation. With
-`template_finetune: encoder`, the decoder and shared token/length embeddings remain
-frozen. Checkpoints include both models and the tokenizer; old template and bridge
-checkpoints retain their existing loading and inference behavior.
+counts; neither path infers melisma alignment. Set `melody_checkpoint` and
+`pretraining_manifest` to your contrastive pretraining assets. The default keeps
+the melody tower frozen and adapts the bridge plus all of BART from epoch 0.
+Set `template_unfreeze_epoch: null` to train only the bridge, or use
+`template_finetune: encoder` to adapt the BART source encoder/projection and its
+source-only length/remainder embeddings while freezing decoder/shared token
+weights. `melody_unfreeze_epoch: 0` also adapts the melody tower. Component
+learning rates and later unfreeze epochs remain configurable.
 
-To fine-tune both pretrained components from the first epoch, set
-`training.melody_unfreeze_epoch: 0`, `training.template_unfreeze_epoch: 0`, and
-`training.template_finetune: all`. Use `encoder` instead of `all` to adapt only
-the BART source encoder and source projection. Epoch thresholds are zero-based;
-`null` keeps a component frozen. Their learning rates are controlled separately
-by `melody_learning_rate` and `template_learning_rate`.
+**Missing author assets:** the public repository and its fork do not include
+`bart_tokenizer` or `bart_custom_model/config.json`. By default, the tokenizer
+recovers title/template/stress IDs from the bundled tokenized samples and
+extends their observed count-5/6/7 mapping linearly to counts 1..40; unknown,
+unused added IDs keep opaque names. The original checkpoint's use of this
+sample vocabulary is unverified; the `counter` examples have a different count
+mapping. Head counts (12), activations, and dropout
+use BART-base settings, which cannot be established from weights alone.
+These assumptions are saved in import and run provenance. Set
+`model.xai_tokenizer_dir` / `model.xai_bart_config` to the author's files when
+available. Matching tensor shapes establishes architecture compatibility,
+not an exact numerical reproduction of the author's unavailable setup.
 
 ```bash
 python -m prosodia_lyricist.train --config configs/end_to_end.yaml --smoke-test
 python -m prosodia_lyricist.train --config configs/end_to_end.yaml
-python -m prosodia_lyricist.infer --checkpoint checkpoints/end-to-end/RUN/best \
+python -m prosodia_lyricist.infer --checkpoint checkpoints/end-to-end-xai/RUN/best \
   --midi examples/imagine.mid --title Imagine --report-prefix outputs/joint-imagine
-python -m prosodia_lyricist.end_to_end_eval --checkpoint checkpoints/end-to-end/RUN/best \
+python -m prosodia_lyricist.end_to_end_eval --checkpoint checkpoints/end-to-end-xai/RUN/best \
   --prepared-dir data/dali-bridge --device cuda --precision bf16 \
   --generation-limit 16 --compare-hard --melody-controls --output outputs/joint-eval.json
 ```
+
+To generate with the original checkpoint and heuristic MIDI templates before
+training a melody bridge, import it once into a new self-contained directory:
+
+```bash
+python -m prosodia_lyricist.xai_model --checkpoint checkpoints/bestM2LCkpt.pt \
+  --output-dir checkpoints/xai-original --local-files-only
+python -m prosodia_lyricist.infer --checkpoint checkpoints/xai-original \
+  --midi examples/imagine.mid --title Imagine --top-k 3
+```
+
+Omit `--local-files-only` to download the base BART tokenizer if it is not cached.
+Import also accepts `--tokenizer-dir` and `--bart-config` for original assets.
+Joint checkpoints include both models and the tokenizer and reload without the
+original `.pt`, reference checkout, or contrastive checkpoint.
 
 Smoke tests use the actual configured pretrained weights, with two small training
 batches; they do not silently substitute random pretrained models. `train.sh`
 defaults to this configuration and accepts another config as its first argument.
 Validation selects checkpoints and drives early stopping by the combined weighted
-loss (all four decoder losses plus the optional bridge anchor), and displays that
-same combined score in epoch summaries. It logs all component losses
-plus bridge and word-event accuracies. The separate evaluator measures IPA from
+loss (lyric CE plus the optional bridge anchor), and displays that
+same combined score in epoch summaries. It logs lyric loss and bridge accuracy.
+There are no auxiliary decoder accuracy metrics for the single-stream model.
+The separate evaluator measures IPA from
 actual generated lyrics, includes duration baselines on the same generation songs,
 and optionally compares hard embeddings and wrong melodies on matched subsets.
 Use `--count-source notes` for the note-count deployment condition; the default
@@ -241,6 +275,9 @@ Use `--count-source notes` for the note-count deployment condition; the default
 with the bridge's hard preview are reported separately; neither establishes physical
 singability. Run metadata records both pretraining sources and split-verification
 status; different template-pretraining data hashes leave that overlap unverified.
+To run the previous four-stream experiment, point `template_checkpoint` to its
+template-only checkpoint, set `decoder_mode: explainable`, and restore its four
+`loss_weights` (`lyrics`, `syllables`, `stresses`, `lengths`).
 
 ## Learned melody-to-template bridge
 

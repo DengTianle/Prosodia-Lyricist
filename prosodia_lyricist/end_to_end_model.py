@@ -1,4 +1,4 @@
-"""Parallel melody conditioning for the unchanged four-stream ProsodyBart decoder."""
+"""Parallel melody conditioning through the pretrained lyric checkpoint's embeddings."""
 
 import json
 import math
@@ -12,7 +12,8 @@ from torch import nn
 from .bridge_data import PAIR_OFFSET, SLOT
 from .bridge_model import ProsodyBridge
 from .end_to_end_data import CONDITION_FIELDS
-from .model import LOSS_NAMES, ProsodyBart
+from .model import ProsodyBart
+from .xai_model import XAILyricist
 
 
 class EndToEndProsody(nn.Module):
@@ -30,8 +31,10 @@ class EndToEndProsody(nn.Module):
         provenance=None,
     ):
         super().__init__()
-        if bridge.query_mode != "parallel" or not isinstance(template_model, ProsodyBart):
-            raise ValueError("Expected a parallel bridge and an explainable template decoder")
+        if bridge.query_mode != "parallel" or not isinstance(
+            template_model, (ProsodyBart, XAILyricist)
+        ):
+            raise ValueError("Expected a parallel bridge and a supported template decoder")
         if bridge.max_syllables != template_model.max_syllables:
             raise ValueError("Bridge and template decoder syllable vocabularies differ")
         if not 0 < temperature < math.inf or not 0 <= anchor_weight < math.inf:
@@ -45,9 +48,10 @@ class EndToEndProsody(nn.Module):
             )
         ):
             raise ValueError("Expected vocabulary IDs for strong and weak source tokens")
+        self.loss_names = tuple(template_model.loss_weights)
         weights = {**template_model.loss_weights, **(loss_weights or {})}
         if (
-            set(weights) != set(LOSS_NAMES)
+            set(weights) != set(self.loss_names)
             or any(not 0 <= w < math.inf for w in weights.values())
             or weights["lyrics"] <= 0
         ):
@@ -60,6 +64,10 @@ class EndToEndProsody(nn.Module):
         self.register_buffer("stress_token_ids", torch.tensor(stress_token_ids), persistent=False)
         self.set_template_trainable(template_trainable)
         self.bridge.set_melody_trainable(melody_trainable)
+
+    @property
+    def decoder_mode(self):
+        return "xai" if isinstance(self.template_model, XAILyricist) else "explainable"
 
     def set_template_trainable(self, mode):
         if mode not in ("frozen", "encoder", "all"):
@@ -77,6 +85,10 @@ class EndToEndProsody(nn.Module):
                 self.template_model.projection,
             ):
                 module.requires_grad_(True)
+            if self.decoder_mode == "xai":
+                # These embeddings belong only to the reference SOURCE path.
+                self.template_model.length_embedding.requires_grad_(True)
+                self.template_model.remainder_embedding.requires_grad_(True)
         self._template_mode()
 
     def _template_mode(self):
@@ -99,6 +111,7 @@ class EndToEndProsody(nn.Module):
             max_song_notes=bridge.max_song_notes,
             max_song_lines=bridge.max_song_lines,
             max_bridge_length=bridge.max_target_length,
+            decoder_mode=self.decoder_mode,
         )
 
     def condition_source(
@@ -115,6 +128,7 @@ class EndToEndProsody(nn.Module):
         song_features,
         *,
         template_mode="soft",
+        remainder_ids=None,
     ):
         if template_mode not in ("soft", "hard"):
             raise ValueError("template_mode must be soft or hard")
@@ -126,6 +140,10 @@ class EndToEndProsody(nn.Module):
             raise ValueError("Source IDs, masks, and slot indices must align")
         if input_ids.shape[1] > self.template_model.bart.config.max_position_embeddings:
             raise ValueError("Source exceeds the template encoder position limit")
+        if self.decoder_mode == "xai" and (
+            remainder_ids is None or remainder_ids.shape != input_ids.shape
+        ):
+            raise ValueError("The XAI checkpoint requires aligned source remainder IDs")
         output = self.bridge.predict_slots(
             melody_features,
             melody_attention_mask,
@@ -157,18 +175,14 @@ class EndToEndProsody(nn.Module):
         # Calling the embedding module preserves BART's configured embedding scale.
         stress_bank = model.bart.get_encoder().embed_tokens(self.stress_token_ids)
         length_bank = model.length_embedding.weight[1:3]  # 1=long, 2=short; never pad.
-        mixed = model.dropout(
-            model.projection(
-                torch.cat(
-                    (
-                        stress.to(stress_bank.dtype) @ stress_bank,
-                        length.to(length_bank.dtype) @ length_bank,
-                    ),
-                    dim=-1,
-                )
-            )
-        )
-        ordinary = model.embed_source(input_ids, length_ids)
+        compound = [stress.to(stress_bank.dtype) @ stress_bank,
+                    length.to(length_bank.dtype) @ length_bank]
+        if self.decoder_mode == "xai":
+            compound.append(model.remainder_embedding(remainder_ids))
+            ordinary = model.embed_source(input_ids, length_ids, remainder_ids)
+        else:
+            ordinary = model.embed_source(input_ids, length_ids)
+        mixed = model.dropout(model.projection(torch.cat(compound, dim=-1)))
         embeddings = torch.where(slots[..., None], mixed, ordinary)
         sequences = output.skeleton["tokens"].clone()
         active = sequences.eq(SLOT)
@@ -186,25 +200,29 @@ class EndToEndProsody(nn.Module):
         self,
         *,
         labels,
-        syllable_labels,
-        stress_labels,
-        length_labels,
+        syllable_labels=None,
+        stress_labels=None,
+        length_labels=None,
         bridge_labels=None,
         template_mode="soft",
         **condition,
     ):
         source = self.condition_source(**condition, template_mode=template_mode)
         # Frozen weights still participate in autograd with respect to source embeddings.
-        # Target words AND all three shifted target-feature streams are unchanged.
+        targets = dict(labels=labels)
+        if self.decoder_mode == "xai":
+            if any(v is not None for v in (syllable_labels, stress_labels, length_labels)):
+                raise ValueError("The XAI checkpoint accepts only lyric targets")
+            targets["remainder_ids"] = condition["remainder_ids"]
+        else:
+            targets.update(syllable_labels=syllable_labels, stress_labels=stress_labels,
+                           length_labels=length_labels)
         output = self.template_model(
             input_ids=condition["input_ids"],
             length_ids=condition["length_ids"],
             attention_mask=condition["attention_mask"],
             inputs_embeds=source.inputs_embeds,
-            labels=labels,
-            syllable_labels=syllable_labels,
-            stress_labels=stress_labels,
-            length_labels=length_labels,
+            **targets,
         )
         if bridge_labels is not None:
             if bridge_labels.shape != source.bridge.logits.shape[:2]:
@@ -231,7 +249,7 @@ class EndToEndProsody(nn.Module):
     def generate(self, *, tokenizer, template_mode="soft", **kwargs):
         if self.training:
             raise ValueError("Call model.eval() before generation")
-        condition = {key: kwargs.pop(key) for key in CONDITION_FIELDS}
+        condition = {key: kwargs.pop(key) for key in CONDITION_FIELDS if key in kwargs}
         source = self.condition_source(**condition, template_mode=template_mode)
         result = self.template_model.generate(
             input_ids=condition["input_ids"],
@@ -239,6 +257,7 @@ class EndToEndProsody(nn.Module):
             attention_mask=condition["attention_mask"],
             inputs_embeds=source.inputs_embeds,
             tokenizer=tokenizer,
+            **({"remainder_ids": condition["remainder_ids"]} if self.decoder_mode == "xai" else {}),
             **kwargs,
         )
         # These are diagnostics; generation used soft embeddings unless explicitly ablated.
@@ -275,9 +294,11 @@ class EndToEndProsody(nn.Module):
         meta = json.loads((directory / "end_to_end.json").read_text(encoding="utf-8"))
         if meta.pop("format_version") != 1 or meta.pop("conditioning") != "parallel_soft_template":
             raise ValueError("Unsupported end-to-end checkpoint format")
-        return cls(ProsodyBridge.load(directory / "bridge"), ProsodyBart.load(directory), **meta)
+        template = (XAILyricist.load(directory) if (directory / "xai.json").exists()
+                    else ProsodyBart.load(directory))
+        return cls(ProsodyBridge.load(directory / "bridge"), template, **meta)
 
 
 def condition_inputs(batch):
     """Explicit allowlist: decoder targets and anchor labels can never enter the bridge."""
-    return {key: batch[key] for key in CONDITION_FIELDS}
+    return {key: batch[key] for key in CONDITION_FIELDS if key in batch}

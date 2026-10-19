@@ -1,4 +1,4 @@
-"""Join melody inputs and four-stream lyric targets from the same prepared song."""
+"""Join melody inputs and checkpoint-specific lyric targets from the same song."""
 
 import json
 import logging
@@ -22,10 +22,10 @@ MELODY_FIELDS = (
     "line_counts",
     "song_features",
 )
-CONDITION_FIELDS = (*SOURCE_FIELDS, *MELODY_FIELDS, "syllable_counts")
+CONDITION_FIELDS = (*SOURCE_FIELDS, *MELODY_FIELDS, "syllable_counts", "remainder_ids")
 
 
-def encode_slot_source(record, counts, tokenizer, max_syllables):
+def encode_slot_source(record, counts, tokenizer, max_syllables, *, decoder_mode="explainable"):
     """Use only title/keywords/counts. Placeholder labels never reach the model as prosody."""
     if len(counts) != len(record["lines"]):
         raise ValueError("Slot counts must match the melody phrases")
@@ -34,12 +34,17 @@ def encode_slot_source(record, counts, tokenizer, max_syllables):
         "lines": [
             {
                 "keyword": line.get("keyword", ""),
-                "syllables": [{"stress": "unknown", "length": "short"}] * count,
+                "syllables": [{"stress": "weak", "length": "short"}] * count,
             }
             for line, count in zip(record["lines"], counts, strict=True)
         ],
     }
-    source = encode_source(neutral, tokenizer, max_syllables)
+    source_encoder = encode_source
+    if decoder_mode == "xai":
+        from .xai_features import encode_source as source_encoder
+    elif decoder_mode != "explainable":
+        raise ValueError("Joint decoder_mode must be explainable or xai")
+    source = source_encoder(neutral, tokenizer, max_syllables)
     # Bridge queries include one line prefix before each line's slots. Source
     # prompts have variable BPE lengths, so map positions explicitly, never by token ID.
     indices, offset = [], 0
@@ -60,6 +65,7 @@ def encode_song(
     encoder_lines_per_window,
     count_source="ipa",
     with_targets=True,
+    decoder_mode="explainable",
 ):
     if count_source not in ("ipa", "notes"):
         raise ValueError("count_source must be ipa or notes")
@@ -70,7 +76,9 @@ def encode_song(
     ]
     example = {
         "melody": encode_bridge_song(lines, encoder_lines_per_window),
-        "source": encode_slot_source(record, counts, tokenizer, max_syllables),
+        "source": encode_slot_source(
+            record, counts, tokenizer, max_syllables, decoder_mode=decoder_mode
+        ),
         "syllable_counts": counts,
         "song_id": record.get("song_id"),
         # Evaluation metadata, never collated into model inputs.
@@ -80,8 +88,13 @@ def encode_song(
     }
     if with_targets:
         # Encode targets from the SAME record, then discard the gold source template.
-        encoded = encode_example(record, tokenizer, max_syllables)
-        example["targets"] = {key: encoded[key] for key in TARGET_KEYS}
+        if decoder_mode == "xai":
+            from .xai_features import encode_targets
+
+            example["targets"] = encode_targets(record, tokenizer)
+        else:
+            encoded = encode_example(record, tokenizer, max_syllables)
+            example["targets"] = {key: encoded[key] for key in TARGET_KEYS}
         labels = []
         for line, count in zip(lines, counts, strict=True):
             labels.append(-100)  # A structural prefix has no prosody label.
@@ -114,6 +127,7 @@ class EndToEndDataset(Dataset):
         max_target_length,
         count_source="ipa",
         limit=None,
+        decoder_mode="explainable",
     ):
         limits = (
             max_syllables,
@@ -182,6 +196,7 @@ class EndToEndDataset(Dataset):
                         max_syllables=max_syllables,
                         encoder_lines_per_window=encoder_lines_per_window,
                         count_source=count_source,
+                        decoder_mode=decoder_mode,
                     )
                     over.update(
                         source_tokens=len(example["source"]["input_ids"]) > max_source_length,
@@ -221,7 +236,8 @@ class EndToEndCollator:
             raise ValueError("Cannot mix labeled and unlabeled joint examples")
         source = self.prosody(
             [
-                {**{key: e["source"][key] for key in SOURCE_KEYS}, **e.get("targets", {})}
+                {**{key: value for key, value in e["source"].items() if key != "slot_indices"},
+                 **e.get("targets", {})}
                 for e in examples
             ]
         )

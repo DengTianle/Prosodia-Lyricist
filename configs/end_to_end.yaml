@@ -16,8 +16,13 @@ data:
 
 model:
   conditioning: end_to_end
-  # Preserve the trained four-stream decoder, tokenizer, and feature embeddings.
-  template_checkpoint: ../checkpoints/dali/20260927T052126888961Z/best
+  decoder_mode: xai
+  # Original single-stream checkpoint; also accepts an imported xai.json directory.
+  template_checkpoint: ../checkpoints/bestM2LCkpt.pt
+  # Set these when the author's assets become available. Otherwise use the
+  # recorded recovery profile from the reference repo's binary samples.
+  xai_tokenizer_dir: null
+  xai_bart_config: null
   melody_initialization: pretrained
   melody_checkpoint: ../../try-contrastive/checkpoints/large_2line_16s/best.pt
   encoder_lines_per_window: 2
@@ -26,7 +31,7 @@ model:
   max_song_lines: 256
   max_bridge_length: 4096 # Structural line prefixes plus syllable queries.
   max_source_length: 1024 # Includes title/keywords and source template slots.
-  max_target_length: 1024 # Existing four-stream lyric decoder events.
+  max_target_length: 1024 # Plain lyric BPE targets, with EOS and no word_end events.
   song_encoder_layers: 2
   slot_encoder:
     d_model: 256
@@ -40,7 +45,7 @@ training:
   # Audit the NEW contrastive CSV while reusing prepared data. Use strict after
   # preparing with that unchanged CSV; warning records unresolved overlap checks.
   pretraining_audit_mode: warning
-  output_dir: ../checkpoints/end-to-end
+  output_dir: ../checkpoints/end-to-end-xai
   device: cuda
   precision: bf16
   seed: 1234
@@ -51,18 +56,14 @@ training:
   learning_rate: 0.0001
   melody_learning_rate: 0.000002
   template_learning_rate: 0.000005
-  # null freezes the pretrained components for the full initial experiment.
-  # Set either to a zero-based epoch to enable a later adaptation stage.
+  # Keep the pretrained melody tower frozen initially. Adapt the lyric model
+  # causally from epoch 0; the public reference forward uses unshifted targets.
   melody_unfreeze_epoch: null
-  template_unfreeze_epoch: null
-  template_finetune: encoder # Only encoder layers/positions/norm and source projection.
-  # 'all' is an explicit ablation that also changes the pretrained decoder.
+  template_unfreeze_epoch: 0
+  template_finetune: all # encoder / all; set unfreeze epoch to null to freeze BART.
   bridge_anchor_weight: 0.0 # Optional direct IPA supervision on intermediate slots.
   loss_weights:
     lyrics: 1.0
-    syllables: 1.0
-    stresses: 1.0
-    lengths: 1.0
   adam_betas: [0.9, 0.98]
   adam_epsilon: 0.00001
   weight_decay: 0.01

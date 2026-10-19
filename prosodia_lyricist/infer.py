@@ -17,6 +17,7 @@ from .model import ProsodyBart
 from .prepare import SCHEMA_VERSION
 from .report import markdown_report, write_report
 from .runtime import seed_everything, select_device
+from .xai_model import XAILyricist
 
 
 def package_versions():
@@ -82,9 +83,10 @@ def infer(
     else:
         model = ProsodyBart.load(checkpoint).to(device).eval()
     explainable = isinstance(model, ProsodyBart)
-    if bridge_checkpoint and not explainable:
-        raise ValueError("A bridge requires a four-stream template-decoder checkpoint")
-    if return_explanations and not explainable:
+    xai = isinstance(model, XAILyricist)
+    if bridge_checkpoint and not (explainable or xai):
+        raise ValueError("A bridge requires an XAI or four-stream template checkpoint")
+    if return_explanations and not (explainable or xai):
         raise ValueError("Legacy lyrics-only checkpoints have no generated explanation streams")
     target_limit = min(
         run["config"]["model"]["max_target_length"], model.bart.config.max_position_embeddings
@@ -129,7 +131,9 @@ def infer(
     ):
         raise ValueError("Reference must have one nonempty line per MIDI phrase")
     source_encoder = encode_source
-    if not explainable:
+    if xai:
+        from .xai_features import encode_source as source_encoder
+    elif not explainable:
         from .legacy_features import encode_source as source_encoder
     if not joint:
         encoded = source_encoder({"title": title, "lines": records}, tokenizer, model.max_syllables)
@@ -170,6 +174,14 @@ def infer(
         if bridge:
             explanation["bridge"] = bridge
         text = explanation["text"]
+    elif xai:
+        result = model.generate(**inputs, tokenizer=tokenizer, **generation)
+        tokens = result.sequences
+        explanation = result.explanations[0]
+        explanation["source"] = {"title": title, "lines": records}
+        if bridge:
+            explanation["bridge"] = bridge
+        text = explanation["text"]
     else:
         generation["bad_words_ids"] = [
             [tokenizer.convert_tokens_to_ids(token)]
@@ -195,7 +207,9 @@ def infer(
     report.update(
         checkpoint=str(checkpoint.resolve()),
         checkpoint_run=run,
-        decoder_mode="explainable" if explainable else "legacy_lyrics",
+        decoder_mode=(
+            "explainable" if explainable else "xai_single_stream" if xai else "legacy_lyrics"
+        ),
         generation={
             "seed": seed,
             "top_k": top_k,
@@ -204,7 +218,7 @@ def infer(
             "device": str(device),
             **repetition,
             "hit_token_limit": explanation["hit_token_limit"]
-            if explainable
+            if explainable or xai
             else len(tokens[0]) - 1 >= max_new_tokens,
         },
         encoded_source=encoded,
@@ -240,9 +254,16 @@ def infer(
             "position; later pairs may be misaligned."
         )
     if reference_lines is not None:
-        streams = reference_targets(
-            reference_lines, tokenizer, model.max_syllables, explainable=explainable
-        )
+        if xai:
+            from .xai_features import encode_targets
+
+            streams = [encode_targets({"lines": [{"text": t} for t in reference_lines]}, tokenizer)[
+                "labels"
+            ]]
+        else:
+            streams = reference_targets(
+                reference_lines, tokenizer, model.max_syllables, explainable=explainable
+            )
         if len(streams[0]) > target_limit:
             raise ValueError("Reference exceeds checkpoint target token limit; no truncation")
         report["reference_lines"] = reference_lines
@@ -335,7 +356,7 @@ def main():
         help="Inspect heuristic or learned templates without generating lyrics",
     )
     parser.add_argument(
-        "--explanations", help="New JSON file with predicted/corrected decoder prosody"
+        "--explanations", help="New decoder details JSON; four-stream models include prosody"
     )
     parser.add_argument(
         "--no-prosody-correction",

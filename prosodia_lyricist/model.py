@@ -145,6 +145,10 @@ class ProsodyBart(nn.Module):
     @classmethod
     def load(cls, directory):
         directory = Path(directory)
+        if (directory / "xai.json").exists():
+            from .xai_model import XAILyricist
+
+            return XAILyricist.load(directory)
         metadata = json.loads((directory / "prosody.json").read_text(encoding="utf-8"))
         if "format_version" not in metadata:
             from .legacy_model import ProsodyBart as LegacyProsodyBart

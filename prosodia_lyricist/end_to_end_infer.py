@@ -5,7 +5,6 @@ import torch
 from .bridge_data import SLOT, decode_bridge_tokens
 from .end_to_end_data import EndToEndCollator, encode_song
 from .end_to_end_model import condition_inputs
-from .features import SOURCE_KEYS
 from .midi import midi_melody_record
 
 
@@ -24,6 +23,7 @@ def condition_midi(
         encoder_lines_per_window=bridge.encoder_lines_per_window,
         count_source="notes",
         with_targets=False,
+        decoder_mode=model.decoder_mode,
     )
     if len(example["source"]["input_ids"]) > max_source_length:
         raise ValueError("MIDI exceeds the checkpoint's source token limit")
@@ -49,4 +49,6 @@ def condition_midi(
         "template_role": "argmax_preview" if template_mode == "soft" else "model_input",
         "melody_provenance": bridge.provenance,
     }
-    return records, {k: example["source"][k] for k in SOURCE_KEYS}, source.inputs_embeds, metadata
+    return records, {k: v for k, v in example["source"].items() if k != "slot_indices"}, (
+        source.inputs_embeds
+    ), metadata
