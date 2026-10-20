@@ -34,7 +34,7 @@ its tokenizer resources once if missing:
 python -m nltk.downloader punkt punkt_tab
 ```
 
-The adapter selects the first pronunciation for each word, preserves repeated
+The paper adapter selects the first modern pronunciation for each word, preserves repeated
 words and punctuation, and does not run metrical or syntactic parsing. The
 lexical/unknown alternatives do not need this dependency. The first training
 run fetches the BART tokenizer and pretrained weights from Hugging Face.
@@ -53,8 +53,9 @@ prosodia-prepare --config configs/dali.yaml
 This writes `data/dali/{train,valid,test}.jsonl`, `manifest.json`, and
 `rejected.jsonl`. Each record is one complete song with an ordered `lines` list;
 the manifest records configuration, pronunciation version, song/group split
-assignments, song and line counts, and file checksums. Schema version 4 requires
-re-running preparation and training; older prepared data must be rebuilt because the IPA stress/length rules changed.
+assignments, song and line counts, and file checksums. Schema version 5 records
+repo/paper IPA rules and pronunciation provenance. Repo-mode XAI training requires
+new preparation; schema-4 paper data remains readable by earlier models.
 Existing lyrics-only checkpoints can still perform legacy inference; they cannot
 be converted into trained explainable models without retraining.
 Preparation can be rerun and replaces only these generated outputs. Raw data
@@ -201,7 +202,8 @@ the whole song and one another without a causal mask or prior prosody labels.
 Softmax probabilities mix the checkpoint's source stress-token and length
 embeddings before its original concatenation/projection. Remainder IDs count
 down independently in every phrase (`count..1`, with `Remain_0` at ID 1).
-Prompts follow the reference's title/count/template/keywords/period format.
+Prompts follow the released MIDI/binary title/count/template/period format;
+keyword markers and keyword text are omitted, even if present in the input record.
 The same soft connection is used for training and generation. Lyric targets
 contain plain BPE text, period phrase separators, and EOS. Generation starts
 with BOS, as in reference inference; training shifts labels right with that
@@ -210,6 +212,37 @@ embeddings while predicting those targets; that target leakage is not reproduced
 The only decoder objective is lyric CE. `bridge_anchor_weight` optionally adds
 IPA supervision on intermediate source slots. Greedy/top-k generation has no
 default repetition penalty, n-gram filter, forced BOS/EOS, or IPA correction.
+The reference also terminates when BOS is sampled (its encoded EOS membership
+test includes BOS); generation now preserves that stopping behavior.
+
+`data.prosody_mode: actual` applies the repository rules during **preparation,
+bridge training, MIDI inference, and evaluation**: primary/secondary/unstressed
+remain `strong/substrong/weak`, and a syllable is long only if its IPA contains
+`ː`. Diphthongs and ASCII colons alone do not mark length. The bridge has three
+strength outputs and two length outputs, mixing all three pretrained stress
+embeddings without collapsing secondary stress. New bridge checkpoints use
+format 7; earlier binary checkpoints retain their saved paper rules.
+
+Pronunciation uses the same pinned Prosodic 1.5.0 English dictionary order and
+`maybestressed`/`unstressed` precedence as the baseline branch. Modern Prosodic
+provides tokenization and explicit dictionary-miss fallback; reports record
+fallback words. The authors' exact historical Prosodic version is unrecorded.
+Install the verified data once, then regenerate the new `data/dali-xai` dataset
+before training (the old `data/dali-bridge` labels are incompatible):
+
+```bash
+python -m prosodia_lyricist.historical_ipa
+python -m prosodia_lyricist.prepare --config configs/end_to_end.yaml
+```
+
+The audit also aligns MIDI stress with the released duration-dependent floor
+grid using the **file's ticks per beat**, including non-480 files; duration
+thresholds use onset buckets of eight quarter notes, computed before phrase
+filtering. Only marked phrases enter the repo input. Notes starting after the
+final marker are omitted and counted in diagnostics, matching `mid2words`.
+The bundled Imagine input therefore uses 16 phrases/103 notes; its 10 trailing
+notes still contribute to `getProsody` bucket thresholds. Paper/supplement
+parsing remains an explicit `--prosody-mode paper` comparison.
 
 Training joins notes and lyrics from each prepared song, uses reference IPA counts,
 and skips whole songs exceeding either model's limits. MIDI inference uses note
@@ -241,7 +274,7 @@ python -m prosodia_lyricist.train --config configs/end_to_end.yaml
 python -m prosodia_lyricist.infer --checkpoint checkpoints/end-to-end-xai/RUN/best \
   --midi examples/imagine.mid --title Imagine --report-prefix outputs/joint-imagine
 python -m prosodia_lyricist.end_to_end_eval --checkpoint checkpoints/end-to-end-xai/RUN/best \
-  --prepared-dir data/dali-bridge --device cuda --precision bf16 \
+  --prepared-dir data/dali-xai --device cuda --precision bf16 \
   --generation-limit 16 --compare-hard --melody-controls --output outputs/joint-eval.json
 ```
 

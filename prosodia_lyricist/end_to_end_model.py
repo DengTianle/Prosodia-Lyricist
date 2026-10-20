@@ -12,6 +12,7 @@ from torch import nn
 from .bridge_data import PAIR_OFFSET, SLOT
 from .bridge_model import ProsodyBridge
 from .end_to_end_data import CONDITION_FIELDS
+from .ipa import REPO_RULES
 from .model import ProsodyBart
 from .xai_model import XAILyricist
 
@@ -40,14 +41,16 @@ class EndToEndProsody(nn.Module):
         if not 0 < temperature < math.inf or not 0 <= anchor_weight < math.inf:
             raise ValueError("Temperature must be positive; anchor weight must be nonnegative")
         if (
-            len(stress_token_ids) != 2
-            or len(set(stress_token_ids)) != 2
+            len(stress_token_ids) != len(bridge.strength_labels)
+            or len(set(stress_token_ids)) != len(bridge.strength_labels)
             or any(
                 not isinstance(i, int) or not 0 <= i < template_model.bart.config.vocab_size
                 for i in stress_token_ids
             )
         ):
-            raise ValueError("Expected vocabulary IDs for strong and weak source tokens")
+            raise ValueError("Source stress token IDs must match the bridge strength vocabulary")
+        if len(bridge.strength_labels) == 3 and not isinstance(template_model, XAILyricist):
+            raise ValueError("Repo three-class stress requires the original XAI decoder")
         self.loss_names = tuple(template_model.loss_weights)
         weights = {**template_model.loss_weights, **(loss_weights or {})}
         if (
@@ -68,6 +71,10 @@ class EndToEndProsody(nn.Module):
     @property
     def decoder_mode(self):
         return "xai" if isinstance(self.template_model, XAILyricist) else "explainable"
+
+    @property
+    def prosody_mode(self):
+        return "actual" if self.bridge.prosody_rules == REPO_RULES else "paper"
 
     def set_template_trainable(self, mode):
         if mode not in ("frozen", "encoder", "all"):
@@ -112,6 +119,8 @@ class EndToEndProsody(nn.Module):
             max_song_lines=bridge.max_song_lines,
             max_bridge_length=bridge.max_target_length,
             decoder_mode=self.decoder_mode,
+            strength_labels=self.bridge.strength_labels,
+            prosody_mode=self.prosody_mode,
         )
 
     def condition_source(
@@ -168,15 +177,21 @@ class EndToEndProsody(nn.Module):
             for logits in (output.strength_logits, output.length_logits)
         ]
         if template_mode == "hard":
-            probabilities = [F.one_hot(p.argmax(-1), 2).to(p.dtype) for p in probabilities]
-        indices = slot_indices.clamp_min(0)[..., None].expand(-1, -1, 2)
-        stress, length = [p.gather(1, indices) for p in probabilities]
+            probabilities = [
+                F.one_hot(p.argmax(-1), p.shape[-1]).to(p.dtype) for p in probabilities
+            ]
+        stress, length = [
+            p.gather(1, slot_indices.clamp_min(0)[..., None].expand(-1, -1, p.shape[-1]))
+            for p in probabilities
+        ]
         model = self.template_model
         # Calling the embedding module preserves BART's configured embedding scale.
         stress_bank = model.bart.get_encoder().embed_tokens(self.stress_token_ids)
         length_bank = model.length_embedding.weight[1:3]  # 1=long, 2=short; never pad.
-        compound = [stress.to(stress_bank.dtype) @ stress_bank,
-                    length.to(length_bank.dtype) @ length_bank]
+        compound = [
+            stress.to(stress_bank.dtype) @ stress_bank,
+            length.to(length_bank.dtype) @ length_bank,
+        ]
         if self.decoder_mode == "xai":
             compound.append(model.remainder_embedding(remainder_ids))
             ordinary = model.embed_source(input_ids, length_ids, remainder_ids)
@@ -215,8 +230,11 @@ class EndToEndProsody(nn.Module):
                 raise ValueError("The XAI checkpoint accepts only lyric targets")
             targets["remainder_ids"] = condition["remainder_ids"]
         else:
-            targets.update(syllable_labels=syllable_labels, stress_labels=stress_labels,
-                           length_labels=length_labels)
+            targets.update(
+                syllable_labels=syllable_labels,
+                stress_labels=stress_labels,
+                length_labels=length_labels,
+            )
         output = self.template_model(
             input_ids=condition["input_ids"],
             length_ids=condition["length_ids"],
@@ -229,7 +247,9 @@ class EndToEndProsody(nn.Module):
                 raise ValueError("Bridge anchor labels must align with structural queries")
             active = bridge_labels.ne(-100)
             if (active & source.bridge.skeleton["tokens"].ne(SLOT)).any() or (
-                ((bridge_labels[active] < 0) | (bridge_labels[active] > 3)).any()
+                (
+                    (bridge_labels[active] < 0) | (bridge_labels[active] >= len(self.bridge.pairs))
+                ).any()
             ):
                 raise ValueError("Invalid bridge anchor labels")
             anchor = (
@@ -265,6 +285,7 @@ class EndToEndProsody(nn.Module):
             slots = source.bridge.skeleton["tokens"][row].eq(SLOT)
             explanation["melody_conditioning"] = {
                 "mode": template_mode,
+                "stress_labels": list(self.bridge.strength_labels),
                 "temperature": self.temperature,
                 "hard_template_tokens": source.sequences[row].tolist(),
                 "stress_probabilities": source.stress_probabilities[row, slots].tolist(),
@@ -294,8 +315,11 @@ class EndToEndProsody(nn.Module):
         meta = json.loads((directory / "end_to_end.json").read_text(encoding="utf-8"))
         if meta.pop("format_version") != 1 or meta.pop("conditioning") != "parallel_soft_template":
             raise ValueError("Unsupported end-to-end checkpoint format")
-        template = (XAILyricist.load(directory) if (directory / "xai.json").exists()
-                    else ProsodyBart.load(directory))
+        template = (
+            XAILyricist.load(directory)
+            if (directory / "xai.json").exists()
+            else ProsodyBart.load(directory)
+        )
         return cls(ProsodyBridge.load(directory / "bridge"), template, **meta)
 
 

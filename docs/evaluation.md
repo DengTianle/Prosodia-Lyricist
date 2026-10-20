@@ -1,5 +1,11 @@
 # Template-decoder MIDI inference and evaluation
 
+This page describes the earlier paper/supplement comparison. The original XAI
+checkpoint now defaults to repo-compatible MIDI/IPA rules and historical
+dictionary-first pronunciation; see the [current workflow](../README.md#end-to-end-melody-conditioning).
+New direct-training data uses `data/dali-xai` and a three-class stress bridge.
+`--prosody-mode paper` explicitly selects the comparison described below.
+
 ## Run the Imagine sanity check
 
 ```bash

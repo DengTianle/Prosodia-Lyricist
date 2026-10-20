@@ -17,7 +17,7 @@ from tqdm import tqdm
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def normalized_identity(value):
@@ -76,7 +76,9 @@ def plan_pretraining_splits(data, files, requested):
     if path:
         upstream_hash = file_sha256(path)
         rows, upstream = read_melody_manifest(
-            path, require_lyrics=False, allow_split_overlap=True,
+            path,
+            require_lyrics=False,
+            allow_split_overlap=True,
         )
         sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
         if sizes and sizes != {data["lines_per_window"]}:
@@ -95,8 +97,15 @@ def plan_pretraining_splits(data, files, requested):
             ncc = float(info.get("scores", {}).get("NCC", 0.0))
             if not math.isfinite(ncc) or ncc < data["min_ncc"]:
                 continue
-        except (OSError, EOFError, pickle.UnpicklingError, KeyError, TypeError,
-                ValueError, AttributeError) as exc:
+        except (
+            OSError,
+            EOFError,
+            pickle.UnpicklingError,
+            KeyError,
+            TypeError,
+            ValueError,
+            AttributeError,
+        ) as exc:
             rejections.append({"file": str(filename), "reason": str(exc)})
             continue
         if song in songs:
@@ -110,26 +119,38 @@ def plan_pretraining_splits(data, files, requested):
         for song, group in groups.items()
     }
     before = pretraining_overlap_report(
-        {song: {**info, "split": random_splits[song]} for song, info in songs.items()}, upstream,
+        {song: {**info, "split": random_splits[song]} for song, info in songs.items()},
+        upstream,
     )
     splits = preserve_pretraining_splits(songs, random_splits, path, upstream=upstream)
     after = pretraining_overlap_report(
-        {song: {**info, "split": splits[song]} for song, info in songs.items()}, upstream,
+        {song: {**info, "split": splits[song]} for song, info in songs.items()},
+        upstream,
     )
     report = {
-        **after, "status": "passed" if path else "not_requested",
-        "manifest": str(Path(path).resolve()) if path else None, "sha256": upstream_hash,
+        **after,
+        "status": "passed" if path else "not_requested",
+        "manifest": str(Path(path).resolve()) if path else None,
+        "sha256": upstream_hash,
         "scope": "metadata_candidates_before_line_rejection",
-        "candidate_songs": len(songs), "metadata_rejections": rejections,
+        "candidate_songs": len(songs),
+        "metadata_rejections": rejections,
         "random_split_conflicts": before["conflicts"],
         "upstream_split_overlaps": before["upstream_split_overlaps"],
         "reassigned_songs": [
             {"song_id": song, "from": random_splits[song], "to": splits[song]}
-            for song in sorted(songs) if random_splits[song] != splits[song]
+            for song in sorted(songs)
+            if random_splits[song] != splits[song]
         ],
         "split_counts": dict(Counter(splits.values())),
-        "songs": {song: {"random_split": random_splits[song], "split": splits[song],
-                         "group": groups[song]} for song in sorted(songs)},
+        "songs": {
+            song: {
+                "random_split": random_splits[song],
+                "split": splits[song],
+                "group": groups[song],
+            }
+            for song in sorted(songs)
+        },
     }
     return splits, groups, upstream, report
 
@@ -143,6 +164,11 @@ def prepare(config, *, limit=None, check_splits=False):
         raise ValueError("max_syllables and limit must be positive")
     if data["stress_source"] not in ("ipa", "lexical", "unknown"):
         raise ValueError("stress_source must be ipa, lexical or unknown")
+    prosody_mode = data.get("prosody_mode", "paper")
+    if prosody_mode not in ("paper", "actual"):
+        raise ValueError("data.prosody_mode must be paper or actual")
+    if prosody_mode == "actual" and data["stress_source"] != "ipa":
+        raise ValueError("Repo prosody preparation requires stress_source: ipa")
     requested, selection_hash = None, None
     if data.get("song_ids_file"):
         selection = Path(data["song_ids_file"]).read_bytes()
@@ -161,7 +187,9 @@ def prepare(config, *, limit=None, check_splits=False):
     planned_splits, planned_groups, upstream, preflight = None, None, None, None
     if check_splits or (data.get("include_melody") and data.get("pretraining_manifest")):
         planned_splits, planned_groups, upstream, preflight = plan_pretraining_splits(
-            data, files, requested,
+            data,
+            files,
+            requested,
         )
         output.mkdir(parents=True, exist_ok=True)
         report_path = output / "split_preflight.json"
@@ -178,6 +206,10 @@ def prepare(config, *, limit=None, check_splits=False):
         from .ipa import backend
 
         backend()  # Only initialize expensive pronunciation after split validation.
+        if prosody_mode == "actual":
+            from .ipa import _historical_lexicon, historical_provenance
+
+            _historical_lexicon()
     output.mkdir(parents=True, exist_ok=True)
     songs, counts = {}, Counter()
     with TemporaryDirectory(prefix=".prepare-", dir=output) as staging, ExitStack() as stack:
@@ -208,6 +240,7 @@ def prepare(config, *, limit=None, check_splits=False):
                     annot,
                     max_syllables=data["max_syllables"],
                     stress_source=data["stress_source"],
+                    **({"prosody_mode": "actual"} if prosody_mode == "actual" else {}),
                 )
                 for rejection in rejected:
                     rejects.write(json.dumps(rejection) + "\n")
@@ -269,7 +302,8 @@ def prepare(config, *, limit=None, check_splits=False):
                 raise ValueError("Pretraining manifest changed during preparation")
             split_audit = audit_pretraining_splits(
                 {key: {**info, "split": splits[key]} for key, info in songs.items()},
-                data["pretraining_manifest"], upstream=upstream,
+                data["pretraining_manifest"],
+                upstream=upstream,
             )
         handles = {
             split: stack.enter_context((staging / f"{split}.jsonl").open("w", encoding="utf-8"))
@@ -291,8 +325,22 @@ def prepare(config, *, limit=None, check_splits=False):
                 {
                     "package": "prosodic",
                     "version": version("prosodic"),
-                    "wordform": "first",
-                    "rules": "ipa_binary_stress_diphthong_length_v2",
+                    "wordform": "historical_dictionary_first_with_modern_fallback"
+                    if prosody_mode == "actual"
+                    else "first",
+                    "rules": (
+                        "ipa_repo_secondary_longmark_historical_v1"
+                        if prosody_mode == "actual"
+                        else "ipa_binary_stress_diphthong_length_v2"
+                    ),
+                    **(
+                        {
+                            "pronunciation_policy": "prosodic_1_5_dictionary_first",
+                            "historical_dictionary": historical_provenance(),
+                        }
+                        if prosody_mode == "actual"
+                        else {}
+                    ),
                 }
                 if data["stress_source"] == "ipa"
                 else None
@@ -308,7 +356,8 @@ def prepare(config, *, limit=None, check_splits=False):
             "counts": dict(counts),
             "songs": {
                 song_id: {
-                    "split": splits[song_id], "group": groups[song_id],
+                    "split": splits[song_id],
+                    "group": groups[song_id],
                     "identity": {
                         "artist": songs[song_id].get("artist", ""),
                         "title": songs[song_id].get("title", ""),
@@ -335,8 +384,11 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--limit", type=int, help="Scan only the first N files for a smoke test")
     parser.add_argument("--song-ids-file", help="Text file containing one exact DALI ID per line")
-    parser.add_argument("--check-splits", action="store_true",
-                        help="Write split_preflight.json from metadata; do not extract notes/IPA")
+    parser.add_argument(
+        "--check-splits",
+        action="store_true",
+        help="Write split_preflight.json from metadata; do not extract notes/IPA",
+    )
     parser.add_argument(
         "--english-only", action="store_true", help="Exclude other/unknown languages"
     )

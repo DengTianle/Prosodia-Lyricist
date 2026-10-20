@@ -167,8 +167,7 @@ def aligned_words(words, notes_by_word, line_start, line_end):
         word_text = normalize_text(raw_text) if isinstance(raw_text, str) else ""
         if not word_text:
             if not notes or not all(
-                (text := normalize_text(n.get("text", ""))) and not text.strip("~")
-                for n in notes
+                (text := normalize_text(n.get("text", ""))) and not text.strip("~") for n in notes
             ):
                 raise AnnotationError("Empty word text")
             if not aligned:
@@ -179,7 +178,7 @@ def aligned_words(words, notes_by_word, line_start, line_end):
     return aligned
 
 
-def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
+def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical", prosody_mode="paper"):
     """Return usable line records and explicit rejection reasons.
 
     Parent indices, not timestamp proximity or paragraph ids, define membership.
@@ -222,12 +221,24 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical"):
                 from .ipa import parse_words
 
                 try:
-                    parsed = parse_words(" ".join(text))
+                    parsed = parse_words(
+                        " ".join(text),
+                        **({"prosody_mode": "actual"} if prosody_mode == "actual" else {}),
+                    )
                 except ValueError as exc:
                     raise AnnotationError(str(exc)) from exc
                 syllables = [s for word in parsed for s in word["syllables"]]
                 scaffold_words = [
-                    {"text": w["text"], "syllable_count": len(w["syllables"])} for w in parsed
+                    {
+                        "text": w["text"],
+                        "syllable_count": len(w["syllables"]),
+                        **(
+                            {"pronunciation_source": w["pronunciation_source"]}
+                            if "pronunciation_source" in w
+                            else {}
+                        ),
+                    }
+                    for w in parsed
                 ]
                 text = [w["text"] for w in parsed]
             if not 1 <= len(syllables) <= max_syllables:

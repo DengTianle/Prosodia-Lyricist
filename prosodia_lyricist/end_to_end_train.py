@@ -20,6 +20,7 @@ from .data import read_manifest
 from .end_to_end_data import EndToEndCollator, EndToEndDataset
 from .end_to_end_model import EndToEndProsody
 from .features import token_id
+from .ipa import REPO_STRESSES
 from .melody_checkpoint import file_sha256, load_contrastive_melody
 from .model import ProsodyBart
 from .runtime import log_stage, seed_everything, select_device
@@ -104,10 +105,14 @@ def run_epoch(
                     events = batch["syllable_labels"].gt(0)
                     for name, key in zip(
                         word_correct,
-                        ("syllable_labels", "stress_labels", "length_labels"), strict=True
+                        ("syllable_labels", "stress_labels", "length_labels"),
+                        strict=True,
                     ):
                         word_correct[name] += int(
-                            output.prosody_logits[name].argmax(-1)[events].eq(batch[key][events]).sum()
+                            output.prosody_logits[name]
+                            .argmax(-1)[events]
+                            .eq(batch[key][events])
+                            .sum()
                         )
                     word_events += int(events.sum())
                 tokens += n
@@ -141,10 +146,17 @@ def run_epoch(
             name: n / anchor_slots if anchor_slots else None for name, n in correct.items()
         },
         "bridge_compared_slots": anchor_slots,
-        **({"teacher_forced_word_event_accuracy": {
-            name: n / word_events if word_events else None for name, n in word_correct.items()
-        },
-        "word_events": word_events} if model.decoder_mode == "explainable" else {}),
+        **(
+            {
+                "teacher_forced_word_event_accuracy": {
+                    name: n / word_events if word_events else None
+                    for name, n in word_correct.items()
+                },
+                "word_events": word_events,
+            }
+            if model.decoder_mode == "explainable"
+            else {}
+        ),
     }
 
 
@@ -155,12 +167,17 @@ def build_model(config, *, local_files_only=False):
         raise ValueError("Set model.template_checkpoint to the pretrained lyric checkpoint")
     checkpoint = Path(checkpoint)
     with log_stage("Loading pretrained template decoder: %s", checkpoint):
-        xai = (cfg.get("decoder_mode") == "xai" or checkpoint.is_file()
-               or (checkpoint / "xai.json").exists())
+        xai = (
+            cfg.get("decoder_mode") == "xai"
+            or checkpoint.is_file()
+            or (checkpoint / "xai.json").exists()
+        )
         if xai:
             template, tokenizer = load_template(
-                checkpoint, tokenizer_dir=cfg.get("xai_tokenizer_dir"),
-                bart_config=cfg.get("xai_bart_config"), cache_dir=cfg.get("xai_cache_dir"),
+                checkpoint,
+                tokenizer_dir=cfg.get("xai_tokenizer_dir"),
+                bart_config=cfg.get("xai_bart_config"),
+                cache_dir=cfg.get("xai_cache_dir"),
                 local_files_only=local_files_only or cfg.get("local_files_only", False),
                 max_syllables=data["max_syllables"],
             )
@@ -169,9 +186,10 @@ def build_model(config, *, local_files_only=False):
             tokenizer = AutoTokenizer.from_pretrained(
                 checkpoint / "tokenizer", local_files_only=True
             )
-        if not isinstance(template, (ProsodyBart, XAILyricist)) or (
-            checkpoint / "melody.json"
-        ).exists():
+        if (
+            not isinstance(template, (ProsodyBart, XAILyricist))
+            or (checkpoint / "melody.json").exists()
+        ):
             raise ValueError(
                 "Use a template-only XAI or explainable checkpoint, not a legacy/direct model"
             )
@@ -209,6 +227,9 @@ def build_model(config, *, local_files_only=False):
         melody_config,
         bridge_scope="song",
         query_mode="parallel",
+        strength_labels=REPO_STRESSES
+        if data.get("prosody_mode") == "actual"
+        else ("strong", "weak"),
         max_syllables=data["max_syllables"],
         encoder_lines_per_window=encoder_lines,
         max_window_notes=cfg.get("max_window_notes", 512),
@@ -226,11 +247,13 @@ def build_model(config, *, local_files_only=False):
     model = EndToEndProsody(
         bridge,
         template,
-        stress_token_ids=[token_id(tokenizer, f"<{s}>") for s in ("strong", "weak")],
+        stress_token_ids=[token_id(tokenizer, f"<{s}>") for s in bridge.strength_labels],
         temperature=cfg.get("temperature", 1.0),
         anchor_weight=settings.get("bridge_anchor_weight", 0),
-        loss_weights={**dict.fromkeys(template.loss_weights, 1.0),
-                      **(settings.get("loss_weights") or {})},
+        loss_weights={
+            **dict.fromkeys(template.loss_weights, 1.0),
+            **(settings.get("loss_weights") or {}),
+        },
         provenance={
             "template_checkpoint": str(checkpoint.resolve()),
             "template_weights_sha256": file_sha256(

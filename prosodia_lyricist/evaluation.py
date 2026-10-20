@@ -16,6 +16,18 @@ from . import ipa
 # English diphthongs, including common rhotic/centering transcription variants.
 DIPHTHONGS = ("eɪ", "aɪ", "ɔɪ", "oʊ", "əʊ", "aʊ", "ɪə", "eə", "ɛə", "ʊə")
 METRIC_VERSION = "xai-paper-reconstruction-v1"
+ACTUAL_METRIC_VERSION = "xai-actual-repo-rules-v2"
+PROSODY_MODES = ipa.PROSODY_MODES
+
+
+def syllable_prosody(syllable, *, prosody_mode="paper"):
+    if prosody_mode not in PROSODY_MODES:
+        raise ValueError(f"prosody_mode must be one of {PROSODY_MODES}")
+    return (
+        ipa.repo_syllable_features(syllable["ipa"])
+        if prosody_mode == "actual"
+        else paper_syllable(syllable)
+    )
 
 
 def paper_syllable(syllable):
@@ -30,12 +42,22 @@ def paper_syllable(syllable):
     }
 
 
-def text_prosody(text):
+def text_prosody(text, *, prosody_mode="paper"):
     if not text.strip():
         return []
     return [
-        {**paper_syllable(syllable), "word": word["text"]}
-        for word in ipa.parse_words(text)
+        {
+            **syllable_prosody(syllable, prosody_mode=prosody_mode),
+            "word": word["text"],
+            **(
+                {"pronunciation_source": word["pronunciation_source"]}
+                if "pronunciation_source" in word
+                else {}
+            ),
+        }
+        for word in ipa.parse_words(
+            text, **({"prosody_mode": "actual"} if prosody_mode == "actual" else {})
+        )
         for syllable in word["syllables"]
     ]
 
@@ -83,21 +105,32 @@ def bleu_diagnostics(reference, hypothesis):
     return counts
 
 
-def evaluate_prosody(records, lyrics):
+def evaluate_prosody(records, lyrics, *, prosody_mode="paper"):
     """Pair by phrase order; missing/extra/unpronounceable phrases score zero."""
+    if prosody_mode not in PROSODY_MODES:
+        raise ValueError(f"prosody_mode must be one of {PROSODY_MODES}")
     phrases = []
     for index in range(max(len(records), len(lyrics))):
         source = records[index]["syllables"] if index < len(records) else []
         text = lyrics[index] if index < len(lyrics) else ""
         error = None
         try:
-            generated = text_prosody(text) if text.strip() else []
+            generated = (
+                text_prosody(
+                    text, **({"prosody_mode": "actual"} if prosody_mode == "actual" else {})
+                )
+                if text.strip()
+                else []
+            )
         except ValueError as exc:
             # Do not silently drop bad samples. Environment/resource failures
             # (RuntimeError) still abort, so a broken installation is not scored.
             generated = None
             error = str(exc)
-        supported = all(s["stress"] in ("strong", "weak") for s in source)
+        supported = all(
+            s["stress"] in (ipa.REPO_STRESSES if prosody_mode == "actual" else ("strong", "weak"))
+            for s in source
+        )
         score = prosody_bleu(source, generated or []) if supported else None
         phrases.append(
             {
@@ -109,6 +142,13 @@ def evaluate_prosody(records, lyrics):
                 "generated_count": None if generated is None else len(generated),
                 "prosody_bleu": score,
                 "bleu_ngram_counts": bleu_diagnostics(source, generated or []),
+                "pronunciation_fallback_words": sorted(
+                    {
+                        s["word"]
+                        for s in generated or []
+                        if s.get("pronunciation_source") == ipa.FALLBACK_SOURCE
+                    }
+                ),
                 "error": error or (None if supported else "Input stress is unknown"),
                 "status": (
                     "extra" if not source else "missing" if index >= len(lyrics) else "paired"
@@ -117,7 +157,8 @@ def evaluate_prosody(records, lyrics):
         )
     scores = [phrase["prosody_bleu"] for phrase in phrases]
     return {
-        "version": METRIC_VERSION,
+        "version": ACTUAL_METRIC_VERSION if prosody_mode == "actual" else METRIC_VERSION,
+        "prosody_mode": prosody_mode,
         "prosody_bleu": (
             sum(scores) / len(scores) if scores and all(s is not None for s in scores) else None
         ),
@@ -189,8 +230,11 @@ def conditional_perplexity(model, inputs, labels, tokenizer, *, prosody_labels=N
         decoder_mask = torch.ones_like(labels)
         decoder_mask[:, 1:] = labels[:, :-1].ne(-100)
         output = model.bart(
-            inputs_embeds=(inputs["inputs_embeds"] if "inputs_embeds" in inputs else
-                           model.embed_source(inputs["input_ids"], inputs["length_ids"])),
+            inputs_embeds=(
+                inputs["inputs_embeds"]
+                if "inputs_embeds" in inputs
+                else model.embed_source(inputs["input_ids"], inputs["length_ids"])
+            ),
             attention_mask=inputs["attention_mask"],
             decoder_inputs_embeds=model.embed_target(
                 decoder_ids, *(model.shift_features(p) for p in prosody_labels)
@@ -203,9 +247,12 @@ def conditional_perplexity(model, inputs, labels, tokenizer, *, prosody_labels=N
         if prosody_labels is not None:
             raise ValueError("The XAI checkpoint accepts only a lyric stream")
         output = model(
-            input_ids=inputs["input_ids"], length_ids=inputs["length_ids"],
-            remainder_ids=inputs["remainder_ids"], attention_mask=inputs["attention_mask"],
-            inputs_embeds=inputs.get("inputs_embeds"), labels=labels,
+            input_ids=inputs["input_ids"],
+            length_ids=inputs["length_ids"],
+            remainder_ids=inputs["remainder_ids"],
+            attention_mask=inputs["attention_mask"],
+            inputs_embeds=inputs.get("inputs_embeds"),
+            labels=labels,
         )
     else:
         if prosody_labels is not None:

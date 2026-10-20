@@ -4,12 +4,12 @@ from collections import Counter
 
 import numpy as np
 
-from .bridge_data import decode_bridge_tokens
+from .bridge_data import PAIRS, decode_bridge_tokens
 
 SCOPES = ("global", "song", "window", "line")
 
 
-def evaluate_duration_baselines(examples, *, lines_per_window, generation=None):
+def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, pairs=PAIRS):
     """Compare raw note duration to arithmetic means, without inspecting target labels.
 
     Like bridge generation, the comparison uses known IPA counts. Notes and slots
@@ -37,7 +37,7 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None):
             "line": line_means[line_ids],
         }
         predictions = {scope: durations > threshold for scope, threshold in thresholds.items()}
-        for index, line in enumerate(decode_bridge_tokens(example["labels"])):
+        for index, line in enumerate(decode_bridge_tokens(example["labels"], pairs=pairs)):
             truth = np.asarray([s["length"] == "long" for s in line["syllables"]])
             note_mask = line_ids == index
             note_count = int(note_mask.sum())

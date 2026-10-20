@@ -6,7 +6,8 @@ from pathlib import Path
 from transformers import AutoTokenizer
 
 from .legacy_features import SOURCE_KEYS as SOURCE_KEYS
-from .legacy_features import encode_source, record_lines
+from .legacy_features import encode_source as encode_legacy_source
+from .legacy_features import record_lines
 
 logger = logging.getLogger(__name__)
 TARGET_KEYS = ("labels",)
@@ -20,6 +21,11 @@ REFERENCE_TOKEN_IDS = {
     "<substrong>": 50320,
     "<weak>": 50321,
 }
+
+
+def encode_source(record, tokenizer, max_syllables):
+    """The released MIDI and binary inputs omit both keyword markers and text."""
+    return encode_legacy_source(record, tokenizer, max_syllables, include_keywords=False)
 
 
 def load_tokenizer(directory=None, *, cache_dir=None, local_files_only=False):
@@ -92,6 +98,14 @@ def validate_tokenizer(tokenizer, model):
 
     if len(tokenizer) != model.bart.config.vocab_size:
         raise ValueError("XAI tokenizer and checkpoint vocabulary sizes differ")
+    if len(tokenizer) == REFERENCE_VOCAB_SIZE and any(
+        tokenizer.convert_tokens_to_ids(token) != expected
+        for token, expected in {
+            **REFERENCE_TOKEN_IDS,
+            **{f"<syllable_{n}>": 50266 + n for n in range(1, model.max_syllables + 1)},
+        }.items()
+    ):
+        raise ValueError("XAI source token IDs differ from the checkpoint recovery profile")
     for token in (
         *REFERENCE_TOKEN_IDS,
         *(f"<syllable_{n}>" for n in range(1, model.max_syllables + 1)),

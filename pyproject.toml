@@ -32,6 +32,9 @@ prosodia-end-to-end-eval = "prosodia_lyricist.end_to_end_eval:main"
 [tool.setuptools.packages.find]
 include = ["prosodia_lyricist*"]
 
+[tool.setuptools.package-data]
+prosodia_lyricist = ["resources/prosodic_1_5/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

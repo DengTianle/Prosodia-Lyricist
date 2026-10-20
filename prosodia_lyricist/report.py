@@ -10,6 +10,7 @@ def pattern(syllables):
 
 def markdown_report(report):
     learned = report["stress_source"] == "learned"
+    actual = report.get("prosody_mode") == "actual"
     count_sources = report.get("bridge", {}).get("count_sources", [])
     note_slots = learned and bool(count_sources) and all(s == "notes" for s in count_sources)
 
@@ -49,6 +50,8 @@ def markdown_report(report):
         rows.append(f"- Checkpoint: `{report['checkpoint']}`")
         if report.get("decoder_mode"):
             rows.append(f"- Decoder: `{report['decoder_mode']}`")
+    if actual:
+        rows.append("- IPA: repo stress/length rules; Prosodic 1.5 dictionary-first pronunciation.")
     generation = report.get("generation", {})
     if "no_repeat_ngram_size" in generation:
         rows.append(
@@ -117,6 +120,9 @@ def markdown_report(report):
                         + f"{len(source['melody']['midi_pitches'])} notes; "
                         "length labels describe IPA vowels."
                         if learned
+                        else "Long means duration > its eight-quarter onset-bucket mean; "
+                        "thresholds are listed per note."
+                        if source.get("length_rule") == "onset_bucket_8_quarters"
                         else f"Long means duration > {source['length_threshold_ticks']:.3f} ticks."
                     ),
                     "",
@@ -129,7 +135,13 @@ def markdown_report(report):
         if learned and comparison and index < len(comparison["lines"]):
             musical = comparison["lines"][index]
             rows.extend(["", "### MIDI notes and beat-based comparison", ""])
-            if comparison["method"]:
+            repo_comparison = comparison["method"] == "actual"
+            if repo_comparison:
+                rows.append(
+                    "Repo getProsody() floor stress and eight-quarter onset-bucket duration means. "
+                    "Comparison only; these labels do not enter the learned conditioner."
+                )
+            elif comparison["method"]:
                 rows.append(
                     "Old `supplement` formula: duration-dependent beat stress; "
                     f"long means duration > {musical['length_threshold_ticks']:.3f} ticks "
@@ -143,8 +155,9 @@ def markdown_report(report):
                     "",
                     "Notes are listed in MIDI order, independently of predicted syllable slots.",
                     "",
-                    "| Note # | Note | Start–end ticks | Bar:beat | Beat-based prosody |",
-                    "| --- | --- | --- | --- | --- |",
+                    "| Note # | Note | Start–end ticks | Bar:beat | Beat-based prosody |"
+                    + (" Length threshold (ticks) |" if repo_comparison else ""),
+                    "| --- | --- | --- | --- | --- |" + (" --- |" if repo_comparison else ""),
                 ]
             )
             for note_index, label in enumerate(musical["syllables"], 1):
@@ -161,6 +174,8 @@ def markdown_report(report):
                     position,
                     pattern([label]) if comparison["method"] else "—",
                 ]
+                if repo_comparison:
+                    cells.append(f"{note['length_threshold_ticks']:.3f}")
                 rows.append("| " + " | ".join(escaped(c) for c in cells) + " |")
         if entry:
             rows.extend(
@@ -176,6 +191,11 @@ def markdown_report(report):
                 rows.append(f"**Scoring issue:** {escaped(entry['error'])}")
             else:
                 rows.extend(["", f"`{pattern(entry['generated_syllables'])}`"])
+            if entry.get("pronunciation_fallback_words"):
+                rows.append(
+                    "Historical dictionary misses (modern fallback): "
+                    + ", ".join(escaped(w) for w in entry["pronunciation_fallback_words"])
+                )
             if entry.get("bleu_ngram_counts"):
                 counts = ", ".join(
                     f"{c['order']}-gram {c['matched']}/{c['total']}"
@@ -205,6 +225,7 @@ def markdown_report(report):
                     else "| Slot | Note | Start–end ticks | Bar:beat | "
                     "Input | Word / IPA | Output |"
                 )
+                + (" Length threshold (ticks) |" if actual and not learned else "")
                 + (
                     " Ground-truth word / IPA | Ground-truth prosody |" if reference_columns else ""
                 ),
@@ -213,6 +234,7 @@ def markdown_report(report):
                     if learned
                     else "| --- | --- | --- | --- | --- | --- | --- |"
                 )
+                + (" --- |" if actual and not learned else "")
                 + (" --- | --- |" if reference_columns else ""),
             ]
         )
@@ -237,6 +259,8 @@ def markdown_report(report):
                 f"{out['word']} / {out['ipa']}" if out else "—",
                 pattern([out]) if out else "—",
             ]
+            if actual and not learned:
+                cells.append(f"{note['length_threshold_ticks']:.3f}" if note else "—")
             if reference_columns:
                 truth = reference[slot] if slot < len(reference) else None
                 cells.extend(

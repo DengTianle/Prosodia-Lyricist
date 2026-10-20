@@ -166,6 +166,30 @@ def test_lyric_targets_do_not_require_prosody_labels(record, tokenizer):
     assert encode_targets(changed, tokenizer) == first
 
 
+def test_generation_stops_on_bos_like_reference_tokenizer_membership(xai_model, record, tokenizer):
+    from transformers import LogitsProcessor
+
+    class ForceBOS(LogitsProcessor):
+        def __call__(self, input_ids, scores):
+            scores.fill_(-torch.inf)
+            scores[:, tokenizer.bos_token_id] = 0
+            return scores
+
+    model = xai_model.eval()
+    batch = ProsodyCollator(tokenizer.pad_token_id)([encode_example(record, tokenizer, 8)])
+    generated = model.generate(
+        **{k: v for k, v in batch.items() if k != "labels"},
+        tokenizer=tokenizer,
+        logits_processor=[ForceBOS()],
+        max_new_tokens=5,
+        do_sample=False,
+    )
+    assert generated.sequences.tolist() == [[tokenizer.bos_token_id, tokenizer.bos_token_id]]
+    assert generated.explanations[0]["completed"]
+    assert generated.explanations[0]["stop_reason"] == "bos"
+    assert not generated.explanations[0]["hit_token_limit"]
+
+
 def test_recovery_keeps_exact_observed_ids_and_records_assumptions(tokenizer, monkeypatch):
     # Test all 50,322 IDs without a network dependency or arbitrary ID offsets.
     import prosodia_lyricist.xai_features as features

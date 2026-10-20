@@ -1,7 +1,7 @@
-# Reuse prepared bridge songs. All paths are relative to this YAML.
+# Prepare repo-compatible IPA songs separately. Paths are relative to this YAML.
 data:
   dali_dir: ../../DALI_v2
-  prepared_dir: ../data/dali-bridge
+  prepared_dir: ../data/dali-xai
   language: english
   song_ids_file: null
   min_ncc: 0.0
@@ -10,6 +10,7 @@ data:
   test_fraction: 0.1
   seed: 1234
   stress_source: ipa
+  prosody_mode: actual # Repo stress/length rules and historical dictionary-first pronunciation.
   include_melody: true
   pretraining_manifest: ../../try-contrastive/data/max_en_2line_16s/segments_manifest.csv
   lines_per_window: 2
@@ -30,7 +31,7 @@ model:
   max_song_notes: 2048
   max_song_lines: 256
   max_bridge_length: 4096 # Structural line prefixes plus syllable queries.
-  max_source_length: 1024 # Includes title/keywords and source template slots.
+  max_source_length: 1024 # Includes title/count/template/period and source slots; no keywords.
   max_target_length: 1024 # Plain lyric BPE targets, with EOS and no word_end events.
   song_encoder_layers: 2
   slot_encoder:
@@ -42,8 +43,8 @@ model:
   temperature: 1.0 # Same soft probabilities at training and inference.
 
 training:
-  # Audit the NEW contrastive CSV while reusing prepared data. Use strict after
-  # preparing with that unchanged CSV; warning records unresolved overlap checks.
+  # Use strict after preparing with the unchanged contrastive CSV;
+  # warning records unavailable or unresolved overlap checks.
   pretraining_audit_mode: warning
   output_dir: ../checkpoints/end-to-end-xai
   device: cuda

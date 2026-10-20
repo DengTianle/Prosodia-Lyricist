@@ -42,7 +42,8 @@ class XAILyricist(nn.Module):
         self.bart.config.decoder_start_token_id = self.bart.config.bos_token_id
         self.bart.generation_config = GenerationConfig(
             bos_token_id=bart.config.bos_token_id,
-            eos_token_id=bart.config.eos_token_id,
+            # Reference infer checks tokenizer.encode('</s>'), containing BOS and EOS.
+            eos_token_id=[bart.config.bos_token_id, bart.config.eos_token_id],
             pad_token_id=bart.config.pad_token_id,
             decoder_start_token_id=bart.config.bos_token_id,
             num_beams=1,
@@ -116,14 +117,28 @@ class XAILyricist(nn.Module):
         explanations = []
         for row in tokens:
             text = tokenizer.decode(row, skip_special_tokens=True)
-            completed = bool(row[1:].eq(self.bart.config.eos_token_id).any())
+            terminals = row[1:][
+                (row[1:] == self.bart.config.eos_token_id)
+                | (row[1:] == self.bart.config.bos_token_id)
+            ]
+            completed = bool(len(terminals))
+            hit_limit = not completed and len(row) - 1 >= max_new_tokens
             explanations.append(
                 dict(
                     decoder_mode="xai_single_stream",
                     text=text,
                     lines=[s.strip() for s in text.split(".") if s.strip()],
                     completed=completed,
-                    hit_token_limit=not completed,
+                    hit_token_limit=hit_limit,
+                    stop_reason=(
+                        "bos"
+                        if completed and terminals[0] == self.bart.config.bos_token_id
+                        else "eos"
+                        if completed
+                        else "token_limit"
+                        if hit_limit
+                        else "custom_stop"
+                    ),
                 )
             )
         return SimpleNamespace(sequences=tokens, explanations=explanations)
@@ -161,6 +176,7 @@ class XAILyricist(nn.Module):
         model.bart.generation_config = GenerationConfig.from_pretrained(
             directory, local_files_only=True
         )
+        model.bart.generation_config.eos_token_id = [config.bos_token_id, config.eos_token_id]
         model.load_state_dict(
             torch.load(directory / "weights.pt", map_location="cpu", weights_only=True), strict=True
         )
@@ -268,6 +284,8 @@ def load_template(
 
     checkpoint = Path(checkpoint)
     if checkpoint.is_dir():
+        if tokenizer_dir is not None or bart_config is not None:
+            raise ValueError("Tokenizer/config overrides require an original XAI checkpoint file")
         model = XAILyricist.load(checkpoint)
         tokenizer = AutoTokenizer.from_pretrained(checkpoint / "tokenizer", local_files_only=True)
     else:

@@ -1,15 +1,18 @@
 """4/4 MIDI templates; explicit supplement conventions are in docs/evaluation.md."""
 
 import math
+from collections import defaultdict
 
 from .dali import normalize_text
 
 
-def midi_melody_record(path, *, track=0, title=""):
+def midi_melody_record(path, *, track=0, title="", phrase_policy="complete"):
     """Raw melody notes in seconds, with phrase ends and no inferred prosody labels."""
     import miditoolkit
 
     midi = miditoolkit.MidiFile(str(path))
+    if phrase_policy not in ("complete", "repo"):
+        raise ValueError("Unknown MIDI phrase policy")
     if not 0 <= track < len(midi.instruments):
         raise ValueError("MIDI melody track is out of range")
     instrument = midi.instruments[track]
@@ -24,7 +27,7 @@ def midi_melody_record(path, *, track=0, title=""):
     if not boundaries:
         raise ValueError("MIDI needs phrase-end markers matching training lyric lines")
     final_marker = boundaries[-1]
-    if boundaries[-1] < notes[-1].end:
+    if phrase_policy == "complete" and boundaries[-1] < notes[-1].end:
         boundaries.append(notes[-1].end)
     times = midi.get_tick_to_time_mapping()
     lines, cursor = [], 0
@@ -47,12 +50,21 @@ def midi_melody_record(path, *, track=0, title=""):
                     },
                 }
             )
-    return {"title": normalize_text(title), "lines": lines}
+    return {
+        "title": normalize_text(title),
+        "lines": lines,
+        "unmarked_notes_omitted": len(notes) - cursor,
+    }
 
 
 def metric_stress(start, duration, resolution):
     """Original project's duration-dependent 4-beat heuristic (not observed beats)."""
-    durations = {resolution * factor for factor in (1, 0.5, 0.25, 0.125, 0.0625, 2, 4)}
+    durations = {
+        resolution,
+        *(resolution // n for n in (2, 4, 8, 16)),
+        2 * resolution,
+        4 * resolution,
+    }
     unit = 4 * duration if duration in durations else 4 * resolution
     beat = int((start % unit) // (unit / 4))
     return "strong" if beat in (0, 2) else "weak"
@@ -75,8 +87,8 @@ def supplement_stress(start, duration, resolution):
 def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="supplement"):
     import miditoolkit
 
-    if stress_source not in ("supplement", "heuristic", "unknown"):
-        raise ValueError("MIDI stress_source must be supplement, heuristic or unknown")
+    if stress_source not in ("supplement", "actual", "heuristic", "unknown"):
+        raise ValueError("MIDI stress_source must be supplement, actual, heuristic or unknown")
     midi = miditoolkit.MidiFile(str(path))
     if stress_source == "supplement" and any(
         (sig.numerator, sig.denominator) != (4, 4) for sig in midi.time_signature_changes
@@ -95,7 +107,7 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
     if not boundaries:
         raise ValueError("MIDI needs phrase-end markers; see examples/imagine.mid")
     final_marker = boundaries[-1]
-    if boundaries[-1] < notes[-1].end:
+    if stress_source != "actual" and boundaries[-1] < notes[-1].end:
         boundaries.append(notes[-1].end)
     groups, current, cursor = [], [], 0
     # Phrase-end markers include notes starting exactly at the marker, matching the old pipeline.
@@ -108,6 +120,10 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
             groups.append(current)
     records = []
     melody_mean = sum(note.end - note.start for note in notes) / len(notes)
+    buckets = defaultdict(list)
+    for note in notes:
+        buckets[note.start // (8 * midi.ticks_per_beat)].append(note.end - note.start)
+    bucket_means = {bucket: sum(values) / len(values) for bucket, values in buckets.items()}
     for index, group in enumerate(groups):
         if len(group) > max_syllables:
             raise ValueError(
@@ -121,12 +137,18 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
             else sum(note.end - note.start for note in group) / len(group)
         )
         strength = supplement_stress if stress_source == "supplement" else metric_stress
+        thresholds = [
+            bucket_means[note.start // (8 * midi.ticks_per_beat)]
+            if stress_source == "actual"
+            else mean_duration
+            for note in group
+        ]
         syllables = [
             {
                 "stress": strength(note.start, note.end - note.start, midi.ticks_per_beat)
                 if stress_source != "unknown"
                 else "unknown",
-                "length": "long" if note.end - note.start > mean_duration else "short",
+                "length": "long" if note.end - note.start > threshold else "short",
                 "note": {
                     "pitch": note.pitch,
                     "start_tick": note.start,
@@ -135,9 +157,10 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
                     "measure": note.start // (4 * midi.ticks_per_beat) + 1,
                     "quarter_beat": (note.start % (4 * midi.ticks_per_beat)) / midi.ticks_per_beat
                     + 1,
+                    **({"length_threshold_ticks": threshold} if stress_source == "actual" else {}),
                 },
             }
-            for note in group
+            for note, threshold in zip(group, thresholds, strict=True)
         ]
         records.append(
             {
@@ -145,17 +168,30 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
                 "title": normalize_text(title),
                 "syllables": syllables,
                 "ticks_per_beat": midi.ticks_per_beat,
-                "length_threshold_ticks": mean_duration,
+                "length_threshold_ticks": thresholds[0] if len(set(thresholds)) == 1 else None,
+                "length_rule": (
+                    "onset_bucket_8_quarters"
+                    if stress_source == "actual"
+                    else "melody_mean"
+                    if stress_source == "supplement"
+                    else "phrase_mean"
+                ),
+                "stress_grid_ticks_per_beat": midi.ticks_per_beat,
                 "stress_source": stress_source,
                 "meter": "4/4" if stress_source == "supplement" else "unchecked",
                 "meter_assumed": not bool(midi.time_signature_changes),
                 "unmarked_tail": group[0].start > final_marker,
+                **(
+                    {"unmarked_notes_omitted": len(notes) - cursor}
+                    if stress_source == "actual"
+                    else {}
+                ),
             }
         )
     return records
 
 
-def midi_note_comparison(path, *, title="", track=0):
+def midi_note_comparison(path, *, title="", track=0, prosody_mode="paper"):
     """Old musical templates for reporting only, independent of learned slot counts."""
     import miditoolkit
 
@@ -169,9 +205,13 @@ def midi_note_comparison(path, *, title="", track=0):
         track=track,
         # Reporting must retain all notes, even when a phrase exceeds the model's slot limit.
         max_syllables=max(1, sum(len(inst.notes) for inst in midi.instruments)),
-        stress_source="supplement" if supported else "unknown",
+        stress_source="actual"
+        if prosody_mode == "actual"
+        else "supplement"
+        if supported
+        else "unknown",
     )
-    if not supported:
+    if not supported and prosody_mode != "actual":
         # Preserve note timing without inventing 4/4 positions or unsupported musical labels.
         for record in records:
             record["length_threshold_ticks"] = None
@@ -181,10 +221,10 @@ def midi_note_comparison(path, *, title="", track=0):
                 syllable["note"]["measure"] = syllable["note"]["quarter_beat"] = None
     return {
         "role": "comparison_only",
-        "method": "supplement" if supported else None,
+        "method": "actual" if prosody_mode == "actual" else "supplement" if supported else None,
         "warning": (
             None
-            if supported
+            if supported or prosody_mode == "actual"
             else "Beat-based comparison and bar:beat positions are unavailable: "
             "the old formula supports only 4/4 MIDI. Raw note pitches and ticks are retained."
         ),

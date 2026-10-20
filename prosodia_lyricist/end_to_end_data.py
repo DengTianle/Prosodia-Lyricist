@@ -8,9 +8,10 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from .bridge_data import PAIRS, bridge_collate, encode_bridge_song
+from .bridge_data import bridge_collate, encode_bridge_song, prosody_pairs
 from .data import ProsodyCollator, read_manifest
 from .features import SOURCE_KEYS, TARGET_KEYS, encode_example, encode_source
+from .ipa import REPO_RULES, REPO_STRESSES
 from .melody_checkpoint import file_sha256
 
 logger = logging.getLogger(__name__)
@@ -66,10 +67,12 @@ def encode_song(
     count_source="ipa",
     with_targets=True,
     decoder_mode="explainable",
+    strength_labels=("strong", "weak"),
 ):
     if count_source not in ("ipa", "notes"):
         raise ValueError("count_source must be ipa or notes")
     lines = record["lines"]
+    pairs = prosody_pairs(strength_labels)
     counts = [
         len(line["syllables"]) if count_source == "ipa" else len(line["melody"]["midi_pitches"])
         for line in lines
@@ -99,7 +102,7 @@ def encode_song(
         for line, count in zip(lines, counts, strict=True):
             labels.append(-100)  # A structural prefix has no prosody label.
             if count == len(line["syllables"]):
-                labels.extend(PAIRS.index((s["stress"], s["length"])) for s in line["syllables"])
+                labels.extend(pairs.index((s["stress"], s["length"])) for s in line["syllables"])
             else:
                 # Note-count evaluation has no inferred note-to-syllable alignment.
                 labels.extend([-100] * count)
@@ -128,6 +131,8 @@ class EndToEndDataset(Dataset):
         count_source="ipa",
         limit=None,
         decoder_mode="explainable",
+        strength_labels=("strong", "weak"),
+        prosody_mode="paper",
     ):
         limits = (
             max_syllables,
@@ -147,6 +152,15 @@ class EndToEndDataset(Dataset):
             raise ValueError("count_source must be ipa or notes")
         manifest = read_manifest(directory)
         data = manifest["config"]
+        if data.get("prosody_mode", "paper") != prosody_mode:
+            raise ValueError("Prepared IPA rules differ from the model; prepare again")
+        if prosody_mode == "actual" and (
+            tuple(strength_labels) != REPO_STRESSES
+            or manifest.get("pronunciation", {}).get("rules") != REPO_RULES
+        ):
+            raise ValueError(
+                "Repo training requires historical pronunciation and three stress classes"
+            )
         if not data.get("include_melody") or data["stress_source"] != "ipa":
             raise ValueError("Prepare with include_melody: true and stress_source: ipa")
         if data["max_syllables"] != max_syllables or (
@@ -197,6 +211,7 @@ class EndToEndDataset(Dataset):
                         encoder_lines_per_window=encoder_lines_per_window,
                         count_source=count_source,
                         decoder_mode=decoder_mode,
+                        strength_labels=strength_labels,
                     )
                     over.update(
                         source_tokens=len(example["source"]["input_ids"]) > max_source_length,
@@ -236,8 +251,10 @@ class EndToEndCollator:
             raise ValueError("Cannot mix labeled and unlabeled joint examples")
         source = self.prosody(
             [
-                {**{key: value for key, value in e["source"].items() if key != "slot_indices"},
-                 **e.get("targets", {})}
+                {
+                    **{key: value for key, value in e["source"].items() if key != "slot_indices"},
+                    **e.get("targets", {}),
+                }
                 for e in examples
             ]
         )

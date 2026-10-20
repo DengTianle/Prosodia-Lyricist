@@ -12,7 +12,9 @@ from .midi import midi_melody_record
 def condition_midi(
     model, tokenizer, midi, *, title, track, device, max_source_length, template_mode="soft"
 ):
-    record = midi_melody_record(midi, title=title, track=track)
+    record = midi_melody_record(midi, title=title, track=track, **(
+        {"phrase_policy": "repo"} if model.prosody_mode == "actual" else {}
+    ))
     bridge = model.bridge
     if len(record["lines"]) > bridge.max_song_lines:
         raise ValueError("MIDI exceeds the checkpoint's phrase limit")
@@ -24,6 +26,7 @@ def condition_midi(
         count_source="notes",
         with_targets=False,
         decoder_mode=model.decoder_mode,
+        strength_labels=bridge.strength_labels,
     )
     if len(example["source"]["input_ids"]) > max_source_length:
         raise ValueError("MIDI exceeds the checkpoint's source token limit")
@@ -31,7 +34,7 @@ def condition_midi(
         k: v.to(device) for k, v in EndToEndCollator(tokenizer.pad_token_id)([example]).items()
     }
     source = model.condition_source(**condition_inputs(batch), template_mode=template_mode)
-    predictions = decode_bridge_tokens(source.sequences[0].tolist())
+    predictions = decode_bridge_tokens(source.sequences[0].tolist(), pairs=bridge.pairs)
     records = [
         {**line, **predicted, "line_id": index, "stress_source": "learned"}
         for index, (line, predicted) in enumerate(zip(record["lines"], predictions, strict=True))
@@ -41,6 +44,9 @@ def condition_midi(
         "conditioning": "parallel_soft_template",
         "mode": template_mode,
         "temperature": model.temperature,
+        "prosody_mode": model.prosody_mode,
+        "stress_labels": list(bridge.strength_labels),
+        "unmarked_notes_omitted": record.get("unmarked_notes_omitted", 0),
         "count_sources": ["notes"] * len(records),
         "note_counts": batch["syllable_counts"][0].tolist(),
         "syllable_counts": batch["syllable_counts"][0].tolist(),

@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 def read_manifest(directory):
     path = Path(directory) / "manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    if manifest["schema_version"] != SCHEMA_VERSION:
+    if manifest["schema_version"] not in (4, SCHEMA_VERSION):
         raise ValueError("Prepared data schema differs; run prosodia-prepare again")
     groups = {}
     for info in manifest["songs"].values():

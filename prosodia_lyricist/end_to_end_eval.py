@@ -65,7 +65,9 @@ def evaluate_generation(
                 raise
             error, lyrics = str(exc), []
             failed += 1
-        metrics = evaluate_prosody(example["reference_lines"], lyrics)
+        metrics = evaluate_prosody(example["reference_lines"], lyrics, **(
+            {"prosody_mode": "actual"} if model.prosody_mode == "actual" else {}
+        ))
         ipa_failures += metrics["pronunciation_failures"]
         for index, phrase in enumerate(metrics["phrases"]):
             reference, actual = phrase["input_syllables"], phrase["generated_syllables"] or []
@@ -90,7 +92,7 @@ def evaluate_generation(
                         equal_correct += n
         if explanation:
             preview = decode_bridge_tokens(
-                explanation["melody_conditioning"]["hard_template_tokens"]
+                explanation["melody_conditioning"]["hard_template_tokens"], pairs=model.bridge.pairs
             )
             # Reuse the same parsed actual lyrics when comparing against the input preview.
             actual_lines = [p["generated_syllables"] or [] for p in metrics["phrases"]]
@@ -225,6 +227,7 @@ def evaluate_end_to_end(
         schema_version=1,
         conditioning="parallel_soft_template",
         decoder_mode=model.decoder_mode,
+        prosody_mode=model.prosody_mode,
         checkpoint=str(checkpoint.resolve()),
         checkpoint_sha256={
             "template": file_sha256(checkpoint / "weights.pt"),
@@ -273,13 +276,16 @@ def evaluate_end_to_end(
         [
             {
                 **e["melody"],
-                "labels": encode_bridge_targets(e["reference_lines"], model.bridge.max_syllables),
+                "labels": encode_bridge_targets(
+                    e["reference_lines"], model.bridge.max_syllables, pairs=model.bridge.pairs
+                ),
                 "note_duration_seconds": np.asarray(e["note_duration_seconds"], dtype=np.float64),
                 "song_mean_note_duration_seconds": float(np.mean(e["note_duration_seconds"])),
             }
             for e in examples
         ],
         lines_per_window=model.bridge.encoder_lines_per_window,
+        pairs=model.bridge.pairs,
     )
     if compare_hard:
         report["hard_template_ablation"] = dict(

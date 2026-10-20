@@ -217,7 +217,9 @@ def test_question_and_empty_melisma_keep_complete_ipa_song(tmp_path, annotation,
     assert all(example[key][question] == 0 for key in TARGET_KEYS[1:])
     assert sum(example["syllable_labels"]) == 4
     assert len({len(example[key]) for key in TARGET_KEYS}) == 1
-    assert manifest["schema_version"] == 4
+    from prosodia_lyricist.prepare import SCHEMA_VERSION
+
+    assert manifest["schema_version"] == SCHEMA_VERSION
 
 
 @pytest.mark.parametrize("text", ["?", "?!?"])

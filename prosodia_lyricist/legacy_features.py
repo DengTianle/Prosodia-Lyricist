@@ -27,7 +27,7 @@ def record_lines(record):
     return lines
 
 
-def encode_source(record, tokenizer, max_syllables):
+def encode_source(record, tokenizer, max_syllables, *, include_keywords=True):
     def token_id(token):
         value = tokenizer.convert_tokens_to_ids(token)
         if value is None or value == tokenizer.unk_token_id:
@@ -56,10 +56,11 @@ def encode_source(record, tokenizer, max_syllables):
             remainders.append(count - index)
         # Original per-line prompt and period boundary. DALI has no keyword field,
         # so its prompt is empty; no target words are copied into conditioning.
-        append_plain([token_id("<keywords>")])
-        append_plain(
-            tokenizer.encode(line.get("keyword", "").replace(".", ""), add_special_tokens=False)
-        )
+        if include_keywords:
+            append_plain([token_id("<keywords>")])
+            append_plain(
+                tokenizer.encode(line.get("keyword", "").replace(".", ""), add_special_tokens=False)
+            )
         append_plain(tokenizer.encode(".", add_special_tokens=False))
     append_plain([tokenizer.eos_token_id])
     return {

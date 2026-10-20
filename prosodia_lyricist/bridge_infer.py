@@ -12,6 +12,7 @@ from .bridge_data import (
 )
 from .bridge_model import ProsodyBridge
 from .features import MAX_LINES
+from .ipa import REPO_RULES
 from .midi import midi_melody_record
 
 
@@ -28,7 +29,10 @@ def predict_templates(
     model = ProsodyBridge.load(checkpoint).to(device).eval()
     if max_syllables is not None and model.max_syllables > max_syllables:
         raise ValueError("Bridge syllable limit exceeds the template decoder's limit")
-    source = midi_melody_record(midi, title=title, track=track)
+    mode = "actual" if model.prosody_rules == REPO_RULES else "paper"
+    source = midi_melody_record(
+        midi, title=title, track=track, **({"phrase_policy": "repo"} if mode == "actual" else {})
+    )
     if len(source["lines"]) > MAX_LINES:
         raise ValueError(f"Template decoder supports at most {MAX_LINES} MIDI phrases")
     for index, line in enumerate(source["lines"]):
@@ -45,21 +49,27 @@ def predict_templates(
         lines = source["lines"][offset : offset + width]
         encoded = (
             encode_bridge_song(lines, model.encoder_lines_per_window)
-            if model.bridge_scope == "song" else encode_bridge_source(lines)
+            if model.bridge_scope == "song"
+            else encode_bridge_source(lines)
         )
         if model.bridge_scope == "window" and len(encoded["note_line_ids"]) > model.max_notes:
             raise ValueError("MIDI window exceeds bridge note limit; no truncation")
         inputs = {key: value.to(device) for key, value in bridge_collate([encoded]).items()}
         result = model.generate(**inputs)
-        predicted = decode_bridge_tokens(result.sequences[0].tolist())
+        predicted = decode_bridge_tokens(result.sequences[0].tolist(), pairs=model.pairs)
         for index, (line, template) in enumerate(zip(lines, predicted, strict=True), offset):
             records.append({**line, **template, "line_id": index, "stress_source": "learned"})
         windows += (
             len(lines) + model.encoder_lines_per_window - 1
         ) // model.encoder_lines_per_window
+    if records and mode == "actual":
+        records[-1]["unmarked_notes_omitted"] = source.get("unmarked_notes_omitted", 0)
     return records, {
         "checkpoint": str(Path(checkpoint).resolve()),
         "melody_provenance": model.provenance,
+        "prosody_mode": mode,
+        "stress_labels": list(model.strength_labels),
+        "unmarked_notes_omitted": source.get("unmarked_notes_omitted", 0),
         "lines_per_window": model.lines_per_window,
         "encoder_lines_per_window": model.encoder_lines_per_window,
         "bridge_scope": model.bridge_scope,

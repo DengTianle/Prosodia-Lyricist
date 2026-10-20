@@ -32,10 +32,16 @@ SONG_SCALARS = (
 SONG_FEATURE_DIM = len(SONG_SCALARS) + 2 * len(SONG_TIME_PERIODS)
 
 
-def bridge_vocabulary(lines_per_window):
+def prosody_pairs(strength_labels=("strong", "weak")):
+    if tuple(strength_labels) not in (("strong", "weak"), ("strong", "substrong", "weak")):
+        raise ValueError("Unsupported bridge strength vocabulary")
+    return tuple((s, n) for s in strength_labels for n in ("long", "short"))
+
+
+def bridge_vocabulary(lines_per_window, *, pairs=PAIRS):
     return (
         ["pad", "bos", "slot"]
-        + [f"{s}_{n}" for s, n in PAIRS]
+        + [f"{s}_{n}" for s, n in pairs]
         + [f"line_{index}" for index in range(lines_per_window)]
     )
 
@@ -124,38 +130,39 @@ def encode_bridge_song(lines, encoder_lines_per_window=2):
     }
 
 
-def encode_bridge_targets(lines, max_syllables):
+def encode_bridge_targets(lines, max_syllables, *, pairs=PAIRS):
     """DALI line membership fixes the prefixes; IPA supplies syllables within each line."""
     labels = []
     for index, line in enumerate(lines):
         if not 1 <= len(line["syllables"]) <= max_syllables:
             raise ValueError("IPA template exceeds the per-phrase syllable limit")
-        labels.append(FIRST_LINE + index)
+        labels.append(PAIR_OFFSET + len(pairs) + index)
         for syllable in line["syllables"]:
             pair = syllable["stress"], syllable["length"]
-            if pair not in PAIRS:
-                raise ValueError("Bridge targets require binary IPA stress and vowel length")
-            labels.append(PAIR_OFFSET + PAIRS.index(pair))
+            if pair not in pairs:
+                raise ValueError("Bridge targets differ from the IPA stress/length vocabulary")
+            labels.append(PAIR_OFFSET + pairs.index(pair))
     return labels
 
 
-def decode_bridge_tokens(tokens):
+def decode_bridge_tokens(tokens, *, pairs=PAIRS):
     lines, syllables, padded = [], None, False
+    first_line = PAIR_OFFSET + len(pairs)
     for token in tokens:
         if token == PAD:
             padded = True
             continue
         if padded:
             raise ValueError("Template padding must be trailing")
-        if token >= FIRST_LINE:
-            if token != FIRST_LINE + len(lines):
+        if token >= first_line:
+            if token != first_line + len(lines):
                 raise ValueError("Template line IDs must be consecutive, starting at line_0")
             if syllables == []:
                 raise ValueError("Empty template phrase")
             syllables = []
             lines.append({"syllables": syllables})
-        elif PAIR_OFFSET <= token < FIRST_LINE and syllables is not None:
-            stress, length = PAIRS[token - PAIR_OFFSET]
+        elif PAIR_OFFSET <= token < first_line and syllables is not None:
+            stress, length = pairs[token - PAIR_OFFSET]
             syllables.append({"stress": stress, "length": length})
         else:
             raise ValueError("Expected a line prefix followed by prosody pairs")

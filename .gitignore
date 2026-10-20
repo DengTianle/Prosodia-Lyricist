@@ -24,6 +24,7 @@ dist/
 /nus-smc-corpus_48/
 /docs/preparation-rejection-audit.md
 /examples/
+/prosodia_lyricist/resources/
 rejected.jsonl
 AGENTS.md
 *.flac
