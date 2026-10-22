@@ -66,6 +66,9 @@ training:
   melody_unfreeze_epoch: 1
   learning_rate: 0.0001
   melody_learning_rate: 0.000002
+  # [long, short], e.g. [2.0, 1.0]; null keeps ordinary CE. Stress is unweighted.
+  # When enabled, best/ uses weighted validation objective; ordinary CE is also logged.
+  length_class_weights: null
   adam_betas: [0.9, 0.98]
   adam_epsilon: 0.00001
   weight_decay: 0.01

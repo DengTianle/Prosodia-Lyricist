@@ -82,6 +82,11 @@ contains preparation, training, evaluation, and MIDI commands.
   0 trains the tower immediately, and null freezes it throughout.
 - `training.learning_rate` applies to the adapter/song encoder/heads;
   `melody_learning_rate` separately controls the tower.
+- `training.length_class_weights` is null (ordinary CE) or `[long, short]`, e.g.
+  `[2.0, 1.0]`. Only length CE is weighted. `loss`/`components` always report
+  ordinary CE; `objective_loss`/`objective_components` report the weighted
+  objective when enabled. Validation uses the same weights for checkpoint
+  selection. Gradient accumulation normalizes each head over the complete group.
 - Source/window/song and target limits skip entire training examples, with counts
   per reason. Inference rejects overlong input without truncation.
 - The existing contrastive-import, song grouping, checksum, and pretraining-split

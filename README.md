@@ -149,6 +149,11 @@ through the song encoder and, when unfrozen, the melody tower:
 loss = CE_stress + CE_length
 ```
 
+Set `training.length_class_weights: [2.0, 1.0]` to weight long/short length CE;
+the default `null` is unweighted. `loss`/`components` continue to report ordinary
+CE. Weighted runs also record `objective_loss`/`objective_components`, and select
+`best/` by the weighted validation objective. Masks and stress CE are unchanged.
+
 The default `data.prosody_mode: actual` preserves XAI's three stress classes
 (`strong`, `substrong`, `weak`) and binary vowel length, where only the IPA
 long mark means long. Prefixes and padding contribute no loss. The title and

@@ -265,7 +265,10 @@ def test_accumulation_uses_supervised_slots_and_masked_phrase_metrics(model):
         torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
 
 
-def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(model, tmp_path):
+@pytest.mark.parametrize("length_class_weights", [None, [2.0, 1.0]])
+def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
+    model, tmp_path, length_class_weights
+):
     data = dict(
         prepared_dir=str(tmp_path),
         include_melody=True,
@@ -320,10 +323,23 @@ def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
             melody_unfreeze_epoch=0,
             warmup_steps=0,
             schedule="constant_after_warmup",
+            length_class_weights=length_class_weights,
         ),
     )
     output = train_bridge(config)
+    run = json.loads((output / "run.json").read_text())
+    epoch = json.loads((output / "metrics.jsonl").read_text())
+    assert run["length_class_weights"] == length_class_weights
+    assert run["checkpoint_selection_metric"] == (
+        "valid.objective_loss" if length_class_weights else "valid.loss"
+    )
+    if length_class_weights:
+        assert epoch["train"]["length_class_weights"] == length_class_weights
+        assert epoch["valid"]["objective_loss"] == pytest.approx(
+            sum(epoch["valid"]["objective_components"].values())
+        )
     report = evaluate_bridge(output / "best", tmp_path, split="valid", device="cpu")
+    assert report["prediction"]["loss"] == pytest.approx(epoch["valid"]["loss"])
     assert report["schema_version"] == 5 and report["query_mode"] == "note"
     assert report["prediction"]["slots"] == report["prediction"]["compared_slots"] == 4
     assert report["prediction"]["fully_supervised_phrases"] == 1
@@ -337,6 +353,71 @@ def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
     loader = DataLoader(ds, batch_size=1, collate_fn=partial(bridge_collate, pairs=model.pairs))
     metrics = run_bridge_epoch(restored, loader, "cpu", template_metrics=True)
     assert metrics["pair_accuracy"] == report["prediction"]["accuracy"]["combined"]
+
+
+@pytest.mark.parametrize("weights", [[1.0, 1.0], [2.0, 1.0], [6.0, 3.0]])
+def test_weighted_length_objective_preserves_ordinary_ce_and_alignment_masks(model, weights):
+    model.eval()
+    batch = batch_for(model)
+    output = model(**batch)
+    active = output.target_mask
+    targets = batch["labels"][active] - PAIR_OFFSET
+    stress = F.cross_entropy(output.strength_logits[active], targets // 2)
+    length = F.cross_entropy(
+        output.length_logits[active], targets % 2, weight=torch.tensor(weights)
+    )
+    metrics = run_bridge_epoch(model, [batch], "cpu", length_class_weights=weights)
+    assert metrics["loss"] == pytest.approx(output.loss.item())
+    assert metrics["objective_components"]["strength"] == pytest.approx(stress.item())
+    assert metrics["objective_components"]["length"] == pytest.approx(length.item())
+    assert metrics["objective_loss"] == pytest.approx((stress + length).item())
+    assert metrics["tokens"] == 6  # Three mismatched-word targets per song stay masked.
+
+
+def test_weighted_accumulation_matches_combined_batch_with_different_class_mixtures(model):
+    combined = copy.deepcopy(model)
+    manual = copy.deepcopy(model)
+    a, b = example(lines()), example(lines()[:1])
+    for i, anchor in enumerate(b["target_note_indices"]):
+        if anchor >= 0:
+            # This microbatch has only short targets; the other has both classes.
+            b["labels"][i] = PAIR_OFFSET + 1
+    results = []
+    for net, batches, accumulation in (
+        (model, [bridge_collate([a], pairs=model.pairs),
+                 bridge_collate([b], pairs=model.pairs)], 3),
+        (combined, [bridge_collate([a, b], pairs=model.pairs)], 1),
+    ):
+        optimizer = torch.optim.SGD(net.parameters(), lr=0.01)
+        results.append(run_bridge_epoch(
+            net, batches, "cpu", optimizer=optimizer,
+            scheduler=torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1),
+            accumulation_steps=accumulation, gradient_clip=None, length_class_weights=[3.0, 1.0],
+        ))
+    for key in ("loss", "objective_loss"):
+        assert results[0][key] == pytest.approx(results[1][key])
+    batch = bridge_collate([a, b], pairs=manual.pairs)
+    output = manual(**batch)
+    active = output.target_mask
+    targets = batch["labels"][active] - PAIR_OFFSET
+    loss = F.cross_entropy(output.strength_logits[active], targets // 2) + F.cross_entropy(
+        output.length_logits[active], targets % 2, weight=torch.tensor([3.0, 1.0])
+    )
+    loss.backward()
+    torch.optim.SGD(manual.parameters(), lr=0.01).step()
+    for left, right in zip(model.parameters(), combined.parameters(), strict=True):
+        torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
+    for left, right in zip(model.parameters(), manual.parameters(), strict=True):
+        torch.testing.assert_close(left, right, atol=1e-6, rtol=1e-5)
+
+
+@pytest.mark.parametrize("weights", [
+    [], [1], [1, 2, 3], [0, 1], [-1, 1], [True, 1], [float("nan"), 1],
+    [float("inf"), 1], "balanced", {"long": 2, "short": 1},
+])
+def test_invalid_length_weights_fail_before_reading_data(weights):
+    with pytest.raises(ValueError, match="length_class_weights"):
+        train_bridge(dict(data={}, model={}, training=dict(length_class_weights=weights)))
 
 
 def test_old_prepared_data_recovers_links_without_pronunciation_or_rewriting(

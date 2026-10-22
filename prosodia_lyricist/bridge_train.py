@@ -11,6 +11,7 @@ from itertools import islice
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -31,6 +32,28 @@ from .runtime import log_stage, seed_everything, select_device
 from .train import build_scheduler
 
 logger = logging.getLogger(__name__)
+
+
+def _length_class_weights(value):
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or len(value) != 2 or any(
+        isinstance(w, bool) or not isinstance(w, (int, float))
+        or not math.isfinite(w) or w <= 0 for w in value
+    ):
+        raise ValueError(
+            "length_class_weights must be null or two positive finite weights [long, short]"
+        )
+    # Weighted means depend only on the ratio; normalize to avoid overflow.
+    scale = max(value)
+    return tuple(float(w / scale) for w in value)
+
+
+def _supervised_slots(batch, first_line):
+    active = batch["labels"].ge(PAIR_OFFSET) & batch["labels"].lt(first_line)
+    if "target_note_indices" in batch:
+        active &= batch["target_note_indices"].ge(0)
+    return active
 
 
 def _random_melody_config(config):
@@ -69,8 +92,16 @@ def run_bridge_epoch(
     max_batches=None,
     history_mask_probability=0.0,
     template_metrics=False,
+    length_class_weights=None,
 ):
     training = optimizer is not None
+    weight_values = _length_class_weights(length_class_weights)
+    if weight_values is not None and model.output_design != "separate":
+        raise ValueError("Length class weights require separate stress/length heads")
+    weights = (
+        torch.tensor(weight_values, device=device, dtype=torch.float32)
+        if weight_values is not None else None
+    )
     model.train(training)
     forward_options = (
         {"history_mask_probability": history_mask_probability}
@@ -78,6 +109,7 @@ def run_bridge_epoch(
     )
     total_loss = 0.0
     component_totals = {}
+    weighted_length_total, length_weight_total = 0.0, 0.0
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
     strength_correct, length_correct = 0, 0
     classification = ClassificationMetrics(
@@ -93,25 +125,29 @@ def run_bridge_epoch(
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
-            group_tokens = sum(
-                int(batch["target_note_indices"].ge(0).sum())
-                if "target_note_indices" in batch else int(batch["syllable_counts"].sum())
-                for batch in group
-            )
+            first_line = getattr(model, "first_line", FIRST_LINE)
+            group_masks = [_supervised_slots(batch, first_line) for batch in group]
+            group_tokens = sum(int(mask.sum()) for mask in group_masks)
             if not group_tokens:
                 continue
+            if weights is not None:
+                group_longs = sum(
+                    int(((batch["labels"][mask] - PAIR_OFFSET) % 2).eq(0).sum())
+                    for batch, mask in zip(group, group_masks, strict=True)
+                )
+                group_length_weight = (
+                    weight_values[0] * group_longs
+                    + weight_values[1] * (group_tokens - group_longs)
+                )
             if training:
                 optimizer.zero_grad(set_to_none=True)
             for batch in group:
                 batch = {key: value.to(device) for key, value in batch.items()}
-                active = batch["labels"].ge(PAIR_OFFSET) & batch["labels"].lt(
-                    getattr(model, "first_line", FIRST_LINE)
-                )
-                if "target_note_indices" in batch:
-                    active &= batch["target_note_indices"].ge(0)
+                active = _supervised_slots(batch, first_line)
                 count = int(active.sum())
                 if not count:
                     continue
+                expected = batch["labels"][active] - PAIR_OFFSET
                 line_count = int(batch["line_counts"].sum())
                 with (
                     torch.autocast("cuda", dtype=torch.bfloat16)
@@ -121,16 +157,31 @@ def run_bridge_epoch(
                     output = model(**batch, **forward_options)
                 if not torch.isfinite(output.loss):
                     raise FloatingPointError("Non-finite bridge loss")
+                if weights is not None:
+                    weighted_length = F.cross_entropy(
+                        output.length_logits[active].float(), expected % 2,
+                        weight=weights, reduction="sum",
+                    )
+                    if not torch.isfinite(weighted_length):
+                        raise FloatingPointError("Non-finite weighted length CE")
+                    longs = int(expected.remainder(2).eq(0).sum())
+                    batch_weight = weight_values[0] * longs + weight_values[1] * (count - longs)
+                    weighted_length_total += weighted_length.item()
+                    length_weight_total += batch_weight
                 if training:
-                    # Weight by valid prosody slots, including partial accumulation groups.
-                    (output.loss * (count / group_tokens)).backward()
+                    # Each head uses its own denominator across the accumulation group.
+                    objective = (
+                        output.loss_components["strength"] * (count / group_tokens)
+                        + weighted_length / group_length_weight
+                        if weights is not None else output.loss * (count / group_tokens)
+                    )
+                    objective.backward()
                 if model.output_design == "separate":
                     predicted = (
                         2 * output.strength_logits.argmax(-1) + output.length_logits.argmax(-1)
                     )[active]
                 else:
                     predicted = output.logits.argmax(-1)[active]
-                expected = batch["labels"][active] - PAIR_OFFSET
                 classification.update(
                     predicted, expected,
                     strength_logits=(
@@ -193,6 +244,13 @@ def run_bridge_epoch(
         result["history_mask_probability"] = history_mask_probability if training else 0.0
     if templates is not None:
         result["templates"] = templates.report()
+    if weights is not None:
+        result["length_class_weights"] = list(length_class_weights)
+        result["objective_components"] = {
+            "strength": result["components"]["strength"],
+            "length": weighted_length_total / length_weight_total,
+        }
+        result["objective_loss"] = sum(result["objective_components"].values())
     return result
 
 
@@ -244,6 +302,8 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
 
 def train_bridge(config, *, output_dir=None, smoke_test=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
+    length_class_weights = settings.get("length_class_weights")
+    _length_class_weights(length_class_weights)
     audit_mode = settings.get("pretraining_audit_mode", "strict")
     if audit_mode not in ("strict", "warning"):
         raise ValueError("training.pretraining_audit_mode must be strict or warning")
@@ -448,6 +508,10 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "training_count_source": "ipa",
         "inference_count_source": "notes",
         "output_design": model.output_design,
+        "length_class_weights": length_class_weights,
+        "checkpoint_selection_metric": (
+            "valid.objective_loss" if length_class_weights is not None else "valid.loss"
+        ),
         "query_mode": model.query_mode,
         "query_attention": model.query_attention,
         "alignment_policy": model.alignment_policy if mode == "note" else None,
@@ -498,6 +562,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                     precision=precision,
                     gradient_clip=clip,
                     max_batches=max_batches,
+                    length_class_weights=length_class_weights,
                 )
             with tqdm(loaders["valid"], desc="Bridge validate", leave=False) as progress:
                 validation = run_bridge_epoch(
@@ -507,6 +572,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                     precision=precision,
                     max_batches=max_batches,
                     template_metrics=True,
+                    length_class_weights=length_class_weights,
                 )
             handle.write(
                 json.dumps(
@@ -541,8 +607,16 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 length["balanced_accuracy"],
                 length["ranking"]["roc_auc"],
             )
-            if validation["loss"] < best:
-                best, stale = validation["loss"], 0
+            if length_class_weights is not None:
+                logger.info(
+                    "Length class weights [long, short]=%s; weighted objective train %.4f "
+                    "valid %.4f (valid weighted length CE %.4f); best/ uses this objective",
+                    length_class_weights, training["objective_loss"], validation["objective_loss"],
+                    validation["objective_components"]["length"],
+                )
+            selection_loss = validation.get("objective_loss", validation["loss"])
+            if selection_loss < best:
+                best, stale = selection_loss, 0
                 model.save(output / "best")
                 (output / "best" / "run.json").write_text(
                     json.dumps(run, indent=2), encoding="utf-8"
