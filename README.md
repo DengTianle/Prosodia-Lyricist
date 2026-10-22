@@ -243,6 +243,8 @@ final marker are omitted and counted in diagnostics, matching `mid2words`.
 The bundled Imagine input therefore uses 16 phrases/103 notes; its 10 trailing
 notes still contribute to `getProsody` bucket thresholds. Paper/supplement
 parsing remains an explicit `--prosody-mode paper` comparison.
+To score all 17 lines in `examples/Imagine_gt.txt` with a joint XAI checkpoint,
+add a phrase-end marker at the last note's end in a copy of `examples/imagine.mid`.
 
 Training joins notes and lyrics from each prepared song, uses reference IPA counts,
 and skips whole songs exceeding either model's limits. MIDI inference uses note
@@ -485,7 +487,8 @@ prosodia-infer \
 
 Choose a monophonic melody with `--track` (default 0). Markers are interpreted
 as **phrase ends**, matching the supplied example; they are not beat markers.
-A trailing phrase after the final marker is retained. Each note is assumed to
+A trailing phrase after the final marker is retained in paper/supplement mode;
+repo (`actual`) mode uses only marked phrases. Each note is assumed to
 represent one syllable at this stage. MIDI melisma and explicit beat/bar marker
 support remain future evaluation work.
 
@@ -497,7 +500,8 @@ explicit non-4/4 meters are rejected. `heuristic` preserves the historical
 unquantized strength/phrase-mean behavior; `unknown` disables stress.
 
 Imagine has 113 notes and 16 phrase markers plus an unmarked tail, yielding
-**17 phrases in one model input**. A trained template-decoder checkpoint is
+**17 phrases in one model input** in paper/supplement mode, or 16 marked phrases
+in repo mode. A trained template-decoder checkpoint is
 needed for lyrics. Inspect the musical template without any checkpoint:
 
 ```bash

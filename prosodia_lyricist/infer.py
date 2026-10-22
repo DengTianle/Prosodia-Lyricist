@@ -183,7 +183,20 @@ def infer(
     if reference_lines is not None and (
         len(reference_lines) != len(records) or any(not line.strip() for line in reference_lines)
     ):
-        raise ValueError("Reference must have one nonempty line per MIDI phrase")
+        blank_lines = [i + 1 for i, line in enumerate(reference_lines) if not line.strip()]
+        details = (
+            f"MIDI has {len(records)} phrases; reference has {len(reference_lines)} lines"
+        )
+        if blank_lines:
+            details += f"; blank reference lines: {blank_lines}"
+        omitted = (bridge or (records[-1] if records else {})).get("unmarked_notes_omitted", 0)
+        if omitted:
+            details += (
+                f"; {omitted} notes after the final phrase-end marker were omitted"
+                "; add a final phrase-end marker to include that tail, or use a reference"
+                " aligned to the marked phrases"
+            )
+        raise ValueError(f"Reference must have one nonempty line per MIDI phrase ({details})")
     source_encoder = encode_source
     if xai:
         from .xai_features import encode_source as source_encoder

@@ -160,8 +160,16 @@ def test_inference_report_and_template_cli(tmp_path, tokenizer, tiny_model, monk
     assert json.loads((tmp_path / "report.json").read_text())["midi_sha256"]
     with pytest.raises(FileExistsError):
         write_report(report, tmp_path / "report")
-    with pytest.raises(ValueError, match="one nonempty line"):
+    with pytest.raises(ValueError, match="MIDI has 1 phrases; reference has 2 lines"):
         infer.infer(checkpoint, path, device="cpu", reference_lines=["one", "two"])
+    with pytest.raises(ValueError, match=r"blank reference lines: \[1\]"):
+        infer.infer(checkpoint, path, device="cpu", reference_lines=["  "])
+    with monkeypatch.context() as patch:
+        records = infer.midi_records(path)
+        records[-1]["unmarked_notes_omitted"] = 10
+        patch.setattr(infer, "midi_records", lambda *a, **kw: records)
+        with pytest.raises(ValueError, match="10 notes after the final phrase-end marker"):
+            infer.infer(checkpoint, path, device="cpu", reference_lines=["one", "two"])
     monkeypatch.setattr(
         evaluation.ipa,
         "parse_words",
