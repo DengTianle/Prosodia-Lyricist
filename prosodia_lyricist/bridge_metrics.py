@@ -2,9 +2,142 @@
 
 from collections import Counter
 from itertools import zip_longest
+from math import log
+
+import torch
 
 from .bridge_data import decode_bridge_tokens
 from .evaluation import prosody_bleu
+
+
+class ClassificationMetrics:
+    """Per-head class balance, confusion, and calibration diagnostics at valid slots."""
+
+    def __init__(self, strength_labels, *, collect_length_scores=False):
+        self.labels = {"strength": tuple(strength_labels), "length": ("long", "short")}
+        self.confusion = {
+            name: torch.zeros(len(labels), len(labels), dtype=torch.long)
+            for name, labels in self.labels.items()
+        }
+        self.probability_sums = {
+            name: torch.zeros(len(labels), dtype=torch.float64)
+            for name, labels in self.labels.items()
+        }
+        self.probability_counts = Counter()
+        self.collect_length_scores = collect_length_scores
+        self.length_scores, self.length_targets = [], []
+
+    @torch.no_grad()
+    def update(self, predicted, expected, *, strength_logits=None, length_logits=None):
+        for name, predictions, targets, logits in (
+            ("strength", predicted // 2, expected // 2, strength_logits),
+            ("length", predicted % 2, expected % 2, length_logits),
+        ):
+            size = len(self.labels[name])
+            self.confusion[name] += (
+                torch.bincount(targets * size + predictions, minlength=size * size)
+                .reshape(size, size)
+                .cpu()
+            )
+            if logits is not None:
+                probabilities = logits.float().softmax(-1)
+                self.probability_sums[name] += probabilities.sum(0).double().cpu()
+                self.probability_counts[name] += len(targets)
+                if name == "length" and self.collect_length_scores:
+                    self.length_scores.append(probabilities[:, 0].cpu())
+                    self.length_targets.append(targets.eq(0).cpu())
+
+    def length_ranking(self):
+        result = {"positive_class": "long", "roc_auc": None, "average_precision": None}
+        if not self.length_scores:
+            return result
+        scores = torch.cat(self.length_scores)
+        targets = torch.cat(self.length_targets)
+        positives = int(targets.sum())
+        negatives = len(targets) - positives
+        if not positives:
+            return result
+        order = scores.argsort(descending=True)
+        sorted_scores = scores[order]
+        # Group ties so constant scores give ROC AUC 0.5 and AP equal to prevalence.
+        ends = torch.cat((sorted_scores[:-1].ne(sorted_scores[1:]), torch.tensor([True])))
+        indices = ends.nonzero(as_tuple=True)[0]
+        true_positives = targets[order].double().cumsum(0)[indices]
+        false_positives = indices.double() + 1 - true_positives
+        preceding = torch.cat((torch.zeros(1, dtype=torch.float64), true_positives[:-1]))
+        result["average_precision"] = float(
+            (
+                (true_positives - preceding)
+                / positives
+                * true_positives
+                / (true_positives + false_positives)
+            ).sum()
+        )
+        if negatives:
+            zero = torch.zeros(1, dtype=torch.float64)
+            result["roc_auc"] = float(
+                torch.trapezoid(
+                    torch.cat((zero, true_positives / positives)),
+                    torch.cat((zero, false_positives / negatives)),
+                )
+            )
+        return result
+
+    def report(self):
+        report = {}
+        for name, labels in self.labels.items():
+            confusion = self.confusion[name]
+            references, predictions = confusion.sum(1), confusion.sum(0)
+            total = int(references.sum())
+            classes = {}
+            for index, label in enumerate(labels):
+                true, predicted = int(references[index]), int(predictions[index])
+                correct = int(confusion[index, index])
+                classes[label] = {
+                    "reference_count": true,
+                    "predicted_count": predicted,
+                    "reference_fraction": true / total if total else None,
+                    "predicted_fraction": predicted / total if total else None,
+                    "precision": correct / predicted if predicted else 0.0,
+                    "recall": correct / true if true else None,
+                    "f1": 2 * correct / (true + predicted) if true + predicted else None,
+                    "mean_probability": (
+                        float(self.probability_sums[name][index]) / self.probability_counts[name]
+                        if self.probability_counts[name]
+                        else None
+                    ),
+                }
+            supported = [value for value in classes.values() if value["reference_count"]]
+            report[name] = {
+                "labels": list(labels),
+                "confusion_matrix": confusion.tolist(),
+                "confusion_axes": "reference_rows_prediction_columns",
+                "slots": total,
+                "classes": classes,
+                "majority_class": labels[int(references.argmax())] if total else None,
+                "majority_accuracy": int(references.max()) / total if total else None,
+                "label_entropy": (
+                    -sum(
+                        (int(count) / total) * log(int(count) / total)
+                        for count in references
+                        if count
+                    )
+                    if total
+                    else None
+                ),
+                "balanced_accuracy": (
+                    sum(value["recall"] for value in supported) / len(supported)
+                    if supported
+                    else None
+                ),
+                "macro_f1": (
+                    sum(value["f1"] for value in supported) / len(supported) if supported else None
+                ),
+                "averaging": "classes_with_reference_support",
+            }
+        if self.collect_length_scores:
+            report["length"]["ranking"] = self.length_ranking()
+        return report
 
 
 class TemplateMetrics:

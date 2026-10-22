@@ -10,14 +10,13 @@ import torch
 from transformers import AutoTokenizer
 
 from . import ipa
-from .evaluation import conditional_perplexity, evaluate_prosody, reference_targets, text_prosody
-from .features import encode_source
+from .evaluation import conditional_perplexity, evaluate_prosody, text_prosody
 from .generation import resolve_repetition_settings
 from .midi import midi_note_comparison, midi_records
-from .model import ProsodyBart
 from .prepare import SCHEMA_VERSION
 from .report import markdown_report, write_report
 from .runtime import seed_everything, select_device
+from .xai_features import encode_source, encode_targets, validate_tokenizer
 from .xai_model import XAILyricist, load_template
 
 
@@ -60,9 +59,7 @@ def infer(
     return_report=False,
     reference_lines=None,
     return_explanations=False,
-    prosody_correction=True,
     bridge_checkpoint=None,
-    template_mode="soft",
     no_repeat_ngram_size=None,
     repetition_penalty=None,
     tokenizer_dir=None,
@@ -75,15 +72,8 @@ def infer(
     checkpoint = Path(checkpoint)
     if prosody_mode not in (None, *ipa.PROSODY_MODES):
         raise ValueError("prosody_mode must be paper or actual")
-    joint = (checkpoint / "end_to_end.json").exists()
-    if template_mode not in ("soft", "hard") or (template_mode != "soft" and not joint):
-        raise ValueError("Hard template ablation requires an end-to-end checkpoint")
-    if joint and (bridge_checkpoint or stress_source is not None):
-        raise ValueError("An end-to-end checkpoint already includes its melody conditioner")
     if bridge_checkpoint and stress_source is not None:
         raise ValueError("stress_source is a heuristic option; omit it when using a bridge")
-    if bridge_checkpoint and (checkpoint / "melody.json").exists():
-        raise ValueError("A bridge requires an XAI or four-stream template checkpoint")
     device = select_device(device)
     if checkpoint.is_file():
         model, tokenizer = load_template(
@@ -105,35 +95,21 @@ def infer(
             ),
         )
     else:
+        if not (checkpoint / "xai.json").is_file():
+            raise ValueError("Expected an imported XAI directory or original XAI checkpoint file")
         if tokenizer_dir is not None or bart_config is not None:
             raise ValueError("Tokenizer/config overrides require an original XAI checkpoint file")
         tokenizer = AutoTokenizer.from_pretrained(checkpoint / "tokenizer", local_files_only=True)
         run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
-    if joint:
-        from .end_to_end_model import EndToEndProsody
-
-        joint_model = EndToEndProsody.load(checkpoint).to(device).eval()
-        model = joint_model.template_model
-    elif not checkpoint.is_file():
-        model = ProsodyBart.load(checkpoint).to(device).eval()
+    if not checkpoint.is_file():
+        model = XAILyricist.load(checkpoint).to(device).eval()
     if run.get("data_schema_version") not in (3, 4, SCHEMA_VERSION):
         raise ValueError("Checkpoint uses an older input scheme; prepare and train song-level data")
-    explainable = isinstance(model, ProsodyBart)
-    xai = isinstance(model, XAILyricist)
-    if xai:
-        from .xai_features import validate_tokenizer
-
-        validate_tokenizer(tokenizer, model)
-    mode = prosody_mode or (joint_model.prosody_mode if joint else "actual" if xai else "paper")
-    if joint and mode != joint_model.prosody_mode:
-        raise ValueError("Requested IPA rules differ from the joint checkpoint's training rules")
+    validate_tokenizer(tokenizer, model)
+    mode = prosody_mode or "actual"
     stress_source = resolve_stress_source(
         mode, stress_source, run["config"]["data"].get("stress_source", "ipa")
     )
-    if bridge_checkpoint and not (explainable or xai):
-        raise ValueError("A bridge requires an XAI or four-stream template checkpoint")
-    if return_explanations and not (explainable or xai):
-        raise ValueError("Legacy lyrics-only checkpoints have no generated explanation streams")
     target_limit = min(
         run["config"]["model"]["max_target_length"], model.bart.config.max_position_embeddings
     )
@@ -142,22 +118,7 @@ def infer(
     if max_new_tokens >= target_limit:
         raise ValueError("max_new_tokens must be smaller than the checkpoint's target token limit")
     bridge = None
-    if joint:
-        from .end_to_end_infer import condition_midi
-
-        records, encoded, source_embeddings, bridge = condition_midi(
-            joint_model,
-            tokenizer,
-            midi,
-            title=title,
-            track=track,
-            device=device,
-            max_source_length=run["config"]["model"]["max_source_length"],
-            template_mode=template_mode,
-        )
-        bridge["checkpoint"] = str(checkpoint.resolve())
-        stress_source = "learned"
-    elif bridge_checkpoint:
+    if bridge_checkpoint:
         from .bridge_infer import predict_templates
 
         records, bridge = predict_templates(
@@ -171,7 +132,7 @@ def infer(
         mode = prosody_mode or bridge.get("prosody_mode", "paper")
         if prosody_mode and mode != bridge.get("prosody_mode", "paper"):
             raise ValueError("Requested IPA rules differ from the learned bridge's rules")
-        if bridge.get("prosody_mode", "paper") != ("actual" if xai else "paper"):
+        if bridge.get("prosody_mode", "paper") != "actual":
             raise ValueError("Bridge IPA rules differ from the template decoder's rules")
         stress_source = "learned"
     else:
@@ -186,9 +147,7 @@ def infer(
         len(reference_lines) != len(records) or any(not line.strip() for line in reference_lines)
     ):
         blank_lines = [i + 1 for i, line in enumerate(reference_lines) if not line.strip()]
-        details = (
-            f"MIDI has {len(records)} phrases; reference has {len(reference_lines)} lines"
-        )
+        details = f"MIDI has {len(records)} phrases; reference has {len(reference_lines)} lines"
         if blank_lines:
             details += f"; blank reference lines: {blank_lines}"
         omitted = (bridge or (records[-1] if records else {})).get("unmarked_notes_omitted", 0)
@@ -199,21 +158,13 @@ def infer(
                 " aligned to the marked phrases"
             )
         raise ValueError(f"Reference must have one nonempty line per MIDI phrase ({details})")
-    source_encoder = encode_source
-    if xai:
-        from .xai_features import encode_source as source_encoder
-    elif not explainable:
-        from .legacy_features import encode_source as source_encoder
-    if not joint:
-        encoded = source_encoder({"title": title, "lines": records}, tokenizer, model.max_syllables)
+    encoded = encode_source({"title": title, "lines": records}, tokenizer, model.max_syllables)
     source_limit = min(
         run["config"]["model"]["max_source_length"], model.bart.config.max_position_embeddings
     )
     if len(encoded["input_ids"]) > source_limit:
         raise ValueError("MIDI song template exceeds the checkpoint's source token limit")
     inputs = {key: torch.tensor([value], device=device) for key, value in encoded.items()}
-    if joint:
-        inputs["inputs_embeds"] = source_embeddings
     repetition = resolve_repetition_settings(model, no_repeat_ngram_size, repetition_penalty)
     generation = {
         "max_new_tokens": max_new_tokens,
@@ -222,42 +173,13 @@ def infer(
     }
     if top_k > 1:
         generation.update(temperature=temperature, top_k=top_k)
-    explanation, prosody_labels = None, None
-    if explainable:
-        result = model.generate(
-            **inputs, tokenizer=tokenizer, prosody_correction=prosody_correction, **generation
-        )
-        tokens = result.sequences
-        prosody_labels = [
-            stream[:, 1:] for stream in (result.syllable_ids, result.stress_ids, result.length_ids)
-        ]
-        explanation = result.explanations[0]
-        explanation["template"] = {
-            "lyrics": tokens[0].tolist(),
-            "syllables": result.syllable_ids[0].tolist(),
-            "stresses": result.stress_ids[0].tolist(),
-            "lengths": result.length_ids[0].tolist(),
-            "tokens": tokenizer.convert_ids_to_tokens(tokens[0].tolist()),
-        }
-        explanation["source"] = {"title": title, "lines": records}
-        if bridge:
-            explanation["bridge"] = bridge
-        text = explanation["text"]
-    elif xai:
-        result = model.generate(**inputs, tokenizer=tokenizer, **generation)
-        tokens = result.sequences
-        explanation = result.explanations[0]
-        explanation["source"] = {"title": title, "lines": records}
-        if bridge:
-            explanation["bridge"] = bridge
-        text = explanation["text"]
-    else:
-        generation["bad_words_ids"] = [
-            [tokenizer.convert_tokens_to_ids(token)]
-            for token in tokenizer.additional_special_tokens
-        ]
-        tokens = model.generate(**inputs, **generation)
-        text = tokenizer.decode(tokens[0], skip_special_tokens=True)
+    result = model.generate(**inputs, tokenizer=tokenizer, **generation)
+    tokens = result.sequences
+    explanation = result.explanations[0]
+    explanation["source"] = {"title": title, "lines": records}
+    if bridge:
+        explanation["bridge"] = bridge
+    text = explanation["text"]
     lyrics = [line.strip() for line in text.split(".") if line.strip()]
     if not return_report:
         if return_explanations:
@@ -266,14 +188,6 @@ def infer(
     report = template_report(
         midi, records, title=title, track=track, stress_source=stress_source, prosody_mode=mode
     )
-    if joint:
-        report["template_role"] = bridge["template_role"]
-        report["warnings"].append(
-            "Template labels are an argmax preview of the soft source embeddings. "
-            "Template-agreement scores are diagnostics, not reference-lyric accuracy."
-            if template_mode == "soft"
-            else "Hard-template ablation of an end-to-end checkpoint."
-        )
     if bridge:
         report["bridge"] = bridge
         if bridge.get("unmarked_notes_omitted"):
@@ -284,9 +198,7 @@ def infer(
     report.update(
         checkpoint=str(checkpoint.resolve()),
         checkpoint_run=run,
-        decoder_mode=(
-            "explainable" if explainable else "xai_single_stream" if xai else "legacy_lyrics"
-        ),
+        decoder_mode="xai_single_stream",
         generation={
             "seed": seed,
             "top_k": top_k,
@@ -294,9 +206,7 @@ def infer(
             "max_new_tokens": max_new_tokens,
             "device": str(device),
             **repetition,
-            "hit_token_limit": explanation["hit_token_limit"]
-            if explainable or xai
-            else len(tokens[0]) - 1 >= max_new_tokens,
+            "hit_token_limit": explanation["hit_token_limit"],
         },
         encoded_source=encoded,
         generated_token_ids=tokens[0].tolist(),
@@ -305,58 +215,33 @@ def infer(
         metrics=evaluate_prosody(
             records, lyrics, **({"prosody_mode": "actual"} if mode == "actual" else {})
         ),
-        generated_perplexity=conditional_perplexity(
-            model, inputs, tokens[:, 1:], tokenizer, prosody_labels=prosody_labels
-        ),
+        generated_perplexity=conditional_perplexity(model, inputs, tokens[:, 1:], tokenizer),
         software_versions=package_versions(),
     )
-    if explainable:
-        report["decoder_explanation"] = explanation
-        report["warnings"].append(
-            "Lyric-BPE perplexity conditions on prior word-boundary/prosody events; "
-            "it is not directly equivalent to baseline text-only perplexity."
-        )
-        if explanation["truncated_word"]:
-            report["warnings"].append(
-                "An unfinished final word was discarded; see decoder details."
-            )
-    elif xai:
-        report["decoder_explanation"] = explanation
+    report["decoder_explanation"] = explanation
     if report["generation"]["hit_token_limit"]:
-        report["warnings"].append(
-            "Generation reached its event budget without completing the song."
-            if explainable
-            else "Generation reached its token budget; the final EOS may have been forced. "
-            "The output may be incomplete."
-        )
+        report["warnings"].append("Generation reached its token budget; output may be incomplete.")
     if len(lyrics) != len(records):
         report["warnings"].append(
             "Generated phrase count differs from the MIDI. Phrases are paired by ordinal "
             "position; later pairs may be misaligned."
         )
     if reference_lines is not None:
-        if xai:
-            from .xai_features import encode_targets
-
-            streams = [
-                encode_targets(
-                    {
-                        "lines": [
-                            {
-                                "words": ipa.parse_words(
-                                    t, **({"prosody_mode": "actual"} if mode == "actual" else {})
-                                )
-                            }
-                            for t in reference_lines
-                        ]
-                    },
-                    tokenizer,
-                )["labels"]
-            ]
-        else:
-            streams = reference_targets(
-                reference_lines, tokenizer, model.max_syllables, explainable=explainable
-            )
+        streams = [
+            encode_targets(
+                {
+                    "lines": [
+                        {
+                            "words": ipa.parse_words(
+                                text, **({"prosody_mode": "actual"} if mode == "actual" else {})
+                            )
+                        }
+                        for text in reference_lines
+                    ]
+                },
+                tokenizer,
+            )["labels"]
+        ]
         if len(streams[0]) > target_limit:
             raise ValueError("Reference exceeds checkpoint target token limit; no truncation")
         report["reference_lines"] = reference_lines
@@ -370,7 +255,6 @@ def infer(
             inputs,
             targets[0],
             tokenizer,
-            prosody_labels=targets[1:] if explainable else None,
         )
     return report
 
@@ -441,12 +325,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", help="The run's best/ directory")
     parser.add_argument("--bridge-checkpoint", help="Learned melody-to-template best/ directory")
-    parser.add_argument(
-        "--template-mode",
-        choices=("soft", "hard"),
-        default="soft",
-        help="End-to-end checkpoints: soft conditioning or hard argmax ablation",
-    )
     parser.add_argument("--midi", required=True)
     parser.add_argument("--title", default="")
     parser.add_argument("--track", type=int, default=0)
@@ -471,7 +349,7 @@ def main():
     parser.add_argument(
         "--prosody-mode",
         choices=ipa.PROSODY_MODES,
-        help="Defaults to repo rules for XAI and the saved rules for joint models",
+        help="Defaults to repo rules for XAI",
     )
     parser.add_argument("--tokenizer-dir")
     parser.add_argument("--bart-config")
@@ -488,20 +366,8 @@ def main():
         action="store_true",
         help="Inspect heuristic or learned templates without generating lyrics",
     )
-    parser.add_argument(
-        "--explanations", help="New decoder details JSON; four-stream models include prosody"
-    )
-    parser.add_argument(
-        "--no-prosody-correction",
-        action="store_false",
-        dest="prosody_correction",
-        help="Ablation: feed predicted prosody back without IPA correction",
-    )
+    parser.add_argument("--explanations", help="New decoder details JSON")
     args = parser.parse_args()
-    if args.template_mode == "hard" and not (
-        args.checkpoint and (Path(args.checkpoint) / "end_to_end.json").exists()
-    ):
-        parser.error("--template-mode hard requires an end-to-end checkpoint")
     if args.bridge_checkpoint and args.stress_source:
         parser.error("--stress-source is a heuristic option; omit it with --bridge-checkpoint")
     if not args.template_only and not args.checkpoint:
@@ -525,35 +391,7 @@ def main():
     if args.template_only:
         bridge = None
         mode = args.prosody_mode or "actual"
-        if args.checkpoint and (Path(args.checkpoint) / "end_to_end.json").exists():
-            from .end_to_end_infer import condition_midi
-            from .end_to_end_model import EndToEndProsody
-
-            if args.bridge_checkpoint or args.stress_source:
-                parser.error("An end-to-end checkpoint already includes its melody conditioner")
-            seed_everything(args.seed)
-            device = select_device(args.device)
-            model = EndToEndProsody.load(args.checkpoint).to(device).eval()
-            mode = args.prosody_mode or model.prosody_mode
-            if mode != model.prosody_mode:
-                parser.error("Requested IPA rules differ from the joint checkpoint")
-            tokenizer = AutoTokenizer.from_pretrained(
-                Path(args.checkpoint) / "tokenizer", local_files_only=True
-            )
-            run = json.loads((Path(args.checkpoint) / "run.json").read_text())
-            records, _, _, bridge = condition_midi(
-                model,
-                tokenizer,
-                args.midi,
-                title=args.title,
-                track=args.track,
-                device=device,
-                max_source_length=run["config"]["model"]["max_source_length"],
-                template_mode=args.template_mode,
-            )
-            bridge["checkpoint"] = str(Path(args.checkpoint).resolve())
-            stress = "learned"
-        elif args.bridge_checkpoint:
+        if args.bridge_checkpoint:
             from .bridge_infer import predict_templates
 
             seed_everything(args.seed)
@@ -583,11 +421,6 @@ def main():
         )
         if bridge:
             report["bridge"] = bridge
-            if "template_role" in bridge:
-                report["template_role"] = bridge["template_role"]
-                report["warnings"].append(
-                    "Displayed hard labels are a preview; see soft slot probabilities in JSON."
-                )
         text = markdown_report(report)
     else:
         kwargs = vars(args).copy()

@@ -7,11 +7,8 @@ import torch
 
 from prosodia_lyricist import ipa
 from prosodia_lyricist.dali import extract_lines
-from prosodia_lyricist.data import ProsodyCollator
-from prosodia_lyricist.legacy_features import encode_example
-from prosodia_lyricist.legacy_model import ProsodyBart
 from prosodia_lyricist.prepare import prepare
-from prosodia_lyricist.train import build_scheduler, run_epoch
+from prosodia_lyricist.train import build_scheduler
 
 
 def fake_backend(monkeypatch):
@@ -60,49 +57,6 @@ def test_real_modern_parser():
     assert all(s["ipa"] for w in words for s in w["syllables"])
 
 
-def test_auxiliary_losses_gradients_padding_and_reload(tmp_path, tokenizer, tiny_model, record):
-    record["words"] = [
-        {"text": "hello", "syllable_count": 2},
-        {"text": "world", "syllable_count": 1},
-    ]
-    example = encode_example(record, tokenizer, 8, scaffold=True)
-    assert example["labels"] == encode_example(record, tokenizer, 8)["labels"]
-    assert example["syllable_labels"] == [-100, 2, 1, -100, -100]
-    assert example["remainder_labels"] == [-100, 1, 0, -100, -100]
-    short = encode_example(
-        {**record, "words": record["words"][:1], "syllables": record["syllables"][:2]},
-        tokenizer,
-        8,
-        scaffold=True,
-    )
-    batch = ProsodyCollator(tokenizer.pad_token_id)([example, short])
-    assert batch["remainder_labels"][1, -1] == -100
-    model = ProsodyBart(
-        tiny_model.bart,
-        max_syllables=8,
-        dropout=0,
-        loss_weights={"word": 1, "syllable": 0.3, "remainder": 0.4, "sentence": 0.2},
-    )
-    output = model(**batch)
-    assert torch.allclose(
-        output.loss, sum(model.loss_weights[k] * v for k, v in output.loss_components.items())
-    )
-    output.loss.backward()
-    for head in model.auxiliary_heads.values():
-        assert head.weight.grad.abs().sum() > 0
-    assert model.projection.weight.grad.abs().sum() > 0
-    model.eval().save(tmp_path, tokenizer)
-    restored = ProsodyBart.load(tmp_path).eval()
-    assert restored.loss_weights == model.loss_weights
-    assert torch.equal(model(**batch).loss, restored(**batch).loss)
-    with pytest.raises(ValueError, match="scaffold labels"):
-        model(**{k: v for k, v in batch.items() if k != "remainder_labels"})
-
-
-def test_text_only_creates_no_heads(tiny_model):
-    assert not tiny_model.auxiliary_heads
-
-
 def test_schedule_matches_literal_original():
     parameter = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.AdamW([parameter], lr=1)
@@ -113,23 +67,6 @@ def test_schedule_matches_literal_original():
         schedule.step()
         rates.append(optimizer.param_groups[0]["lr"])
     assert rates == [0, 0.25, 0.5, 0.75, 0, 0, 0]
-
-
-def test_original_batch_mean():
-    class Model:
-        def train(self, mode):
-            pass
-
-        def __call__(self, labels):
-            return SimpleNamespace(loss=labels[0, 0].float())
-
-    metrics = run_epoch(
-        Model(),
-        [{"labels": torch.tensor([[2]])}, {"labels": torch.tensor([[4, 4, 4]])}],
-        "cpu",
-        loss_aggregation="batches",
-    )
-    assert metrics["loss"] == 3
 
 
 def test_constant_schedule_without_warmup():

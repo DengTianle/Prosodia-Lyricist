@@ -291,6 +291,12 @@ def test_standalone_training_and_single_pass_evaluation(model, tmp_path, monkeyp
     assert report["schema_version"] == 4
     assert "teacher_forced" not in report and "generation" not in report
     assert report["prediction"]["slots"] == report["prediction"]["compared_slots"] == 7
+    classes = report["prediction"]["classification"]
+    assert classes["length"]["slots"] == 7
+    assert sum(sum(row) for row in classes["strength"]["confusion_matrix"]) == 7
+    if len(model.strength_labels) == 3:
+        assert classes["strength"]["classes"]["substrong"]["reference_count"] == 1
+        assert classes["strength"]["classes"]["weak"]["reference_count"] == 2
     dataset = BridgeDataset(data["prepared_dir"], "test", **loaded.dataset_options)
     loader = DataLoader(
         dataset, batch_size=2, collate_fn=partial(bridge_collate, pairs=model.pairs)

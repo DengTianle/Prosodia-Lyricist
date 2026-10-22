@@ -135,6 +135,7 @@ def evaluate_bridge(
             **(generated if parallel else {}),
             "loss": scores["loss"],
             "loss_components": scores["components"],
+            "classification": scores["classification"],
             "accuracy": {
                 name: scores[f"{'' if parallel else 'teacher_forced_'}{key}_accuracy"]
                 for name, key in (
@@ -166,6 +167,13 @@ def evaluate_bridge(
                 "MIDI inference still uses note counts."
             ),
             "combined_accuracy": "Both strength and length must match at the same slot.",
+            "classification": (
+                "Per-head reference/prediction counts, mean softmax probabilities and confusion "
+                "matrices over valid slots. Length ranking uses long as positive, grouping ties "
+                "for ROC AUC and average precision. Balanced accuracy and macro F1 average classes "
+                "with reference support. Label entropy is the empirical reference entropy in nats, "
+                "a constant-output diagnostic, not a held-out fitted baseline."
+            ),
             "prosody_bleu": (
                 f"{METRIC_VERSION}: phrase-mean unsmoothed BLEU-4 of (strength,length) "
                 "symbols, same as final lyric evaluation. A phrase with either sequence "

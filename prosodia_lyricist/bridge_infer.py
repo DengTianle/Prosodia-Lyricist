@@ -11,7 +11,6 @@ from .bridge_data import (
     encode_bridge_source,
 )
 from .bridge_model import ProsodyBridge
-from .features import MAX_LINES
 from .ipa import REPO_RULES
 from .midi import midi_melody_record
 
@@ -36,8 +35,6 @@ def predict_templates(
             "repo" if mode == "actual" and model.query_attention != "cross" else "complete"
         ),
     )
-    if len(source["lines"]) > MAX_LINES:
-        raise ValueError(f"Template decoder supports at most {MAX_LINES} MIDI phrases")
     for index, line in enumerate(source["lines"]):
         count = len(line["melody"]["midi_pitches"])
         if count > model.max_syllables:

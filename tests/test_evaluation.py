@@ -1,5 +1,6 @@
 import json
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -14,10 +15,10 @@ from prosodia_lyricist.evaluation import (
     paper_syllable,
     prosody_bleu,
 )
-from prosodia_lyricist.legacy_features import encode_source
-from prosodia_lyricist.legacy_model import ProsodyBart as LegacyProsodyBart
 from prosodia_lyricist.prepare import SCHEMA_VERSION
 from prosodia_lyricist.report import markdown_report, write_report
+from prosodia_lyricist.xai_features import encode_source
+from prosodia_lyricist.xai_model import XAILyricist
 
 
 def test_bleu_clipping_brevity_and_fixed_order():
@@ -116,7 +117,7 @@ def test_conditional_perplexity_uses_shifted_raw_logits(tiny_model, tokenizer, r
         )
     assert result["nll_sum"] == pytest.approx(expected["nll_sum"])
     # Teacher forcing must not accidentally include an auxiliary weighted loss.
-    tiny_model.loss_weights["word"] = 99
+    tiny_model.loss_weights["lyrics"] = 99
     assert conditional_perplexity(tiny_model, inputs, labels, tokenizer) == result
 
 
@@ -143,14 +144,23 @@ def test_inference_report_and_template_cli(tmp_path, tokenizer, tiny_model, monk
         )
     )
     monkeypatch.setattr(
-        LegacyProsodyBart,
+        XAILyricist,
         "generate",
-        lambda *a, **kw: torch.tensor(
-            [[tokenizer.eos_token_id] + tokenizer.encode("hello world.")]
+        lambda *a, **kw: SimpleNamespace(
+            sequences=torch.tensor(
+                [
+                    [tokenizer.bos_token_id]
+                    + tokenizer.encode("hello world.", add_special_tokens=False)
+                    + [tokenizer.eos_token_id]
+                ]
+            ),
+            explanations=[{"text": "hello world.", "hit_token_limit": False}],
         ),
     )
     monkeypatch.setattr(evaluation, "text_prosody", lambda _: [])
-    report = infer.infer(checkpoint, path, device="cpu", top_k=1, return_report=True)
+    report = infer.infer(
+        checkpoint, path, device="cpu", prosody_mode="paper", top_k=1, return_report=True
+    )
     assert report["unit"] == "whole_song"
     assert report["stress_source"] == "supplement"
     assert report["lyrics"] == ["hello world"]
@@ -161,15 +171,19 @@ def test_inference_report_and_template_cli(tmp_path, tokenizer, tiny_model, monk
     with pytest.raises(FileExistsError):
         write_report(report, tmp_path / "report")
     with pytest.raises(ValueError, match="MIDI has 1 phrases; reference has 2 lines"):
-        infer.infer(checkpoint, path, device="cpu", reference_lines=["one", "two"])
+        infer.infer(
+            checkpoint, path, device="cpu", prosody_mode="paper", reference_lines=["one", "two"]
+        )
     with pytest.raises(ValueError, match=r"blank reference lines: \[1\]"):
-        infer.infer(checkpoint, path, device="cpu", reference_lines=["  "])
+        infer.infer(checkpoint, path, device="cpu", prosody_mode="paper", reference_lines=["  "])
     with monkeypatch.context() as patch:
         records = infer.midi_records(path)
         records[-1]["unmarked_notes_omitted"] = 10
         patch.setattr(infer, "midi_records", lambda *a, **kw: records)
         with pytest.raises(ValueError, match="10 notes after the final phrase-end marker"):
-            infer.infer(checkpoint, path, device="cpu", reference_lines=["one", "two"])
+            infer.infer(
+                checkpoint, path, device="cpu", prosody_mode="paper", reference_lines=["one", "two"]
+            )
     monkeypatch.setattr(
         evaluation.ipa,
         "parse_words",
@@ -179,6 +193,7 @@ def test_inference_report_and_template_cli(tmp_path, tokenizer, tiny_model, monk
         checkpoint,
         path,
         device="cpu",
+        prosody_mode="paper",
         top_k=1,
         return_report=True,
         reference_lines=["hello world"],

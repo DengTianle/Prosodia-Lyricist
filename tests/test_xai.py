@@ -9,7 +9,6 @@ from tokenizers.models import WordLevel
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from prosodia_lyricist.data import ProsodyCollator
-from prosodia_lyricist.model import ProsodyBart
 from prosodia_lyricist.xai_features import encode_example, encode_targets, load_tokenizer
 from prosodia_lyricist.xai_model import XAILyricist
 
@@ -143,7 +142,7 @@ def test_source_projection_matches_reference_without_embedding_dropout(
 def test_native_save_reload_and_plain_generation(xai_model, record, tokenizer, tmp_path):
     model = xai_model.eval()
     model.save(tmp_path, tokenizer)
-    restored = ProsodyBart.load(tmp_path).eval()
+    restored = XAILyricist.load(tmp_path).eval()
     assert isinstance(restored, XAILyricist)
     assert restored.bart.generation_config.no_repeat_ngram_size == 0
     assert restored.bart.generation_config.num_beams == 1

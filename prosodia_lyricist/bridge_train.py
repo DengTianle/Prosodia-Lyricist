@@ -22,7 +22,7 @@ from .bridge_data import (
     BridgeDataset,
     bridge_collate,
 )
-from .bridge_metrics import TemplateMetrics
+from .bridge_metrics import ClassificationMetrics, TemplateMetrics
 from .bridge_model import ProsodyBridge
 from .data import read_manifest
 from .ipa import REPO_STRESSES
@@ -80,6 +80,9 @@ def run_bridge_epoch(
     component_totals = {}
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
     strength_correct, length_correct = 0, 0
+    classification = ClassificationMetrics(
+        getattr(model, "strength_labels", ("strong", "weak")), collect_length_scores=not training
+    )
     parallel = getattr(model, "query_mode", "autoregressive") == "parallel"
     if template_metrics and not parallel:
         raise ValueError("Single-pass template metrics require parallel queries")
@@ -118,6 +121,16 @@ def run_bridge_epoch(
                 else:
                     predicted = output.logits.argmax(-1)[active]
                 expected = batch["labels"][active] - PAIR_OFFSET
+                classification.update(
+                    predicted, expected,
+                    strength_logits=(
+                        output.strength_logits[active]
+                        if hasattr(output, "strength_logits") else None
+                    ),
+                    length_logits=(
+                        output.length_logits[active] if hasattr(output, "length_logits") else None
+                    ),
+                )
                 correct += int(predicted.eq(expected).sum())
                 # Each stress class occupies two pair IDs, ordered long then short.
                 strength_correct += int((predicted // 2).eq(expected // 2).sum())
@@ -161,6 +174,7 @@ def run_bridge_epoch(
         "phrases": phrases,
         "batches": batches,
         "optimizer_steps": updates,
+        "classification": classification.report(),
     }
     if not parallel:
         result["history_mask_probability"] = history_mask_probability if training else 0.0
@@ -481,6 +495,19 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 epoch + 1, training["loss"], validation["loss"],
                 *(f"{validation[key]:.4f}"
                   for key in ("strength_accuracy", "length_accuracy", "pair_accuracy")),
+            )
+            length = validation["classification"]["length"]
+            long_class = length["classes"]["long"]
+            logger.info(
+                "Length CE %.4f, label entropy %.4f; majority=%s (%.4f); "
+                "predicted long=%.4f (mean probability %.4f), long recall=%s; "
+                "balanced accuracy=%.4f; long ROC AUC=%s",
+                validation["components"]["length"], length["label_entropy"],
+                length["majority_class"], length["majority_accuracy"],
+                long_class["predicted_fraction"], long_class["mean_probability"],
+                long_class["recall"],
+                length["balanced_accuracy"],
+                length["ranking"]["roc_auc"],
             )
             if validation["loss"] < best:
                 best, stale = validation["loss"], 0

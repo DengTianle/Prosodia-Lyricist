@@ -51,9 +51,8 @@ serialization; they and padding are excluded from the loss.
 
 The default `prosody_mode: actual` uses XAI's `strong/substrong/weak` stress and
 `long/short` vowel length. Only the IPA long mark denotes long, matching the
-historical dictionary-first pronunciation path. Binary paper-mode data remains
-supported for the earlier four-stream lyric decoder, with a two-class stress
-head. A checkpoint's vocabulary and IPA rules must match its prepared data and
+historical dictionary-first pronunciation path. Binary paper-mode bridges remain loadable for template evaluation;
+the current XAI handoff requires the three-class repo vocabulary. A checkpoint's vocabulary and IPA rules must match its prepared data and
 lyric decoder; secondary stress is not collapsed for XAI.
 
 Reference IPA counts specify query positions during training and evaluation.

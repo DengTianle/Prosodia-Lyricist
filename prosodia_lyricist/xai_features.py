@@ -5,10 +5,6 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from .legacy_features import SOURCE_KEYS as SOURCE_KEYS
-from .legacy_features import encode_source as encode_legacy_source
-from .legacy_features import record_lines
-
 logger = logging.getLogger(__name__)
 TARGET_KEYS = ("labels",)
 BASE_VOCAB_SIZE = 50265
@@ -23,9 +19,72 @@ REFERENCE_TOKEN_IDS = {
 }
 
 
+STRESSES = ("strong", "substrong", "weak", "unknown")
+LENGTH_IDS = {"long": 1, "short": 2}
+SOURCE_KEYS = ("input_ids", "length_ids", "remainder_ids", "attention_mask")
+
+
+def special_tokens(max_syllables):
+    return (
+        ["<title>", "<template>", "<keywords>"]
+        + [f"<{stress}>" for stress in STRESSES]
+        + [f"<syllable_{n}>" for n in range(1, max_syllables + 1)]
+    )
+
+
+def configure_tokenizer(tokenizer, max_syllables):
+    tokenizer.add_special_tokens({"additional_special_tokens": special_tokens(max_syllables)})
+    tokenizer.padding_side = "right"
+    return tokenizer
+
+
+def record_lines(record):
+    # A single phrase is also a valid one-line song (e.g. a short MIDI).
+    lines = record["lines"] if "lines" in record else [record]
+    if not lines:
+        raise ValueError("Expected at least one lyric line")
+    return lines
+
+
+def token_id(tokenizer, token):
+    value = tokenizer.convert_tokens_to_ids(token)
+    if value is None or value == tokenizer.unk_token_id:
+        raise ValueError(f"Tokenizer is missing the template token {token}")
+    return value
+
+
 def encode_source(record, tokenizer, max_syllables):
-    """The released MIDI and binary inputs omit both keyword markers and text."""
-    return encode_legacy_source(record, tokenizer, max_syllables, include_keywords=False)
+    ids = [tokenizer.bos_token_id, token_id(tokenizer, "<title>")]
+    ids += tokenizer.encode(record.get("title", "").replace(".", ""), add_special_tokens=False)
+    lengths, remainders = [0] * len(ids), [0] * len(ids)
+
+    def append_plain(tokens):
+        ids.extend(tokens)
+        lengths.extend([0] * len(tokens))
+        remainders.extend([0] * len(tokens))
+
+    for line in record_lines(record):
+        syllables = line["syllables"]
+        count = len(syllables)
+        if not 1 <= count <= max_syllables:
+            raise ValueError(f"Expected 1..{max_syllables} syllables per line, got {count}")
+        append_plain(
+            [token_id(tokenizer, f"<syllable_{count}>"), token_id(tokenizer, "<template>")]
+        )
+        for index, syllable in enumerate(syllables):
+            ids.append(token_id(tokenizer, f"<{syllable['stress']}>"))
+            lengths.append(LENGTH_IDS[syllable["length"]])
+            # Remaining+1 reserves zero for padding; reset for each line.
+            remainders.append(count - index)
+        # The released XAI source omits keyword markers and text.
+        append_plain(tokenizer.encode(".", add_special_tokens=False))
+    append_plain([tokenizer.eos_token_id])
+    return {
+        "input_ids": ids,
+        "length_ids": lengths,
+        "remainder_ids": remainders,
+        "attention_mask": [1] * len(ids),
+    }
 
 
 def load_tokenizer(directory=None, *, cache_dir=None, local_files_only=False):
@@ -94,8 +153,6 @@ def load_tokenizer(directory=None, *, cache_dir=None, local_files_only=False):
 
 
 def validate_tokenizer(tokenizer, model):
-    from .features import token_id
-
     if len(tokenizer) != model.bart.config.vocab_size:
         raise ValueError("XAI tokenizer and checkpoint vocabulary sizes differ")
     if len(tokenizer) == REFERENCE_VOCAB_SIZE and any(

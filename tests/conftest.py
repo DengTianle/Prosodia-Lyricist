@@ -5,8 +5,8 @@ from tokenizers.pre_tokenizers import Whitespace
 from tokenizers.processors import TemplateProcessing
 from transformers import BartConfig, BartForConditionalGeneration, PreTrainedTokenizerFast
 
-from prosodia_lyricist.features import configure_tokenizer
-from prosodia_lyricist.legacy_model import ProsodyBart
+from prosodia_lyricist.xai_features import configure_tokenizer
+from prosodia_lyricist.xai_model import XAILyricist
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ def tiny_model(tokenizer):
         eos_token_id=2,
         decoder_start_token_id=2,
     )
-    return ProsodyBart(BartForConditionalGeneration(config), max_syllables=8, dropout=0.0)
+    return XAILyricist(BartForConditionalGeneration(config), max_syllables=8)
 
 
 @pytest.fixture

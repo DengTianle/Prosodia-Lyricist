@@ -1,18 +1,11 @@
-"""Tokenized JSONL datasets and padding for compound prosody features."""
+"""Prepared-data manifest validation and XAI source/target padding."""
 
-import hashlib
 import json
-import logging
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset
-from tqdm import tqdm
 
-from .features import encode_example
 from .prepare import SCHEMA_VERSION
-
-logger = logging.getLogger(__name__)
 
 
 def read_manifest(directory):
@@ -26,67 +19,6 @@ def read_manifest(directory):
         if previous != info["split"]:
             raise ValueError("A song group appears in more than one data split")
     return manifest
-
-
-class LyricDataset(Dataset):
-    def __init__(
-        self,
-        directory,
-        split,
-        tokenizer,
-        *,
-        max_source_length,
-        max_target_length,
-        limit=None,
-        scaffold=False,
-        decoder_mode="explainable",
-    ):
-        if decoder_mode not in ("explainable", "lyrics"):
-            raise ValueError("decoder_mode must be explainable or lyrics")
-        if decoder_mode == "lyrics":
-            from .legacy_features import encode_example as encode_legacy
-        manifest = read_manifest(directory)
-        path = Path(directory) / f"{split}.jsonl"
-        if hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"][path.name]:
-            raise ValueError(f"{path} differs from its preparation manifest; prepare again")
-        self.examples = []
-        self.skipped = 0
-        with path.open(encoding="utf-8") as handle:
-            for row in tqdm(handle, desc=f"Tokenizing {split}", unit="song"):
-                record = json.loads(row)
-                if not record.get("lines"):
-                    raise ValueError("Expected a song with ordered lines; prepare again")
-                if manifest["songs"][record["song_id"]]["split"] != split:
-                    raise ValueError(f"Song in incorrect split: {record['song_id']}")
-                if decoder_mode == "lyrics":
-                    example = encode_legacy(
-                        record, tokenizer, manifest["config"]["max_syllables"], scaffold=scaffold
-                    )
-                else:
-                    example = encode_example(record, tokenizer, manifest["config"]["max_syllables"])
-                if (
-                    len(example["input_ids"]) > max_source_length
-                    or len(example["labels"]) > max_target_length
-                ):
-                    self.skipped += 1
-                    continue
-                self.examples.append(example)
-                if limit is not None and len(self.examples) >= limit:
-                    break
-        if not self.examples:
-            raise ValueError(
-                f"No usable examples in {split}; prepare more songs or raise length limits"
-            )
-        if self.skipped:
-            logger.warning(
-                "Skipped %d %s songs exceeding token limits (no truncation)", self.skipped, split
-            )
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, index):
-        return self.examples[index]
 
 
 class ProsodyCollator:

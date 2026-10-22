@@ -6,9 +6,9 @@ import json
 import pytest
 
 from prosodia_lyricist import ipa
-from prosodia_lyricist.data import LyricDataset, read_manifest
-from prosodia_lyricist.legacy_features import SOURCE_KEYS, encode_example
+from prosodia_lyricist.data import read_manifest
 from prosodia_lyricist.prepare import prepare
+from prosodia_lyricist.xai_features import SOURCE_KEYS, encode_example
 
 
 def add_line(annotation):
@@ -52,17 +52,7 @@ def test_two_lines_one_example_with_original_boundaries(tmp_path, annotation, to
     song = json.loads(rows[0])
     assert [line["line_id"] for line in song["lines"]] == [0, 1]
     assert [line["text"] for line in song["lines"]] == ["hello world", "light"]
-    dataset = LyricDataset(
-        directory,
-        split,
-        tokenizer,
-        decoder_mode="lyrics",
-        max_source_length=1024,
-        max_target_length=1024,
-        scaffold=True,
-    )
-    assert len(dataset) == 1
-    example = dataset[0]
+    example = encode_example(song, tokenizer, 8)
     assert tokenizer.convert_ids_to_tokens(example["input_ids"]) == [
         "<s>",
         "<title>",
@@ -73,17 +63,14 @@ def test_two_lines_one_example_with_original_boundaries(tmp_path, annotation, to
         "<unknown>",
         "<unknown>",
         "<unknown>",
-        "<keywords>",
         ".",
         "<syllable_1>",
         "<template>",
         "<unknown>",
-        "<keywords>",
         ".",
         "</s>",
     ]
     assert tokenizer.convert_ids_to_tokens(example["labels"]) == [
-        "<s>",
         "hello",
         "world",
         ".",
@@ -92,9 +79,6 @@ def test_two_lines_one_example_with_original_boundaries(tmp_path, annotation, to
         "</s>",
     ]
     assert [r for r in example["remainder_ids"] if r] == [3, 2, 1, 1]
-    assert example["syllable_labels"] == [-100, 2, 1, -100, 1, -100, -100]
-    assert example["remainder_labels"] == [-100, 1, 0, -100, 0, -100, -100]
-    assert example["sentence_labels"] == [0, 1, 1, 0, 1, 0, 0]
     assert example["labels"] == encode_example(song, tokenizer, 8)["labels"]
     assert len({len(example[key]) for key in SOURCE_KEYS}) == 1
     for i, token in enumerate(example["input_ids"]):
@@ -111,42 +95,6 @@ def test_invalid_line_rejects_whole_song(tmp_path, annotation):
     assert manifest["counts"]["songs_rejected_lines"] == 1
     assert manifest["counts"]["lines_rejected"] == 1
     assert json.loads((directory / "rejected.jsonl").read_text())["line_id"] == 1
-
-
-@pytest.mark.parametrize("side", ["source", "target"])
-def test_complete_song_limits_inclusive_and_never_truncated(tmp_path, annotation, tokenizer, side):
-    # Ordinary words tokenize to one token with this test tokenizer. Make one
-    # song exactly 1024 tokens on the selected side, and a second 1025 tokens.
-    songs = []
-    for i in range(3):
-        song = copy.deepcopy(annotation)
-        song["info"].update(id=f"limit-{i}", artist="same", title="same")
-        if i:
-            count = 1013 + i if side == "source" else 1019 + i
-            if side == "source":
-                song["info"]["title"] = " ".join(["song"] * count)
-            else:
-                song["annotations"]["annot"]["words"][0]["text"] = " ".join(["hello"] * count)
-        songs.append(song)
-    # Share an audio id so all three songs enter the same split even with long titles.
-    for song in songs:
-        song["info"]["audio"] = {"url": "same-audio"}
-    directory, manifest = prepare_songs(tmp_path, songs)
-    split = manifest["songs"]["limit-0"]["split"]
-    rows = [json.loads(row) for row in (directory / f"{split}.jsonl").read_text().splitlines()]
-    key = "input_ids" if side == "source" else "labels"
-    assert [len(encode_example(row, tokenizer, 8)[key]) for row in rows[1:]] == [1024, 1025]
-    dataset = LyricDataset(
-        directory,
-        split,
-        tokenizer,
-        decoder_mode="lyrics",
-        max_source_length=1024,
-        max_target_length=1024,
-    )
-    assert len(dataset) == 2
-    assert dataset.skipped == 1
-    assert len(dataset[1][key]) == 1024
 
 
 def test_old_line_manifest_requires_repreparation(tmp_path):
@@ -185,9 +133,6 @@ def test_real_ipa_song_preparation(tmp_path, annotation):
 
 
 def test_question_and_empty_melisma_keep_complete_ipa_song(tmp_path, annotation, tokenizer):
-    from prosodia_lyricist.features import TARGET_KEYS, WORD_END
-    from prosodia_lyricist.features import encode_example as encode_template_example
-
     pytest.importorskip("prosodic")
     annot = add_line(annotation)["annotations"]["annot"]
     annot["words"][1]["text"] = "world?"
@@ -208,15 +153,11 @@ def test_question_and_empty_melisma_keep_complete_ipa_song(tmp_path, annotation,
     assert line["sung_syllables"][-1]["duration"] == 2.5
     assert line["sung_syllables"][-1]["note_count"] == 2
     assert not (directory / "rejected.jsonl").read_text()
-    # Punctuation survives the four-stream targets without a completed-word event.
+    # Punctuation survives in XAI's plain lyric target stream.
     tokenizer.add_tokens(["?"])
-    example = encode_template_example(row, tokenizer, 8)
+    example = encode_example(row, tokenizer, 8)
     question = example["labels"].index(tokenizer.convert_tokens_to_ids("?"))
-    assert example["labels"].count(tokenizer.convert_tokens_to_ids(WORD_END)) == 3
     assert example["labels"][question + 1] == tokenizer.convert_tokens_to_ids(".")
-    assert all(example[key][question] == 0 for key in TARGET_KEYS[1:])
-    assert sum(example["syllable_labels"]) == 4
-    assert len({len(example[key]) for key in TARGET_KEYS}) == 1
     from prosodia_lyricist.prepare import SCHEMA_VERSION
 
     assert manifest["schema_version"] == SCHEMA_VERSION
@@ -234,9 +175,9 @@ def test_word_without_pronunciation_still_rejected(monkeypatch):
 
     word = SimpleNamespace(txt="missing", wordtype=SimpleNamespace(form=None))
     monkeypatch.setattr(
-        ipa, "backend", lambda: SimpleNamespace(
-            Text=lambda *a, **kw: SimpleNamespace(wordtokens=[word])
-        )
+        ipa,
+        "backend",
+        lambda: SimpleNamespace(Text=lambda *a, **kw: SimpleNamespace(wordtokens=[word])),
     )
     with pytest.raises(ValueError, match="No IPA pronunciation for 'missing'"):
         ipa.parse_words("missing")
@@ -249,11 +190,13 @@ def test_midi_song_generated_once_and_limits_checked(
     record,
     monkeypatch,
 ):
+    from types import SimpleNamespace
+
     import torch
 
     from prosodia_lyricist import infer as inference
-    from prosodia_lyricist.legacy_model import ProsodyBart
     from prosodia_lyricist.prepare import SCHEMA_VERSION
+    from prosodia_lyricist.xai_model import XAILyricist
 
     tiny_model.save(tmp_path, tokenizer)
     run = {
@@ -269,9 +212,12 @@ def test_midi_song_generated_once_and_limits_checked(
 
     def generate(self, **kwargs):
         calls.append(kwargs)
-        return torch.tensor([tokenizer.encode("hello world. light.")])
+        return SimpleNamespace(
+            sequences=torch.tensor([tokenizer.encode("hello world. light.")]),
+            explanations=[{"text": "hello world. light.", "hit_token_limit": False}],
+        )
 
-    monkeypatch.setattr(ProsodyBart, "generate", generate)
+    monkeypatch.setattr(XAILyricist, "generate", generate)
     lyrics = inference.infer(tmp_path, "unused.mid", title="a song", device="cpu", top_k=1)
     assert lyrics == ["hello world", "light"]
     assert len(calls) == 1
@@ -280,7 +226,7 @@ def test_midi_song_generated_once_and_limits_checked(
     assert calls[0]["input_ids"].eq(template).sum().item() == 2
     with pytest.raises(ValueError, match="target token limit"):
         inference.infer(tmp_path, "unused.mid", device="cpu", max_new_tokens=32)
-    run["config"]["model"]["max_source_length"] = 16  # Each phrase fits, whole song does not.
+    run["config"]["model"]["max_source_length"] = 14  # Each phrase fits, whole song does not.
     (tmp_path / "run.json").write_text(json.dumps(run))
     with pytest.raises(ValueError, match="song template exceeds"):
         inference.infer(tmp_path, "unused.mid", device="cpu")
@@ -300,23 +246,3 @@ def test_ipa_cache_failure_is_not_a_data_rejection(monkeypatch):
     monkeypatch.setattr(ipa, "backend", lambda: SimpleNamespace(Text=failed_text))
     with pytest.raises(RuntimeError, match="resource/cache failure"):
         ipa.parse_words("unseen word")
-
-
-@pytest.mark.parametrize("source_limit,target_limit", [(16, 1024), (1024, 6)])
-def test_limits_apply_to_combined_song(tmp_path, annotation, tokenizer, source_limit, target_limit):
-    directory, manifest = prepare_songs(tmp_path, [add_line(annotation)])
-    split = manifest["songs"]["song-a"]["split"]
-    row = json.loads((directory / f"{split}.jsonl").read_text())
-    for line in row["lines"]:
-        example = encode_example(line, tokenizer, 8)
-        assert len(example["input_ids"]) <= source_limit
-        assert len(example["labels"]) <= target_limit
-    with pytest.raises(ValueError, match="No usable examples"):
-        LyricDataset(
-            directory,
-            split,
-            tokenizer,
-            decoder_mode="lyrics",
-            max_source_length=source_limit,
-            max_target_length=target_limit,
-        )

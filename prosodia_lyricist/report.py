@@ -83,12 +83,6 @@ def markdown_report(report):
                     f"- {label}: **{number(value['perplexity'])}** "
                     f"({value['token_count']} scored BPE tokens)"
                 )
-                if "event_perplexity" in value:
-                    event = value["event_perplexity"]
-                    rows.append(
-                        f"  - Including word-end events: {number(event['perplexity'])} "
-                        f"({event['token_count']} events); separate diagnostic."
-                    )
         rows.extend(
             [
                 "",

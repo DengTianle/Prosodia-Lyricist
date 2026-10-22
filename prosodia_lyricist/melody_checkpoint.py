@@ -71,5 +71,9 @@ def load_contrastive_melody(path):
         "pretraining_manifest": str(args.get("manifest", "")),
         "pretraining_train_split": args.get("train_split", "train"),
         "pretraining_valid_split": args.get("val_split", "val"),
+        "upstream_melody_pretrained_checkpoint": (
+            str(args["melody_pretrained_checkpoint"])
+            if args.get("melody_pretrained_checkpoint") else None
+        ),
     }
     return tower, config, provenance

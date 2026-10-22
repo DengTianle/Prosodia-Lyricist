@@ -205,125 +205,31 @@ def aggregate_perplexity(statistics):
 
 
 @torch.inference_mode()
-def conditional_perplexity(model, inputs, labels, tokenizer, *, prosody_labels=None):
-    """Score raw lyric logits with the correct causal decoder representation.
-
-    Explainable labels require all three aligned prosody streams. Keep word-end
-    events in decoder context but exclude their log probabilities from the main
-    BPE score. Also expose a separately named all-event score for diagnostics.
-    """
-    from .features import WORD_END, token_id
-    from .model import ProsodyBart
-    from .xai_model import XAILyricist
-
-    explainable = isinstance(model, ProsodyBart)
-    excluded = ()
-    if explainable:
-        if prosody_labels is None or len(prosody_labels) != 3:
-            raise ValueError("Explainable perplexity requires three aligned prosody streams")
-        if any(
-            p.shape != labels.shape or not torch.equal(p.eq(-100), labels.eq(-100))
-            for p in prosody_labels
-        ):
-            raise ValueError("Perplexity target streams must have aligned shapes and padding")
-        decoder_ids = model.bart.prepare_decoder_input_ids_from_labels(labels)
-        decoder_mask = torch.ones_like(labels)
-        decoder_mask[:, 1:] = labels[:, :-1].ne(-100)
-        output = model.bart(
-            inputs_embeds=(
-                inputs["inputs_embeds"]
-                if "inputs_embeds" in inputs
-                else model.embed_source(inputs["input_ids"], inputs["length_ids"])
-            ),
-            attention_mask=inputs["attention_mask"],
-            decoder_inputs_embeds=model.embed_target(
-                decoder_ids, *(model.shift_features(p) for p in prosody_labels)
-            ),
-            decoder_attention_mask=decoder_mask,
-            use_cache=False,
-        )
-        excluded = (token_id(tokenizer, WORD_END),)
-    elif isinstance(model, XAILyricist):
-        if prosody_labels is not None:
-            raise ValueError("The XAI checkpoint accepts only a lyric stream")
-        output = model(
-            input_ids=inputs["input_ids"],
-            length_ids=inputs["length_ids"],
-            remainder_ids=inputs["remainder_ids"],
-            attention_mask=inputs["attention_mask"],
-            inputs_embeds=inputs.get("inputs_embeds"),
-            labels=labels,
-        )
-    else:
-        if prosody_labels is not None:
-            raise ValueError("Legacy checkpoints do not accept compound decoder streams")
-        output = model.bart(
-            inputs_embeds=model.embed_source(
-                inputs["input_ids"], inputs["length_ids"], inputs["remainder_ids"]
-            ),
-            attention_mask=inputs["attention_mask"],
-            labels=labels,
-            use_cache=False,
-        )
+def conditional_perplexity(model, inputs, labels, tokenizer):
+    """Score raw XAI lyric logits with causal teacher forcing, excluding BOS/PAD."""
+    output = model(
+        input_ids=inputs["input_ids"],
+        length_ids=inputs["length_ids"],
+        remainder_ids=inputs["remainder_ids"],
+        attention_mask=inputs["attention_mask"],
+        labels=labels,
+    )
     scored = labels.ne(-100) & labels.ne(tokenizer.bos_token_id) & labels.ne(tokenizer.pad_token_id)
-    for excluded_id in excluded:
-        scored &= labels.ne(excluded_id)
     if not scored.any():
         return {
             "perplexity": None,
             "nll_sum": 0.0,
             "token_count": 0,
             "mean_nll": None,
-            "reason": "No scored lyric tokens remain after incomplete-word removal",
+            "reason": "No scored lyric tokens",
         }
-    result = aggregate_perplexity(
+    return aggregate_perplexity(
         [
             nll_statistics(
                 output.logits,
                 labels,
                 bos_token_id=tokenizer.bos_token_id,
                 pad_token_id=tokenizer.pad_token_id,
-                exclude_token_ids=excluded,
             )
         ]
     )
-    if explainable:
-        result["conditioning"] = "prior word-boundary events and prior decoder prosody"
-        result["event_perplexity"] = aggregate_perplexity(
-            [
-                nll_statistics(
-                    output.logits,
-                    labels,
-                    bos_token_id=tokenizer.bos_token_id,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-            ]
-        )
-    return result
-
-
-def reference_targets(lines, tokenizer, max_syllables, *, explainable):
-    """Build teacher-forcing targets only; reference text never builds the source."""
-    from .features import WORD_END, token_id, word_prosody
-
-    streams = [[tokenizer.bos_token_id], [0], [0], [0]]
-
-    def append(token, features=(0, 0, 0)):
-        for stream, value in zip(streams, (token, *features), strict=True):
-            stream.append(value)
-
-    for line in lines:
-        for word in ipa.parse_words(line):
-            for token in tokenizer.encode(" " + word["text"], add_special_tokens=False):
-                if explainable and token == tokenizer.unk_token_id:
-                    raise ValueError(f"Reference word cannot be tokenized: {word['text']!r}")
-                append(token)
-            if explainable and word["syllables"]:
-                features = word_prosody(word["syllables"])
-                if features[0] > max_syllables:
-                    raise ValueError("Reference word exceeds syllable vocabulary")
-                append(token_id(tokenizer, WORD_END), features)
-        for token in tokenizer.encode(".", add_special_tokens=False):
-            append(token)
-    append(tokenizer.eos_token_id)
-    return streams
