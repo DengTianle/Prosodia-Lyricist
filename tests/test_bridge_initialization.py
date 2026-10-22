@@ -54,7 +54,6 @@ def config(tmp_path):
             output_dir=str(tmp_path / "runs"), device="cpu", seed=1234, epochs=1,
             batch_size=2, patience=2, learning_rate=1e-3, melody_learning_rate=1e-3,
             melody_unfreeze_epoch=0, warmup_steps=0, schedule="constant_after_warmup",
-            history_mask_probability=0.3,
         ),
     }
 

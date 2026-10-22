@@ -84,11 +84,16 @@ def supplement_stress(start, duration, resolution):
     return "strong" if position % 4 in (0, 2) else "weak"
 
 
-def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="supplement"):
+def midi_records(
+    path, *, title="", track=0, max_syllables=64, stress_source="supplement", phrase_policy=None
+):
     import miditoolkit
 
     if stress_source not in ("supplement", "actual", "heuristic", "unknown"):
         raise ValueError("MIDI stress_source must be supplement, actual, heuristic or unknown")
+    if phrase_policy not in (None, "complete", "repo"):
+        raise ValueError("Unknown MIDI phrase policy")
+    phrase_policy = phrase_policy or ("repo" if stress_source == "actual" else "complete")
     midi = miditoolkit.MidiFile(str(path))
     if stress_source == "supplement" and any(
         (sig.numerator, sig.denominator) != (4, 4) for sig in midi.time_signature_changes
@@ -107,7 +112,7 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
     if not boundaries:
         raise ValueError("MIDI needs phrase-end markers; see examples/imagine.mid")
     final_marker = boundaries[-1]
-    if stress_source != "actual" and boundaries[-1] < notes[-1].end:
+    if phrase_policy == "complete" and boundaries[-1] < notes[-1].end:
         boundaries.append(notes[-1].end)
     groups, current, cursor = [], [], 0
     # Phrase-end markers include notes starting exactly at the marker, matching the old pipeline.
@@ -191,7 +196,7 @@ def midi_records(path, *, title="", track=0, max_syllables=64, stress_source="su
     return records
 
 
-def midi_note_comparison(path, *, title="", track=0, prosody_mode="paper"):
+def midi_note_comparison(path, *, title="", track=0, prosody_mode="paper", phrase_policy=None):
     """Old musical templates for reporting only, independent of learned slot counts."""
     import miditoolkit
 
@@ -205,6 +210,7 @@ def midi_note_comparison(path, *, title="", track=0, prosody_mode="paper"):
         track=track,
         # Reporting must retain all notes, even when a phrase exceeds the model's slot limit.
         max_syllables=max(1, sum(len(inst.notes) for inst in midi.instruments)),
+        phrase_policy=phrase_policy,
         stress_source="actual"
         if prosody_mode == "actual"
         else "supplement"

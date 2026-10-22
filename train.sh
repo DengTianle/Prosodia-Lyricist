@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=prosodia-end-to-end
+#SBATCH --job-name=prosodia-bridge-xai
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:a100-80:1
 #SBATCH --cpus-per-task=8
@@ -20,4 +20,4 @@ if [[ ! -x "$PROSODIA_ENV/bin/python" ]]; then
 fi
 export PATH="$PROSODIA_ENV/bin:$PATH"
 
-time "$PROSODIA_ENV/bin/python" -m prosodia_lyricist.train --config "${1:-configs/end_to_end.yaml}"
+time "$PROSODIA_ENV/bin/python" -m prosodia_lyricist.train --config "${1:-configs/bridge.yaml}"

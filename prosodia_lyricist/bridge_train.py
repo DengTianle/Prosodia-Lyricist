@@ -6,7 +6,8 @@ import math
 import os
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from itertools import islice, zip_longest
+from functools import partial
+from itertools import islice
 from pathlib import Path
 
 import torch
@@ -17,13 +18,14 @@ from .audit_bridge_splits import check_training_splits
 from .bridge_data import (
     FIRST_LINE,
     PAIR_OFFSET,
+    PAIRS,
     BridgeDataset,
     bridge_collate,
-    decode_bridge_tokens,
 )
+from .bridge_metrics import TemplateMetrics
 from .bridge_model import ProsodyBridge
 from .data import read_manifest
-from .evaluation import prosody_bleu
+from .ipa import REPO_STRESSES
 from .melody_checkpoint import file_sha256, load_contrastive_melody
 from .runtime import log_stage, seed_everything, select_device
 from .train import build_scheduler
@@ -66,6 +68,7 @@ def run_bridge_epoch(
     gradient_clip=1.0,
     max_batches=None,
     history_mask_probability=0.0,
+    template_metrics=False,
 ):
     training = optimizer is not None
     model.train(training)
@@ -77,6 +80,13 @@ def run_bridge_epoch(
     component_totals = {}
     tokens, phrases, correct, batches, updates = 0, 0, 0, 0, 0
     strength_correct, length_correct = 0, 0
+    parallel = getattr(model, "query_mode", "autoregressive") == "parallel"
+    if template_metrics and not parallel:
+        raise ValueError("Single-pass template metrics require parallel queries")
+    templates = (
+        TemplateMetrics(pairs=model.pairs, bridge_scope=model.bridge_scope)
+        if template_metrics else None
+    )
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
@@ -85,7 +95,9 @@ def run_bridge_epoch(
                 optimizer.zero_grad(set_to_none=True)
             for batch in group:
                 batch = {key: value.to(device) for key, value in batch.items()}
-                active = batch["labels"].ge(PAIR_OFFSET) & batch["labels"].lt(FIRST_LINE)
+                active = batch["labels"].ge(PAIR_OFFSET) & batch["labels"].lt(
+                    getattr(model, "first_line", FIRST_LINE)
+                )
                 count = int(active.sum())
                 line_count = int(batch["line_counts"].sum())
                 with (
@@ -107,12 +119,19 @@ def run_bridge_epoch(
                     predicted = output.logits.argmax(-1)[active]
                 expected = batch["labels"][active] - PAIR_OFFSET
                 correct += int(predicted.eq(expected).sum())
-                # PAIRS groups strong/weak by quotient and long/short by remainder.
+                # Each stress class occupies two pair IDs, ordered long then short.
                 strength_correct += int((predicted // 2).eq(expected // 2).sum())
                 length_correct += int((predicted % 2).eq(expected % 2).sum())
                 total_loss += output.loss.item() * count
                 for name, value in output.loss_components.items():
                     component_totals[name] = component_totals.get(name, 0.0) + value.item() * count
+                if templates is not None:
+                    note_counts = model.note_counts(batch["note_line_ids"], batch["line_counts"])
+                    templates.diagnose_counts(batch["syllable_counts"], note_counts)
+                    templates.record(
+                        model.template_sequences(output).tolist(),
+                        batch["labels"].tolist(), note_counts.tolist(),
+                    )
                 tokens += count
                 phrases += line_count
                 batches += 1
@@ -129,47 +148,49 @@ def run_bridge_epoch(
     if not tokens:
         raise ValueError("No template targets")
     loss = total_loss / tokens
-    return {
+    result = {
         "loss": loss,
         "components": {name: value / tokens for name, value in component_totals.items()},
-        "teacher_forced_strength_accuracy": strength_correct / tokens,
-        "teacher_forced_length_accuracy": length_correct / tokens,
-        "teacher_forced_pair_accuracy": correct / tokens,
+        **{
+            f"{'' if parallel else 'teacher_forced_'}{name}_accuracy": value / tokens
+            for name, value in (
+                ("strength", strength_correct), ("length", length_correct), ("pair", correct)
+            )
+        },
         "tokens": tokens,
         "phrases": phrases,
         "batches": batches,
         "optimizer_steps": updates,
-        "history_mask_probability": history_mask_probability if training else 0.0,
     }
+    if not parallel:
+        result["history_mask_probability"] = history_mask_probability if training else 0.0
+    if templates is not None:
+        result["templates"] = templates.report()
+    return result
 
 
 @torch.inference_mode()
 def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp32"):
-    """Free-running labels with IPA counts; note/IPA differences remain diagnostics."""
+    """Predict with reference IPA counts, without supplying any label history."""
     model.eval()
-    phrases, exact, count_matches, count_error, count_phrases = 0, 0, 0, 0, 0
-    skipped_examples, skipped_phrases = 0, 0
-    skipped_target_examples, skipped_target_phrases = 0, 0
-    bleu_sum, short_phrases = 0.0, 0
-    slots, strength_correct, length_correct, pair_correct = 0, 0, 0, 0
-    equal_count_phrases, equal_count_slots, equal_count_length_correct = 0, 0, 0
+    metrics = TemplateMetrics(
+        pairs=getattr(model, "pairs", PAIRS), bridge_scope=model.bridge_scope
+    )
     for batch in islice(loader, max_batches):
         batch = dict(batch)
         labels = batch.pop("labels")
         # Supply the reference skeleton, but never feed gold prosody labels to generation.
         counts = batch["syllable_counts"]
         note_counts = model.note_counts(batch["note_line_ids"], batch["line_counts"])
-        active = counts.gt(0)
-        count_matches += int((note_counts.eq(counts) & active).sum())
-        count_error += int((note_counts - counts).abs()[active].sum())
-        count_phrases += int(active.sum())
+        metrics.diagnose_counts(counts, note_counts)
         eligible = counts.le(model.max_syllables).all(-1)
         target_eligible = (counts.sum(-1) + batch["line_counts"]).le(model.max_target_length)
-        skipped_examples += int((~eligible).sum())
-        skipped_phrases += int(batch["line_counts"][~eligible].sum())
-        # Report total-target exclusions separately; slot-limit failures take precedence.
-        skipped_target_examples += int((eligible & ~target_eligible).sum())
-        skipped_target_phrases += int(batch["line_counts"][eligible & ~target_eligible].sum())
+        metrics.counts.update(
+            skipped_examples=int((~eligible).sum()),
+            skipped_phrases=int(batch["line_counts"][~eligible].sum()),
+            skipped_target_examples=int((eligible & ~target_eligible).sum()),
+            skipped_target_phrases=int(batch["line_counts"][eligible & ~target_eligible].sum()),
+        )
         eligible &= target_eligible
         if not eligible.any():
             continue
@@ -185,60 +206,8 @@ def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp
             else nullcontext()
         ):
             result = model.generate(**batch)
-        for predicted, truth, phrase_notes in zip(
-            result.sequences.tolist(), labels.tolist(), retained_note_counts, strict=True
-        ):
-            expected = decode_bridge_tokens([token for token in truth if token != -100])
-            actual = decode_bridge_tokens(predicted)
-            for line_index, (a, b) in enumerate(zip(actual, expected, strict=True)):
-                phrases += 1
-                exact += a == b
-                hypothesis, reference = a["syllables"], b["syllables"]
-                bleu_sum += prosody_bleu(reference, hypothesis)
-                short_phrases += min(len(reference), len(hypothesis)) < 4
-                # Compare by phrase/slot order; missing and extra slots are incorrect.
-                slots += max(len(hypothesis), len(reference))
-                equal_count = phrase_notes[line_index] == len(reference)
-                if equal_count:
-                    equal_count_phrases += 1
-                    equal_count_slots += max(len(hypothesis), len(reference))
-                for predicted_slot, expected_slot in zip_longest(hypothesis, reference):
-                    if predicted_slot is not None and expected_slot is not None:
-                        strength_correct += predicted_slot["stress"] == expected_slot["stress"]
-                        length_correct += predicted_slot["length"] == expected_slot["length"]
-                        pair_correct += predicted_slot == expected_slot
-                        if equal_count:
-                            equal_count_length_correct += (
-                                predicted_slot["length"] == expected_slot["length"]
-                            )
-    return {
-        "phrases": phrases,
-        "slot_count_source": "ipa",
-        "strength_accuracy": strength_correct / slots if slots else None,
-        "length_accuracy": length_correct / slots if slots else None,
-        "pair_accuracy": pair_correct / slots if slots else None,
-        "compared_slots": slots,
-        "equal_note_ipa_count": {
-            "phrases": equal_count_phrases,
-            "compared_slots": equal_count_slots,
-            "length_accuracy": (
-                equal_count_length_correct / equal_count_slots if equal_count_slots else None
-            ),
-        },
-        "exact_template_accuracy": exact / phrases if phrases else None,
-        "prosody_bleu": bleu_sum / phrases if phrases else None,
-        "bleu_short_phrases": short_phrases,
-        "count_diagnostic_phrases": count_phrases,
-        "note_ipa_count_match_rate": count_matches / count_phrases,
-        "note_ipa_count_mae": count_error / count_phrases,
-        f"skipped_slot_limit_{'songs' if model.bridge_scope == 'song' else 'windows'}": (
-            skipped_examples
-        ),
-        "skipped_target_limit_examples": skipped_target_examples,
-        "skipped_target_limit_phrases": skipped_target_phrases,
-        "example_scope": model.bridge_scope,
-        "skipped_slot_limit_phrases": skipped_phrases,
-    }
+        metrics.record(result.sequences.tolist(), labels.tolist(), retained_note_counts)
+    return metrics.report()
 
 
 def train_bridge(config, *, output_dir=None, smoke_test=False):
@@ -275,7 +244,14 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         0 <= history_mask_probability <= 1
     ):
         raise ValueError("history_mask_probability must be a number between 0 and 1")
-    logger.info("Training label-history masking probability: %.3f", history_mask_probability)
+    if history_mask_probability:
+        raise ValueError(
+            "Remove training.history_mask_probability: parallel queries have no label history"
+        )
+    if cfg.get("query_mode", "parallel") != "parallel" or (
+        cfg.get("bridge_scope", "song") != "song"
+    ):
+        raise ValueError("New bridge training requires parallel song queries")
     with log_stage("Initializing bridge device and random seed"):
         seed_everything(settings["seed"])
         device = select_device(settings["device"])
@@ -346,16 +322,24 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "Melody initialization: %s; pretrained weights loaded=%s",
         provenance["initialization"], provenance["weights_loaded"],
     )
-    decoder = cfg.get("bridge_decoder", {})
+    if "bridge_readout" in cfg and "bridge_decoder" in cfg:
+        raise ValueError("Use model.bridge_readout, without the old bridge_decoder alias")
+    readout = cfg.get("bridge_readout", cfg.get("bridge_decoder", {}))
     if smoke_test:
-        decoder = dict(d_model=16, num_layers=1, num_heads=2, dim_feedforward=32, dropout=0.0)
+        readout = dict(d_model=16, num_layers=1, num_heads=2, dim_feedforward=32, dropout=0.0)
     with log_stage("Building bridge model"):
         model = ProsodyBridge(
             melody_config,
             max_syllables=data["max_syllables"],
             encoder_lines_per_window=encoder_lines,
             max_window_notes=max_window_notes,
-            bridge_scope=cfg.get("bridge_scope", "song"),
+            bridge_scope="song",
+            query_mode="parallel",
+            query_attention="cross",
+            strength_labels=(
+                REPO_STRESSES if data.get("prosody_mode", "paper") == "actual"
+                else ("strong", "weak")
+            ),
             max_song_notes=cfg.get("max_song_notes", 2048),
             max_song_lines=cfg.get("max_song_lines", 256),
             max_target_length=cfg.get("max_target_length"),
@@ -363,7 +347,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 1 if smoke_test else cfg.get("song_encoder_layers", 2)
             ),
             provenance=provenance,
-            **decoder,
+            **readout,
         )
         if tower is not None:
             model.melody_encoder.load_state_dict(tower.state_dict(), strict=True)
@@ -381,7 +365,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         split: DataLoader(
             ds,
             batch_size=min(2, settings["batch_size"]) if smoke_test else settings["batch_size"],
-            collate_fn=bridge_collate,
+            collate_fn=partial(bridge_collate, pairs=model.pairs),
             shuffle=split == "train",
             generator=torch.Generator().manual_seed(settings["seed"]),
             num_workers=0 if smoke_test else settings.get("num_workers", 0),
@@ -422,6 +406,10 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "training_count_source": "ipa",
         "inference_count_source": "notes",
         "output_design": model.output_design,
+        "query_mode": model.query_mode,
+        "query_attention": model.query_attention,
+        "output_labels": {"strength": list(model.strength_labels), "length": ["long", "short"]},
+        "prosody_rules": model.prosody_rules,
         "config": config,
         "smoke_test": smoke_test,
         "data_schema_version": manifest["schema_version"],
@@ -464,7 +452,6 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                     precision=precision,
                     gradient_clip=clip,
                     max_batches=max_batches,
-                    history_mask_probability=history_mask_probability,
                 )
             with tqdm(loaders["valid"], desc="Bridge validate", leave=False) as progress:
                 validation = run_bridge_epoch(
@@ -473,22 +460,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                     device,
                     precision=precision,
                     max_batches=max_batches,
-                )
-            logger.info(
-                "Epoch %d train %.4f valid %.4f; starting template generation "
-                "(cached decoder cuDNN SDPA disabled)",
-                epoch + 1, training["loss"], validation["loss"],
-            )
-            with (
-                log_stage("Epoch %d template generation", epoch + 1),
-                tqdm(loaders["valid"], desc="Bridge generate", leave=False) as progress,
-            ):
-                validation["generation"] = evaluate_templates(
-                    model,
-                    progress,
-                    device,
-                    max_batches=max_batches,
-                    precision=precision,
+                    template_metrics=True,
                 )
             handle.write(
                 json.dumps(
@@ -503,12 +475,11 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
                 + "\n"
             )
             handle.flush()
-            generation = validation["generation"]
             logger.info(
-                "Epoch %d train %.4f valid %.4f; free generation accuracy (IPA counts): "
+                "Epoch %d train %.4f valid %.4f; parallel prediction accuracy (IPA counts): "
                 "strength=%s length=%s pair=%s",
                 epoch + 1, training["loss"], validation["loss"],
-                *(f"{generation[key]:.4f}" if generation[key] is not None else "n/a"
+                *(f"{validation[key]:.4f}"
                   for key in ("strength_accuracy", "length_accuracy", "pair_accuracy")),
             )
             if validation["loss"] < best:

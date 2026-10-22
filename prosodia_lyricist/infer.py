@@ -83,7 +83,7 @@ def infer(
     if bridge_checkpoint and stress_source is not None:
         raise ValueError("stress_source is a heuristic option; omit it when using a bridge")
     if bridge_checkpoint and (checkpoint / "melody.json").exists():
-        raise ValueError("A bridge requires a four-stream template-decoder checkpoint")
+        raise ValueError("A bridge requires an XAI or four-stream template checkpoint")
     device = select_device(device)
     if checkpoint.is_file():
         model, tokenizer = load_template(
@@ -171,6 +171,8 @@ def infer(
         mode = prosody_mode or bridge.get("prosody_mode", "paper")
         if prosody_mode and mode != bridge.get("prosody_mode", "paper"):
             raise ValueError("Requested IPA rules differ from the learned bridge's rules")
+        if bridge.get("prosody_mode", "paper") != ("actual" if xai else "paper"):
+            raise ValueError("Bridge IPA rules differ from the template decoder's rules")
         stress_source = "learned"
     else:
         records = midi_records(
@@ -428,6 +430,7 @@ def template_report(midi, records, *, title, track, stress_source, prosody_mode=
             title=title,
             track=track,
             **({"prosody_mode": "actual"} if prosody_mode == "actual" else {}),
+            **({"phrase_policy": "complete"} if records[-1]["unmarked_tail"] else {}),
         )
         if report["note_comparison"]["warning"]:
             report["warnings"].append(report["note_comparison"]["warning"])

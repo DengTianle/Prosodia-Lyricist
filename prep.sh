@@ -14,4 +14,4 @@ export ESPEAK_DATA_PATH="$(python -c 'import espeak_english; print(espeak_englis
 export PHONEMIZER_ESPEAK_DATA_PATH="$ESPEAK_DATA_PATH"
 
 # Repo mode needs a one-time `python -m prosodia_lyricist.historical_ipa` installation.
-srun python -m prosodia_lyricist.prepare --config "${1:-configs/end_to_end.yaml}"
+srun python -m prosodia_lyricist.prepare --config "${1:-configs/bridge.yaml}"

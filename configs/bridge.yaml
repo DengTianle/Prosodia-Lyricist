@@ -1,7 +1,7 @@
-# All paths are relative to this YAML. Keep the existing template data/checkpoint.
+# All paths are relative to this YAML. The XAI lyric checkpoint is used only at inference.
 data:
   dali_dir: ../../DALI_v2
-  prepared_dir: ../data/dali-bridge
+  prepared_dir: ../data/dali-xai
   language: english
   song_ids_file: null
   min_ncc: 0.0
@@ -10,20 +10,21 @@ data:
   test_fraction: 0.1
   seed: 1234
   stress_source: ipa
+  prosody_mode: actual # Preserve XAI primary/secondary stress and long-vowel rules.
   include_melody: true
   # Preparation puts contrastive-trained identity groups in downstream train;
   # upstream val/test songs otherwise retain downstream random assignments.
   # Inspect early with: python -m prosodia_lyricist.prepare --config ... --check-splits
   # With warning mode, it may be changed or unavailable when reusing prepared data.
-  pretraining_manifest: ../../try-contrastive/600_2line_window12/segments_manifest.csv
+  pretraining_manifest: ../../try-contrastive/data/max_en_2line_16s/segments_manifest.csv
   lines_per_window: 2 # Pretrained tower's window size; retain existing prepared data.
 
 model:
   conditioning: bridge
   melody_initialization: pretrained # random never opens melody_checkpoint.
   # Current note-based two-pool contrastive checkpoint (same format as prosodia-direct).
-  melody_checkpoint: ../../try-contrastive/checkpoints/600_2line_window12/22Sep_1mig/best.pt
-  # Only used for random initialization; matches the current pretrained tower.
+  melody_checkpoint: ../../try-contrastive/checkpoints/large_2line_16s/best.pt
+  # Only used for random initialization; choose the tower size for the comparison.
   random_melody_encoder:
     d_model: 256
     num_layers: 4
@@ -33,13 +34,14 @@ model:
     pooling: cls
     max_length: 4096
   bridge_scope: song
+  query_mode: parallel # Position queries only; no prior labels or causal attention.
   encoder_lines_per_window: 2 # Must match data.lines_per_window and pretraining.
   max_window_notes: 512
   max_song_notes: 2048
   max_song_lines: 256
   max_target_length: 4096 # Includes fixed line prefixes. Skip whole songs; never truncate.
   song_encoder_layers: 2
-  bridge_decoder:
+  bridge_readout: # Cross-attention + FFN; each requested position reads the entire song.
     d_model: 256
     num_layers: 4
     num_heads: 4
@@ -50,7 +52,7 @@ training:
   # strict retains the preparation-time CSV requirement; warning permits reuse
   # with a changed/missing CSV and records the current audit status in run.json.
   pretraining_audit_mode: strict
-  output_dir: ../checkpoints/bridge
+  output_dir: ../checkpoints/bridge-xai
   device: cuda
   seed: 1234
   epochs: 100
@@ -58,9 +60,7 @@ training:
   num_workers: 0
   precision: bf16 #fp32 bf16 is also supported on CUDA hardware with BF16 support.
   gradient_accumulation_steps: 2
-  # Independently replace previous prosody pairs with SLOT during training; 0 disables.
-  history_mask_probability: 0.3
-  # Zero-based: 1 warms up the new song encoder/decoder, then fine-tunes the trunk.
+  # Zero-based: 1 warms up the song encoder/readout, then fine-tunes the trunk.
   # null keeps the pretrained trunk frozen; 0 fine-tunes immediately.
   # Also applies to a random tower; use 0 to train it from the first epoch.
   melody_unfreeze_epoch: 1

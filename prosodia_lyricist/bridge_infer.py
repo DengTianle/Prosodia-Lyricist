@@ -31,7 +31,10 @@ def predict_templates(
         raise ValueError("Bridge syllable limit exceeds the template decoder's limit")
     mode = "actual" if model.prosody_rules == REPO_RULES else "paper"
     source = midi_melody_record(
-        midi, title=title, track=track, **({"phrase_policy": "repo"} if mode == "actual" else {})
+        midi, title=title, track=track,
+        phrase_policy=(
+            "repo" if mode == "actual" and model.query_attention != "cross" else "complete"
+        ),
     )
     if len(source["lines"]) > MAX_LINES:
         raise ValueError(f"Template decoder supports at most {MAX_LINES} MIDI phrases")
@@ -81,6 +84,9 @@ def predict_templates(
         "max_target_length": model.max_target_length,
         "target_scheme": model.target_scheme,
         "output_design": model.output_design,
+        "query_mode": model.query_mode,
+        "query_attention": model.query_attention,
+        "prosody_rules": model.prosody_rules,
         "count_sources": ["notes"] * len(records),
         "skeleton": {
             "lines": [
@@ -90,5 +96,5 @@ def predict_templates(
         },
         "note_counts": [len(line["melody"]["midi_pitches"]) for line in records],
         "syllable_counts": [len(line["syllables"]) for line in records],
-        "decoding": "greedy_skeleton",
+        "decoding": "parallel_queries" if model.query_mode == "parallel" else "greedy_skeleton",
     }

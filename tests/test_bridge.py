@@ -529,9 +529,8 @@ def test_window_tail_note_limits_and_checksums(tmp_path, lines):
 
 
 @pytest.mark.parametrize("pretrained", [False, True])
-@pytest.mark.parametrize("history_mask_probability", [0.0, 0.5])
 def test_prepare_train_and_reload_bridge(
-    tmp_path, monkeypatch, annotation, pretrained, history_mask_probability
+    tmp_path, monkeypatch, annotation, pretrained
 ):
     from prosodia_lyricist import ipa
     from prosodia_lyricist.prepare import prepare
@@ -598,7 +597,6 @@ def test_prepare_train_and_reload_bridge(
             learning_rate=0.001,
             melody_learning_rate=0.0001,
             melody_unfreeze_epoch=None,
-            history_mask_probability=history_mask_probability,
             warmup_steps=0,
             schedule="constant_after_warmup",
         ),
@@ -611,13 +609,13 @@ def test_prepare_train_and_reload_bridge(
     output = train(config, smoke_test=True)
     metrics = json.loads((output / "metrics.jsonl").read_text())
     assert metrics["train"]["loss"] > 0
-    assert metrics["train"]["history_mask_probability"] == history_mask_probability
-    assert metrics["valid"]["history_mask_probability"] == 0
+    assert "history_mask_probability" not in metrics["train"]
+    assert "teacher_forced_pair_accuracy" not in metrics["valid"]
     run = json.loads((output / "run.json").read_text())
-    assert run["config"]["training"]["history_mask_probability"] == history_mask_probability
+    assert run["query_mode"] == "parallel" and run["query_attention"] == "cross"
     assert run["melody_initialization"] == ("pretrained" if pretrained else "random")
     assert run["melody_provenance"]["weights_loaded"] == pretrained
-    assert 0 <= metrics["valid"]["generation"]["note_ipa_count_match_rate"] <= 1
+    assert 0 <= metrics["valid"]["templates"]["note_ipa_count_match_rate"] <= 1
     assert set(metrics["train"]["components"]) == {"strength", "length"}
     assert metrics["train"]["loss"] == pytest.approx(sum(metrics["train"]["components"].values()))
     restored = ProsodyBridge.load(output / "best")

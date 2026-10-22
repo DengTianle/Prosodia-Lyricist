@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from .data import read_manifest
+from .ipa import REPO_RULES, REPO_STRESSES
 from .melody_checkpoint import file_sha256
 from .melody_encoder.encoding import MELODY_FEATURE_DIM, encode_note_sequence
 from .runtime import log_stage
@@ -175,6 +176,7 @@ class BridgeDataset(Dataset):
     def __init__(
         self, directory, split, *, lines_per_window, max_notes, limit=None,
         bridge_scope="window", max_song_notes=2048, max_song_lines=256, max_target_length=None,
+        strength_labels=None,
     ):
         if lines_per_window < 1 or max_notes < 1:
             raise ValueError("Window sizes must be positive")
@@ -188,6 +190,19 @@ class BridgeDataset(Dataset):
         data = manifest["config"]
         if not data.get("include_melody") or data["stress_source"] != "ipa":
             raise ValueError("Prepare with include_melody: true and stress_source: ipa")
+        prepared_labels = (
+            REPO_STRESSES if data.get("prosody_mode", "paper") == "actual" else ("strong", "weak")
+        )
+        if strength_labels is not None and tuple(strength_labels) != prepared_labels:
+            raise ValueError("Prepared IPA rules differ from the bridge's stress/length vocabulary")
+        if prepared_labels == REPO_STRESSES and (
+            manifest.get("pronunciation", {}).get("rules") != REPO_RULES
+        ):
+            raise ValueError("Prepared IPA rules must record XAI historical pronunciation")
+        if data.get("lines_per_window", lines_per_window) != lines_per_window:
+            raise ValueError("Prepared encoder window size differs from the bridge")
+        self.strength_labels = prepared_labels
+        self.pairs = prosody_pairs(prepared_labels)
         path = Path(directory) / f"{split}.jsonl"
         with log_stage("Verifying prepared %s checksum: %s", split, path):
             if file_sha256(path) != manifest["sha256"][path.name]:
@@ -233,7 +248,9 @@ class BridgeDataset(Dataset):
                     self.examples.append(
                         {
                             **source,
-                            "labels": encode_bridge_targets(lines, data["max_syllables"]),
+                            "labels": encode_bridge_targets(
+                                lines, data["max_syllables"], pairs=self.pairs
+                            ),
                             # Evaluation metadata; bridge_collate never passes it to the model.
                             "note_duration_seconds": np.asarray([
                                 duration for line in lines
@@ -267,7 +284,7 @@ class BridgeDataset(Dataset):
         return self.examples[index]
 
 
-def bridge_collate(examples):
+def bridge_collate(examples, *, pairs=PAIRS):
     if not examples:
         raise ValueError("Cannot collate an empty bridge batch")
     for key in ("song_features", "labels"):
@@ -298,7 +315,10 @@ def bridge_collate(examples):
             batch["song_features"][row, :n] = torch.from_numpy(example["song_features"])
         if "labels" in batch:
             batch["labels"][row, : len(example["labels"])] = torch.tensor(example["labels"])
-            counts = [len(line["syllables"]) for line in decode_bridge_tokens(example["labels"])]
+            counts = [
+                len(line["syllables"])
+                for line in decode_bridge_tokens(example["labels"], pairs=pairs)
+            ]
             if len(counts) != example["line_count"]:
                 raise ValueError("Target line skeleton does not match the melody lines")
             batch["syllable_counts"][row, : len(counts)] = torch.tensor(counts)

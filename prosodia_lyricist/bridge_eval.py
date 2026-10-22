@@ -3,6 +3,7 @@
 import argparse
 import json
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -31,7 +32,7 @@ def evaluate_bridge(
     limit=None,
     progress=False,
 ):
-    """Return teacher-forced and free-running IPA-count metrics without training config."""
+    """Score IPA-count predictions; gold labels are loss targets only for parallel models."""
     if split not in ("valid", "test"):
         raise ValueError("Use the prepared valid or test split")
     if batch_size < 1 or num_workers < 0 or (limit is not None and limit < 1):
@@ -53,31 +54,39 @@ def evaluate_bridge(
     if any(
         len(line["syllables"]) > model.max_syllables
         for example in dataset.examples
-        for line in decode_bridge_tokens(example["labels"])
+        for line in decode_bridge_tokens(example["labels"], pairs=model.pairs)
     ):
         raise ValueError("Prepared IPA targets exceed the checkpoint's per-phrase slot limit")
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=False,
-        collate_fn=bridge_collate,
+        collate_fn=partial(bridge_collate, pairs=model.pairs),
         num_workers=num_workers,
     )
     model.to(device)
-    with tqdm(loader, desc="Teacher-forced evaluation", unit="batch", disable=not progress) as bar:
-        teacher = run_bridge_epoch(model, bar, device, precision=precision)
-    with tqdm(loader, desc="IPA-count generation", unit="batch", disable=not progress) as bar:
-        generated = evaluate_templates(model, bar, device, precision=precision)
+    parallel = model.query_mode == "parallel"
+    description = "Parallel IPA-slot prediction" if parallel else "Teacher-forced evaluation"
+    with tqdm(loader, desc=description, unit="batch", disable=not progress) as bar:
+        scores = run_bridge_epoch(
+            model, bar, device, precision=precision, template_metrics=parallel
+        )
+    if parallel:
+        generated = scores.pop("templates")
+    else:
+        with tqdm(loader, desc="IPA-count generation", unit="batch", disable=not progress) as bar:
+            generated = evaluate_templates(model, bar, device, precision=precision)
     duration_baselines = evaluate_duration_baselines(
-        dataset.examples, lines_per_window=model.encoder_lines_per_window, generation=generated
+        dataset.examples, lines_per_window=model.encoder_lines_per_window,
+        generation=generated, pairs=model.pairs,
     )
     generated["accuracy"] = {
         "strength": generated.pop("strength_accuracy"),
         "length": generated.pop("length_accuracy"),
         "combined": generated.pop("pair_accuracy"),
     }
-    return {
-        "schema_version": 3,
+    report = {
+        "schema_version": 4 if parallel else 3,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "checkpoint_weights_sha256": file_sha256(checkpoint / "bridge_weights.pt"),
@@ -117,30 +126,40 @@ def evaluate_bridge(
         },
         "bridge_scope": model.bridge_scope,
         "output_design": model.output_design,
+        "query_mode": model.query_mode,
+        "query_attention": model.query_attention,
+        "prosody_rules": model.prosody_rules,
+        "output_labels": {"strength": list(model.strength_labels), "length": ["long", "short"]},
         "target_scheme": model.target_scheme,
-        "teacher_forced": {
-            "loss": teacher["loss"],
-            "loss_components": teacher["components"],
+        "prediction" if parallel else "teacher_forced": {
+            **(generated if parallel else {}),
+            "loss": scores["loss"],
+            "loss_components": scores["components"],
             "accuracy": {
-                "strength": teacher["teacher_forced_strength_accuracy"],
-                "length": teacher["teacher_forced_length_accuracy"],
-                "combined": teacher["teacher_forced_pair_accuracy"],
+                name: scores[f"{'' if parallel else 'teacher_forced_'}{key}_accuracy"]
+                for name, key in (
+                    ("strength", "strength"), ("length", "length"), ("combined", "pair")
+                )
             },
-            "slots": teacher["tokens"],
-            "phrases": teacher["phrases"],
-            "batches": teacher["batches"],
+            "slots": scores["tokens"],
+            "phrases": scores["phrases"],
+            "batches": scores["batches"],
             "slot_count_source": "ipa",
         },
         "generation": generated,
         "duration_baselines": duration_baselines,
         "metric_definitions": {
             "loss": (
-                "Sum of mean binary strength and length cross-entropies per IPA slot; "
+                "Sum of mean stress and length cross-entropies per IPA slot; "
                 "prefixes/padding excluded."
                 if model.output_design == "separate"
                 else "Mean joint pair cross-entropy per IPA slot; prefixes/padding excluded."
             ),
-            "teacher_forced_accuracy": "Micro accuracy over IPA slots with gold prior labels.",
+            "prediction_accuracy" if parallel else "teacher_forced_accuracy": (
+                "Micro accuracy over IPA slots. All position queries attend to the song encoding "
+                "in parallel; gold stress/length labels are used only for scoring and loss."
+                if parallel else "Micro accuracy over IPA slots with gold prior labels."
+            ),
             "generation_accuracy": (
                 "Greedy free-running labels with reference IPA counts, without gold prior labels. "
                 "Micro accuracy over IPA slots, compared by phrase/slot order. "
@@ -153,14 +172,22 @@ def evaluate_bridge(
                 "shorter than four slots scores zero."
             ),
             "coverage": (
-                "Teacher forcing excludes entire examples above checkpoint source/target "
-                "limits. A song example is never partially retained. Generation also excludes "
-                "examples whose IPA counts exceed the per-phrase slot or total target limit. Count "
-                "diagnostics cover all teacher-forced phrases. Skips are reported separately. "
+                "Evaluation excludes entire examples above checkpoint source/target "
+                "limits. A song example is never partially retained. Predictions also respect "
+                "the per-phrase IPA slot and total target limits. Count "
+                "diagnostics cover all retained phrases. Skips are reported separately. "
                 "With --limit, counts cover only the scanned subset."
             ),
         },
     }
+    if parallel:
+        report.pop("generation")
+        report["metric_definitions"].pop("generation_accuracy")
+        report["metric_definitions"]["slot_count_source"] = (
+            "Reference IPA counts supply query positions during evaluation. MIDI inference "
+            "uses one query per note; no syllable-count predictor or alignment is trained."
+        )
+    return report
 
 
 def main(argv=None):
