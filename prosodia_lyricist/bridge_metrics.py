@@ -41,7 +41,8 @@ class ClassificationMetrics:
             )
             if logits is not None:
                 probabilities = logits.float().softmax(-1)
-                self.probability_sums[name] += probabilities.sum(0).double().cpu()
+                # MPS cannot cast to float64; keep double-precision accumulation on CPU.
+                self.probability_sums[name] += probabilities.sum(0).cpu().double()
                 self.probability_counts[name] += len(targets)
                 if name == "length" and self.collect_length_scores:
                     self.length_scores.append(probabilities[:, 0].cpu())

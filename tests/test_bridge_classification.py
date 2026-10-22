@@ -8,13 +8,19 @@ import torch
 from prosodia_lyricist.bridge_metrics import ClassificationMetrics
 
 
-def test_constant_predictions_report_class_counts_recall_and_probabilities():
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param("mps", marks=pytest.mark.skipif(
+        not torch.backends.mps.is_available(), reason="MPS is unavailable"
+    )),
+])
+def test_constant_predictions_report_class_counts_recall_and_probabilities(device):
     metrics = ClassificationMetrics(("strong", "substrong", "weak"), collect_length_scores=True)
     # Reference pairs: strong-long, substrong-short, weak-short, weak-short.
-    expected = torch.tensor([0, 3, 5, 5])
+    expected = torch.tensor([0, 3, 5, 5], device=device)
     predicted = torch.full_like(expected, 5)
-    strength = torch.tensor([[0.1, 0.2, 0.7]]).log().expand(4, -1)
-    length = torch.tensor([[0.3, 0.7]]).log().expand(4, -1)
+    strength = torch.tensor([[0.1, 0.2, 0.7]], device=device).log().expand(4, -1)
+    length = torch.tensor([[0.3, 0.7]], device=device).log().expand(4, -1)
     for start, end in ((0, 1), (1, 4)):
         metrics.update(
             predicted[start:end],
