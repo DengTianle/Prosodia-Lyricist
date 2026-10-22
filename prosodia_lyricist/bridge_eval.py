@@ -31,6 +31,7 @@ def evaluate_bridge(
     num_workers=0,
     limit=None,
     progress=False,
+    dali_dir=None,
 ):
     """Score IPA-count predictions; gold labels are loss targets only for parallel models."""
     if split not in ("valid", "test"):
@@ -50,6 +51,7 @@ def evaluate_bridge(
         split,
         **model.dataset_options,
         limit=limit,
+        dali_dir=dali_dir,
     )
     if any(
         len(line["syllables"]) > model.max_syllables
@@ -65,8 +67,12 @@ def evaluate_bridge(
         num_workers=num_workers,
     )
     model.to(device)
-    parallel = model.query_mode == "parallel"
-    description = "Parallel IPA-slot prediction" if parallel else "Teacher-forced evaluation"
+    note_heads = model.query_mode == "note"
+    parallel = model.query_mode in ("parallel", "note")
+    description = (
+        "Aligned note-head prediction" if note_heads else
+        "Parallel IPA-slot prediction" if parallel else "Teacher-forced evaluation"
+    )
     with tqdm(loader, desc=description, unit="batch", disable=not progress) as bar:
         scores = run_bridge_epoch(
             model, bar, device, precision=precision, template_metrics=parallel
@@ -86,7 +92,7 @@ def evaluate_bridge(
         "combined": generated.pop("pair_accuracy"),
     }
     report = {
-        "schema_version": 4 if parallel else 3,
+        "schema_version": 5 if note_heads else 4 if parallel else 3,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "checkpoint_weights_sha256": file_sha256(checkpoint / "bridge_weights.pt"),
@@ -102,6 +108,12 @@ def evaluate_bridge(
             "encoder_windows": dataset.encoder_windows,
             "skipped_examples": dataset.skipped,
             "skipped_limits": dataset.skipped_limits,
+            **({
+                "alignment_policy": model.alignment_policy,
+                "alignment_counts": dict(dataset.alignment_counts),
+                "raw_alignment_sha256": dataset.raw_alignment_sha256,
+                "skipped_no_alignment": dataset.skipped_alignment,
+            } if note_heads else {}),
             **({
                 "limit_windows": limit, "windows": len(dataset),
                 "skipped_note_limit_windows": dataset.skipped_limits["window_notes"],
@@ -143,7 +155,7 @@ def evaluate_bridge(
                 )
             },
             "slots": scores["tokens"],
-            "phrases": scores["phrases"],
+            "phrases": generated["phrases"] if note_heads else scores["phrases"],
             "batches": scores["batches"],
             "slot_count_source": "ipa",
         },
@@ -195,6 +207,25 @@ def evaluate_bridge(
             "Reference IPA counts supply query positions during evaluation. MIDI inference "
             "uses one query per note; no syllable-count predictor or alignment is trained."
         )
+    if note_heads:
+        report["metric_definitions"].update(
+            prediction_accuracy=(
+                "Micro accuracy on observed first-note anchors gathered into the IPA skeleton. "
+                "Only aligned targets enter stress/length CE and classification metrics; "
+                "gold labels, counts and alignment are never inputs to the note encoder/heads."
+            ),
+            slot_count_source=(
+                "Reference IPA skeleton and observed word/note anchors are used for scoring. "
+                "MIDI inference directly emits one stress/length pair per note."
+            ),
+            coverage=(
+                "Source/target limits exclude whole examples. Unaligned word targets are masked "
+                "while every retained note remains encoder context. Slot accuracy includes all "
+                "supervised slots; exact-template accuracy and BLEU include only fully supervised "
+                "phrases. Alignment counts include scanned examples; --limit selects a subset."
+            ),
+            loss="Sum of mean stress/length CE on aligned IPA slots; unmatched slots are excluded.",
+        )
     return report
 
 
@@ -202,6 +233,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--prepared-dir", required=True, type=Path)
+    parser.add_argument("--dali-dir", type=Path,
+                        help="Raw annotations for older prepared files without word/note links")
     parser.add_argument("--split", choices=("test", "valid"), default="test")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", default="auto")
@@ -223,6 +256,7 @@ def main(argv=None):
         num_workers=args.num_workers,
         limit=args.limit,
         progress=not args.no_progress,
+        dali_dir=args.dali_dir,
     )
     summary = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.output:

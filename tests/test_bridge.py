@@ -618,7 +618,7 @@ def test_prepare_train_and_reload_bridge(tmp_path, monkeypatch, annotation, pret
     assert "history_mask_probability" not in metrics["train"]
     assert "teacher_forced_pair_accuracy" not in metrics["valid"]
     run = json.loads((output / "run.json").read_text())
-    assert run["query_mode"] == "parallel" and run["query_attention"] == "cross"
+    assert run["query_mode"] == "note" and run["query_attention"] == "none"
     assert run["melody_initialization"] == ("pretrained" if pretrained else "random")
     assert run["melody_provenance"]["weights_loaded"] == pretrained
     assert 0 <= metrics["valid"]["templates"]["note_ipa_count_match_rate"] <= 1

@@ -131,19 +131,19 @@ small subsets may have empty splits, in which case training fails clearly.
 
 The bridge uses the window-preserving melody encoder and global song features
 from `prosodia-bridge2`. Two bidirectional song-encoder layers provide whole-song
-context. Each requested syllable position then retrieves from that memory using
-four cross-attention/FFN layers, with independent stress and vowel-length heads:
+context. Shared stress and vowel-length classifiers read each contextual note
+directly after those bidirectional layers:
 
 ```text
 MIDI notes → pretrained two-line windows → whole-song encoder
-           → parallel position queries → discrete IPA template
+           → per-note stress/length heads → discrete IPA template
            → original XAI-Lyricist template encoder and lyric decoder → lyrics
 ```
 
-Queries contain only line, within-line position, count, and sinusoidal position
-embeddings. There are no previous-label inputs, shifted labels, causal masks,
-query self-attention, or decoding loops. Both supervised losses backpropagate
-through the readout into the encoder when it is unfrozen:
+Observed DALI word/note links map the first note of each sung-syllable group to
+an IPA slot. Gold labels and this mapping select losses and scores; they never
+enter the encoder or classification heads. Both supervised losses backpropagate
+through the song encoder and, when unfrozen, the melody tower:
 
 ```text
 loss = CE_stress + CE_length
@@ -155,16 +155,19 @@ long mark means long. Prefixes and padding contribute no loss. The title and
 lyric text never enter the bridge; the title is supplied to XAI at inference.
 The XAI checkpoint is neither loaded nor updated during bridge training.
 
-Training and evaluation use reference IPA syllable counts to request positions.
-MIDI inference uses one position per note and retains an unmarked tail as a final
-phrase. There is no count predictor or forced note-to-syllable alignment; melisma
-can still make training and inference counts differ.
+Training and evaluation gather note predictions into the reference IPA skeleton.
+`model.alignment_policy: strict` masks whole words with unequal sung/IPA counts;
+`prefix` instead pairs their first `min(sung, IPA)` positions and ignores the
+unmatched tail. Alignment always restarts at word boundaries. Unresolved text
+alignment is masked. All notes remain encoder context, including continuations
+and masked words. MIDI inference emits one pair per note and retains an unmarked
+tail as a final phrase. There is no role or count predictor.
 
 Configure `configs/bridge.yaml` with the original contrastive checkpoint and its
 pretraining CSV. Set those paths before preparation so identity groups exposed to
 upstream training stay in downstream training. Other duplicate song/audio groups
 also stay together. Source limits remain 512 notes per encoder window, 2,048 notes
-and 256 lines per song, and 4,096 query/structural positions per song. Overlong
+and 256 lines per song, and 4,096 IPA/structural positions per song. Overlong
 training songs are skipped whole and counted; inference rejects them.
 
 ```bash
@@ -194,17 +197,21 @@ loading XAI. Reference lyrics are used only for scoring. XAI's tokenizer/config
 overrides and decoding controls remain available.
 
 Existing `data/dali-xai` data can be reused when its preparation configuration
-matches. Old binary paper-mode `data/dali-bridge` labels cannot supervise an XAI
+matches. New schema-v6 preparation stores word/note links. Older files recover
+them in memory from `data.dali_dir`, without rerunning IPA or changing the files;
+raw annotation checksums are recorded in the run. Evaluation accepts `--dali-dir`
+to override a cluster path. Old binary paper-mode labels cannot supervise an XAI
 bridge. For upstream CSV changes, `training.pretraining_audit_mode: warning`
 retains prepared-file integrity checks and records missing/conflicting audit
 information; `strict` requires the unchanged original CSV.
 
-Evaluation schema v4 reports one `prediction` block: slot-weighted loss, separate
+Evaluation schema v5 reports one `prediction` block: slot-weighted loss, separate
 loss components, head/pair accuracies, exact phrase accuracy, prosody-BLEU, and
-note/IPA count diagnostics. All are computed from the same parallel pass, without
-gold-label feedback. Unsmoothed BLEU-4 scores phrases shorter than four slots as
-zero. Duration baselines, constant controls, and the equal-note/IPA-count subset
-are retained. Checkpoint selection uses this same validation CE.
+note/IPA count diagnostics. Slot metrics use only aligned targets. Exact-template
+accuracy and BLEU use fully supervised phrases, with coverage reported explicitly.
+Unsmoothed BLEU-4 scores phrases shorter than four slots as zero. Duration
+baselines use the same first-note anchors and target masks. Checkpoint selection
+uses validation CE over supervised slots.
 The `classification` block adds per-head reference/prediction counts, confusion
 matrices, mean probabilities, per-class recall, balanced accuracy, and macro F1.
 `label_entropy` is the empirical reference entropy in nats; it helps identify
@@ -213,8 +220,9 @@ recall, so majority-class collapse is visible without opening the JSON.
 Validation additionally reports long-vs-short ROC AUC and average precision:
 these reveal useful ranking even when every argmax prediction is still short.
 
-New checkpoints use bridge format v8. Older v2-v7 checkpoints retain their original
-architecture for inference/evaluation; they do not initialize the new readout.
+New checkpoints use bridge format v9. Older v2-v8 checkpoints retain their original
+architecture for inference/evaluation. New training defaults to note heads;
+explicit legacy parallel-query configurations remain usable for comparisons.
 See [bridge details](docs/prosody-bridge.md) for features and configuration.
 
 ## XAI lyric inference and reports
@@ -278,8 +286,9 @@ prosodia_lyricist/
   melody_encoder/             pretrained note representation and tower
   melody_checkpoint.py        strict trunk import and provenance
   bridge_data.py              windows, global song features, targets, padding
-  bridge_model.py              source fusion, song encoder, structural queries
-  bridge_readout.py           cross-attention/FFN query readout
+  bridge_model.py              source fusion, song encoder, direct note heads
+  bridge_alignment.py         word-local IPA targets and observed note anchors
+  bridge_readout.py           legacy cross-attention query readout
   bridge_train.py, train.py    supervised training and validation
   bridge_eval.py              held-out template evaluation and controls
   bridge_infer.py              MIDI-to-template prediction

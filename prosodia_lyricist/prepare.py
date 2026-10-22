@@ -17,7 +17,7 @@ from tqdm import tqdm
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def normalized_identity(value):

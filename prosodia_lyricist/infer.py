@@ -103,7 +103,7 @@ def infer(
         run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
     if not checkpoint.is_file():
         model = XAILyricist.load(checkpoint).to(device).eval()
-    if run.get("data_schema_version") not in (3, 4, SCHEMA_VERSION):
+    if run.get("data_schema_version") not in (3, 4, 5, SCHEMA_VERSION):
         raise ValueError("Checkpoint uses an older input scheme; prepare and train song-level data")
     validate_tokenizer(tokenizer, model)
     mode = prosody_mode or "actual"

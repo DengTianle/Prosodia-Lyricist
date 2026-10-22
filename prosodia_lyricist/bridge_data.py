@@ -2,6 +2,7 @@
 
 import json
 import logging
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from .bridge_alignment import ALIGNMENT_POLICIES, aligned_note_indices, recover_note_alignment
 from .data import read_manifest
 from .ipa import REPO_RULES, REPO_STRESSES
 from .melody_checkpoint import file_sha256
@@ -176,12 +178,14 @@ class BridgeDataset(Dataset):
     def __init__(
         self, directory, split, *, lines_per_window, max_notes, limit=None,
         bridge_scope="window", max_song_notes=2048, max_song_lines=256, max_target_length=None,
-        strength_labels=None,
+        strength_labels=None, alignment_policy=None, dali_dir=None,
     ):
         if lines_per_window < 1 or max_notes < 1:
             raise ValueError("Window sizes must be positive")
         if bridge_scope not in ("window", "song"):
             raise ValueError("Unknown bridge scope")
+        if alignment_policy is not None and alignment_policy not in ALIGNMENT_POLICIES:
+            raise ValueError("alignment_policy must be strict or prefix")
         if max_song_notes < 1 or max_song_lines < 1 or (
             max_target_length is not None and max_target_length < 1
         ) or (limit is not None and limit < 1):
@@ -208,6 +212,8 @@ class BridgeDataset(Dataset):
             if file_sha256(path) != manifest["sha256"][path.name]:
                 raise ValueError("Prepared data differs from its manifest; prepare again")
         self.examples, self.skipped, self.songs = [], 0, set()
+        self.alignment_counts, self.raw_alignment_sha256 = Counter(), {}
+        self.skipped_alignment = 0
         self.bridge_scope, self.encoder_windows = bridge_scope, 0
         self.skipped_limits = dict(window_notes=0, song_notes=0, song_lines=0, target_tokens=0)
         with log_stage("Encoding bridge %s data", split), path.open(encoding="utf-8") as handle:
@@ -215,6 +221,11 @@ class BridgeDataset(Dataset):
                 song = json.loads(row)
                 if manifest["songs"][song["song_id"]]["split"] != split:
                     raise ValueError("Song appears in incorrect split")
+                if alignment_policy is not None and any(
+                    "note_alignment" not in line for line in song["lines"]
+                ):
+                    checksum = recover_note_alignment(song, dali_dir or data.get("dali_dir"))
+                    self.raw_alignment_sha256[song["song_id"]] = checksum
                 width = len(song["lines"]) if bridge_scope == "song" else lines_per_window
                 if not width:
                     raise ValueError("Empty bridge song")
@@ -241,6 +252,15 @@ class BridgeDataset(Dataset):
                         for reason, exceeded in over.items():
                             self.skipped_limits[reason] += int(exceeded)
                         continue
+                    alignment = {}
+                    if alignment_policy is not None:
+                        indices, counts = aligned_note_indices(lines, alignment_policy)
+                        self.alignment_counts.update(counts)
+                        if not counts["supervised_slots"]:
+                            self.skipped += 1
+                            self.skipped_alignment += 1
+                            continue
+                        alignment["target_note_indices"] = indices
                     source = (
                         encode_bridge_song(lines, lines_per_window)
                         if bridge_scope == "song" else encode_bridge_source(lines)
@@ -248,6 +268,7 @@ class BridgeDataset(Dataset):
                     self.examples.append(
                         {
                             **source,
+                            **alignment,
                             "labels": encode_bridge_targets(
                                 lines, data["max_syllables"], pairs=self.pairs
                             ),
@@ -276,6 +297,11 @@ class BridgeDataset(Dataset):
             split, len(self.examples), bridge_scope, self.encoder_windows,
             array_bytes / 1024**2, self.skipped_limits,
         )
+        if alignment_policy is not None:
+            logger.info(
+                "%s note alignment (%s): %s; %d examples without targets skipped",
+                split, alignment_policy, dict(self.alignment_counts), self.skipped_alignment,
+            )
 
     def __len__(self):
         return len(self.examples)
@@ -287,7 +313,7 @@ class BridgeDataset(Dataset):
 def bridge_collate(examples, *, pairs=PAIRS):
     if not examples:
         raise ValueError("Cannot collate an empty bridge batch")
-    for key in ("song_features", "labels"):
+    for key in ("song_features", "labels", "target_note_indices"):
         if any((key in e) != (key in examples[0]) for e in examples):
             raise ValueError("Cannot mix bridge scopes or labeled/unlabeled examples")
     width = max(len(e["note_line_ids"]) for e in examples)
@@ -306,6 +332,8 @@ def bridge_collate(examples, *, pairs=PAIRS):
         batch["syllable_counts"] = torch.zeros(
             len(examples), int(batch["line_counts"].max()), dtype=torch.long
         )
+        if "target_note_indices" in examples[0]:
+            batch["target_note_indices"] = torch.full_like(batch["labels"], -1)
     for row, example in enumerate(examples):
         n = len(example["note_line_ids"])
         batch["melody_features"][row, :n] = torch.from_numpy(example["melody_features"])
@@ -322,4 +350,9 @@ def bridge_collate(examples, *, pairs=PAIRS):
             if len(counts) != example["line_count"]:
                 raise ValueError("Target line skeleton does not match the melody lines")
             batch["syllable_counts"][row, : len(counts)] = torch.tensor(counts)
+            if "target_note_indices" in batch:
+                indices = example["target_note_indices"]
+                if len(indices) != len(example["labels"]):
+                    raise ValueError("Note alignment must match the IPA target skeleton")
+                batch["target_note_indices"][row, :len(indices)] = torch.tensor(indices)
     return batch

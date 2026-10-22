@@ -32,7 +32,8 @@ def predict_templates(
     source = midi_melody_record(
         midi, title=title, track=track,
         phrase_policy=(
-            "repo" if mode == "actual" and model.query_attention != "cross" else "complete"
+            "repo" if mode == "actual" and model.query_mode != "note"
+            and model.query_attention != "cross" else "complete"
         ),
     )
     for index, line in enumerate(source["lines"]):
@@ -93,5 +94,8 @@ def predict_templates(
         },
         "note_counts": [len(line["melody"]["midi_pitches"]) for line in records],
         "syllable_counts": [len(line["syllables"]) for line in records],
-        "decoding": "parallel_queries" if model.query_mode == "parallel" else "greedy_skeleton",
+        "decoding": (
+            "note_heads" if model.query_mode == "note" else
+            "parallel_queries" if model.query_mode == "parallel" else "greedy_skeleton"
+        ),
     }

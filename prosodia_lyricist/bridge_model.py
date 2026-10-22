@@ -1,4 +1,4 @@
-"""Contrastive melody trunk with legacy autoregressive or parallel structural queries."""
+"""Direct contextual note heads, with legacy query checkpoint compatibility."""
 
 import json
 from contextlib import nullcontext
@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from .bridge_alignment import ALIGNMENT_POLICIES, ALIGNMENT_SCHEME
 from .bridge_data import (
     BOS,
     PAD,
@@ -56,6 +57,7 @@ class ProsodyBridge(nn.Module):
         query_mode="autoregressive",
         strength_labels=("strong", "weak"),
         query_attention="self_cross",
+        alignment_policy="strict",
     ):
         super().__init__()
         if encoder_lines_per_window is not None:
@@ -80,25 +82,32 @@ class ProsodyBridge(nn.Module):
             raise ValueError("Song bridges require separate heads and a supported bridge scope")
         self.bridge_scope = bridge_scope
         self.output_design = output_design
-        if query_mode not in ("autoregressive", "parallel") or (
-            query_mode == "parallel" and bridge_scope != "song"
+        if query_mode not in ("autoregressive", "parallel", "note") or (
+            query_mode in ("parallel", "note") and bridge_scope != "song"
         ):
-            raise ValueError("Parallel slot queries require a song bridge")
+            raise ValueError("Parallel queries and note heads require a song bridge")
         self.query_mode = query_mode
-        if query_attention not in ("cross", "self_cross") or (
+        if query_mode == "note" and query_attention == "self_cross":
+            query_attention = "none"
+        if query_attention not in ("cross", "self_cross", "none") or (
             query_attention == "cross" and query_mode != "parallel"
-        ):
-            raise ValueError("Cross-attention readout requires parallel queries")
+        ) or ((query_attention == "none") != (query_mode == "note")):
+            raise ValueError("Invalid attention/readout for the selected bridge mode")
+        if alignment_policy not in ALIGNMENT_POLICIES:
+            raise ValueError("alignment_policy must be strict or prefix")
+        self.alignment_policy = alignment_policy
         self.query_attention = query_attention
         self.strength_labels = tuple(strength_labels)
         self.pairs = prosody_pairs(self.strength_labels)
         self.first_line = PAIR_OFFSET + len(self.pairs)
         self.prosody_rules = REPO_RULES if self.strength_labels == REPO_STRESSES else PAPER_RULES
         if len(self.strength_labels) == 3 and (
-            query_mode != "parallel" or output_design != "separate"
+            query_mode not in ("parallel", "note") or output_design != "separate"
         ):
             raise ValueError("Three-class repo stress requires a parallel separate-head bridge")
         self.target_scheme = (
+            "aligned_note_heads_v1"
+            if query_mode == "note" else
             "parallel_queries_v2"
             if query_attention == "cross"
             else "parallel_slots_v1"
@@ -178,18 +187,21 @@ class ProsodyBridge(nn.Module):
                 for parameter in self.song_encoder.parameters():
                     if parameter.ndim > 1:
                         nn.init.xavier_uniform_(parameter)
-        if query_mode == "parallel":
+        if query_mode == "note":
+            self.head_dropout = nn.Dropout(dropout)
+        elif query_mode == "parallel":
             # Only structural query types exist: line prefix or syllable slot.
             # No embedding of previous stress/length predictions is constructed.
             self.query_type_embedding = nn.Embedding(2, d_model)
         else:
             self.token_embedding = nn.Embedding(len(self.vocabulary), d_model, padding_idx=PAD)
-        self.slot_embedding = nn.Embedding(max_syllables + 1, d_model, padding_idx=0)
-        self.count_embedding = nn.Embedding(max_syllables + 1, d_model, padding_idx=0)
-        self.positions = SinusoidalPositionalEncoding(d_model, self.max_target_length)
+        if query_mode != "note":
+            self.slot_embedding = nn.Embedding(max_syllables + 1, d_model, padding_idx=0)
+            self.count_embedding = nn.Embedding(max_syllables + 1, d_model, padding_idx=0)
+            self.positions = SinusoidalPositionalEncoding(d_model, self.max_target_length)
         if query_attention == "cross":
             self.decoder = ParallelReadout(**self.decoder_config)
-        else:
+        elif query_mode != "note":
             # Retain the original stacks for loading v2-v7 checkpoints.
             layer = nn.TransformerDecoderLayer(
                 d_model=d_model,
@@ -235,6 +247,7 @@ class ProsodyBridge(nn.Module):
             max_song_lines=self.max_song_lines,
             max_target_length=self.max_target_length,
             strength_labels=self.strength_labels,
+            alignment_policy=self.alignment_policy if self.query_mode == "note" else None,
         )
 
     def encode(
@@ -416,6 +429,52 @@ class ProsodyBridge(nn.Module):
             logits=logits, strength_logits=strength_logits, length_logits=length_logits
         )
 
+    def predict_notes(
+        self, melody_features, melody_attention_mask, note_line_ids, line_counts,
+        song_features=None,
+    ):
+        """Two shared token-classification heads AFTER all bidirectional layers."""
+        if self.query_mode != "note":
+            raise ValueError("predict_notes requires direct note heads")
+        hidden = self.encode(
+            melody_features, melody_attention_mask, note_line_ids, line_counts, song_features
+        )
+        return self.classify(self.head_dropout(hidden))
+
+    def align_note_predictions(
+        self, notes, target_note_indices, syllable_counts, line_counts, note_line_ids,
+        melody_attention_mask,
+    ):
+        """Gather observed note anchors into an IPA skeleton; never learn alignment."""
+        self.validate_counts(syllable_counts, line_counts)
+        indices = target_note_indices
+        if indices.ndim != 2 or indices.dtype != torch.long or len(indices) != len(line_counts):
+            raise ValueError("Invalid target_note_indices shape/type")
+        skeleton = self.make_skeleton(syllable_counts, width=indices.shape[1])
+        slots = skeleton["tokens"].eq(SLOT)
+        active = indices.ge(0)
+        if (indices < -1).any() or (indices >= notes.logits.shape[1]).any() or (
+            active & ~slots
+        ).any():
+            raise ValueError("Invalid note index or mapped line prefix/padding")
+        safe = indices.clamp_min(0)
+        if (active & (
+            ~melody_attention_mask.gather(1, safe).bool()
+            | note_line_ids.gather(1, safe).ne(skeleton["line_ids"])
+        )).any():
+            raise ValueError("Note alignment points to padding or another phrase")
+        for row in indices:
+            selected = row[row.ge(0)]
+            if (selected[1:] <= selected[:-1]).any():
+                raise ValueError("Note anchors must be unique and ordered")
+        gathered = {}
+        for name in ("logits", "strength_logits", "length_logits"):
+            values = getattr(notes, name)
+            gathered[name] = values.gather(
+                1, safe[..., None].expand(-1, -1, values.shape[-1])
+            ).masked_fill(~active[..., None], 0)
+        return SimpleNamespace(**gathered, skeleton=skeleton, target_mask=active & slots)
+
     def predict_slots(
         self,
         melody_features,
@@ -462,13 +521,14 @@ class ProsodyBridge(nn.Module):
         song_features=None,
         *,
         history_mask_probability=0.0,
+        target_note_indices=None,
     ):
         if not isinstance(history_mask_probability, (int, float)) or not (
             0 <= history_mask_probability <= 1
         ):
             raise ValueError("history_mask_probability must be a number between 0 and 1")
-        if self.query_mode == "parallel" and history_mask_probability:
-            raise ValueError("Parallel queries have no label history to mask")
+        if self.query_mode != "autoregressive" and history_mask_probability:
+            raise ValueError("Note heads and parallel queries have no label history to mask")
         if (
             labels.ndim != 2
             or labels.shape[0] != len(melody_features)
@@ -477,7 +537,20 @@ class ProsodyBridge(nn.Module):
             raise ValueError("Invalid bridge target shape/length")
         if not labels.ne(-100).any():
             raise ValueError("No bridge target labels")
-        if self.query_mode == "parallel":
+        if self.query_mode == "note":
+            if target_note_indices is None or target_note_indices.shape != labels.shape:
+                raise ValueError(
+                    "Note-head training requires target_note_indices for the IPA skeleton"
+                )
+            notes = self.predict_notes(
+                melody_features, melody_attention_mask, note_line_ids, line_counts, song_features
+            )
+            output = self.align_note_predictions(
+                notes, target_note_indices, syllable_counts, line_counts, note_line_ids,
+                melody_attention_mask,
+            )
+            skeleton = output.skeleton
+        elif self.query_mode == "parallel":
             output = self.predict_slots(
                 melody_features, melody_attention_mask, note_line_ids, line_counts,
                 syllable_counts, song_features, width=labels.shape[1],
@@ -511,6 +584,8 @@ class ProsodyBridge(nn.Module):
                     )
                 tokens = tokens.masked_fill(mask, SLOT)
             output = self.decode(tokens, memory, melody_attention_mask, skeleton)
+        if self.query_mode == "note":
+            slots &= output.target_mask
         pair_targets = (labels - PAIR_OFFSET).masked_fill(~slots, -100)
         if self.output_design == "separate":
             strength_targets = (pair_targets // 2).masked_fill(~slots, -100)
@@ -518,10 +593,10 @@ class ProsodyBridge(nn.Module):
             components = {
                 "strength": F.cross_entropy(
                     output.strength_logits.flatten(0, 1), strength_targets.flatten()
-                ),
+                ) if slots.any() else output.strength_logits.sum() * 0,
                 "length": F.cross_entropy(
                     output.length_logits.flatten(0, 1), length_targets.flatten()
-                ),
+                ) if slots.any() else output.length_logits.sum() * 0,
             }
         else:
             components = {
@@ -534,6 +609,7 @@ class ProsodyBridge(nn.Module):
             length_logits=output.length_logits,
             loss_components=components,
             skeleton=skeleton,
+            target_mask=slots,
         )
 
     def template_sequences(self, output):
@@ -555,8 +631,36 @@ class ProsodyBridge(nn.Module):
         *,
         syllable_counts=None,
         use_cache=None,
+        target_note_indices=None,
     ):
         """Generate labels with optional known counts; default to one slot per note."""
+        if self.query_mode == "note":
+            notes = self.predict_notes(
+                melody_features, melody_attention_mask, note_line_ids, line_counts, song_features
+            )
+            counts = self.note_counts(note_line_ids, line_counts)
+            if target_note_indices is None:
+                if syllable_counts is not None and not torch.equal(syllable_counts, counts):
+                    raise ValueError("IPA-count generation requires observed target_note_indices")
+                self.validate_counts(counts, line_counts)
+                skeleton = self.make_skeleton(counts)
+                target_note_indices = torch.full_like(skeleton["tokens"], -1)
+                for row in range(len(counts)):
+                    slots = skeleton["tokens"][row].eq(SLOT)
+                    target_note_indices[row, slots] = torch.arange(
+                        int(melody_attention_mask[row].sum()), device=counts.device
+                    )
+            else:
+                if syllable_counts is None:
+                    raise ValueError("Observed note alignment requires IPA syllable_counts")
+                counts = syllable_counts
+            output = self.align_note_predictions(
+                notes, target_note_indices, counts, line_counts, note_line_ids,
+                melody_attention_mask,
+            )
+            return SimpleNamespace(
+                sequences=self.template_sequences(output), syllable_counts=counts
+            )
         if self.query_mode == "parallel":
             counts = (
                 self.note_counts(note_line_ids, line_counts)
@@ -627,6 +731,8 @@ class ProsodyBridge(nn.Module):
         directory.mkdir(parents=True, exist_ok=True)
         metadata = {
             "format_version": (
+                9
+                if self.query_mode == "note" else
                 8
                 if self.query_attention == "cross"
                 else 7
@@ -656,8 +762,16 @@ class ProsodyBridge(nn.Module):
             "bridge_scope": self.bridge_scope,
             "max_target_length": self.max_target_length,
         }
-        if self.query_mode == "parallel":
-            metadata["query_mode"] = "parallel"
+        if self.query_mode in ("parallel", "note"):
+            metadata["query_mode"] = self.query_mode
+        if self.query_mode == "note":
+            metadata["query_attention"] = "none"
+            metadata["alignment_policy"] = self.alignment_policy
+            metadata["alignment_scheme"] = ALIGNMENT_SCHEME
+            metadata["encoder_config"] = {
+                key: value for key, value in metadata.pop("decoder_config").items()
+                if key != "num_layers"
+            }
         if self.query_attention == "cross":
             metadata["query_attention"] = "cross"
             metadata["readout_config"] = metadata.pop("decoder_config")
@@ -684,7 +798,7 @@ class ProsodyBridge(nn.Module):
         version = meta["format_version"]
         strength_labels = (
             tuple(meta.get("output_labels", {}).get("strength", ()))
-            if version == 8 else REPO_STRESSES if version == 7 else ("strong", "weak")
+            if version in (8, 9) else REPO_STRESSES if version == 7 else ("strong", "weak")
         )
         pairs = prosody_pairs(strength_labels)
         expected_labels = {"strength": list(strength_labels), "length": ["long", "short"]}
@@ -701,15 +815,22 @@ class ProsodyBridge(nn.Module):
         }.issubset(meta):
             raise ValueError("Incomplete song bridge checkpoint architecture/feature rules")
         if (
-            version not in (2, 3, 4, 5, 6, 7, 8)
+            version not in (2, 3, 4, 5, 6, 7, 8, 9)
             or meta.get("target_scheme")
             != (
+                "aligned_note_heads_v1" if version == 9 else
                 "parallel_queries_v2" if version == 8 else
                 "parallel_slots_v1" if version >= 6 else f"line_skeleton_v{version}"
             )
-            or (version >= 6 and meta.get("query_mode") != "parallel")
+            or (version in (6, 7, 8) and meta.get("query_mode") != "parallel")
             or (version == 8 and (
                 meta.get("query_attention") != "cross" or "readout_config" not in meta
+            ))
+            or (version == 9 and (
+                meta.get("query_mode") != "note" or meta.get("query_attention") != "none"
+                or meta.get("alignment_policy") not in ALIGNMENT_POLICIES
+                or meta.get("alignment_scheme") != ALIGNMENT_SCHEME
+                or "encoder_config" not in meta
             ))
             or (version >= 3 and meta.get("inference_count_source") != "notes")
             or (
@@ -745,15 +866,17 @@ class ProsodyBridge(nn.Module):
             raise ValueError("Incompatible bridge checkpoint format/feature rules")
         model = cls(
             meta["melody_config"],
-            **meta["readout_config" if version == 8 else "decoder_config"],
+            **meta["encoder_config" if version == 9 else
+                   "readout_config" if version == 8 else "decoder_config"],
             max_syllables=meta["max_syllables"],
             lines_per_window=meta["lines_per_window"],
             max_notes=meta["max_notes"],
             provenance=meta["provenance"],
             output_design="separate" if version >= 4 else "joint_pair",
             bridge_scope="song" if version >= 5 else "window",
-            query_mode="parallel" if version >= 6 else "autoregressive",
-            query_attention="cross" if version == 8 else "self_cross",
+            query_mode="note" if version == 9 else "parallel" if version >= 6 else "autoregressive",
+            query_attention="none" if version == 9 else "cross" if version == 8 else "self_cross",
+            alignment_policy=meta.get("alignment_policy", "strict"),
             strength_labels=strength_labels,
             max_target_length=meta.get("max_target_length"),
             **(

@@ -1,9 +1,9 @@
-# Parallel melody → IPA template → XAI lyrics
+# Note heads → IPA template → XAI lyrics
 
 The standalone bridge predicts XAI-compatible IPA templates using supervised
-position queries. The original XAI template-to-lyrics checkpoint is used only
+note classification. The original XAI template-to-lyrics checkpoint is used only
 at inference and is not changed by bridge training. New bridge checkpoints use
-format v8; older v2-v7 checkpoints retain their original inference architecture.
+format v9; older v2-v8 checkpoints retain their original inference architecture.
 
 ## Melody encoding
 
@@ -13,7 +13,7 @@ contextual note vectors before pooled projection. Real windows are packed into
 one tower call and scattered back into song order. Padding never creates notes
 or windows.
 
-LayerNorm/linear/GELU adapts the vectors to readout width. Global sinusoidal note
+LayerNorm/linear/GELU adapts the vectors to song-encoder width. Global sinusoidal note
 positions and shared song-line embeddings are added after the tower, preserving
 its pretrained feature normalization.
 
@@ -30,24 +30,29 @@ A linear/GELU/linear/LayerNorm projection adds these features to the adapted
 vectors. After fusion normalization, two bidirectional song-encoder layers
 attend across the complete song.
 
-## Parallel prediction and supervision
+## Note prediction and supervision
 
-Each requested syllable position has a structural query: slot type, line ID,
-within-line index, line syllable count, and sinusoidal target position. Source
-note positions and target syllable positions are separate coordinates.
-
-Four pre-norm cross-attention/FFN layers retrieve from the complete song memory.
-There is no query self-attention, causal mask, previous-label embedding, target
-shift, or iterative prediction. All positions are evaluated together. The two
-heads predict stress and vowel length independently, with
+Dropout and two shared linear classifiers read each note's contextual vector
+directly after the song encoder. There are no target queries, count/slot
+embeddings, cross-attention readout, or label-history inputs in this architecture.
+Stress and vowel length are predicted independently at all notes, with
 
 ```text
 loss = CE_stress + CE_length
 ```
 
-Gold labels are loss targets only. Both losses train the readout and, when
-unfrozen, the melody encoder. Fixed line prefixes exist only for structural
-serialization; they and padding are excluded from the loss.
+Observed DALI word membership and sung-group starts select the first note of
+each sung syllable. Its predictions are gathered into the corresponding IPA
+slot. Counts, note anchors, and labels affect supervision only; they never
+condition the encoder or heads. Fixed line prefixes and padding have no loss.
+Both losses train the song encoder and, when unfrozen, the melody tower.
+
+`alignment_policy: strict` masks a word if its sung-group and IPA counts differ.
+`prefix` pairs their first `min(sung, IPA)` positions and masks the rest, always
+restarting at the next word. Spelling/token boundaries are matched within raw
+words; unresolved text is masked. All notes remain context. Examples with no
+supervised slots are skipped and counted. Continuation-note outputs have no
+direct CE target; there is no learned role head.
 
 The default `prosody_mode: actual` uses XAI's `strong/substrong/weak` stress and
 `long/short` vowel length. Only the IPA long mark denotes long, matching the
@@ -55,11 +60,11 @@ historical dictionary-first pronunciation path. Binary paper-mode bridges remain
 the current XAI handoff requires the three-class repo vocabulary. A checkpoint's vocabulary and IPA rules must match its prepared data and
 lyric decoder; secondary stress is not collapsed for XAI.
 
-Reference IPA counts specify query positions during training and evaluation.
-MIDI markers specify phrases at inference, and every note supplies one query.
+Reference IPA counts specify the scoring skeleton during training and evaluation.
+MIDI markers specify phrases at inference, and every note supplies one output pair.
 All notes, including an unmarked trailing phrase, are retained. Melisma can
-produce note/IPA count differences. There is no learned count head or guaranteed
-note-to-syllable alignment. No lyric words, title, or IPA labels enter the melody
+produce note/IPA count differences. There is no learned count head. No lyric
+words, title, or IPA labels enter the melody
 source. The title is supplied only to XAI.
 
 ## Configuration and workflow
@@ -67,13 +72,15 @@ source. The title is supplied only to XAI.
 Use the `prosodia-lyricist` Conda environment and `configs/bridge.yaml`; the README
 contains preparation, training, evaluation, and MIDI commands.
 
-- `model.bridge_readout` controls query width, layers, heads, FFN width, and dropout.
+- `model.query_mode: note` selects direct note heads.
+- `model.song_encoder` controls width, attention heads, FFN width, and dropout.
+- `model.alignment_policy` selects `strict` (default) or word-local `prefix`.
 - `model.song_encoder_layers` controls global source attention (zero bypasses it).
 - `model.melody_initialization` selects pretrained or random. Random mode never
   reads the checkpoint, and requires `model.random_melody_encoder`.
 - `training.melody_unfreeze_epoch` is zero-based: 1 warms up the new components,
   0 trains the tower immediately, and null freezes it throughout.
-- `training.learning_rate` applies to the adapter/song encoder/readout/heads;
+- `training.learning_rate` applies to the adapter/song encoder/heads;
   `melody_learning_rate` separately controls the tower.
 - Source/window/song and target limits skip entire training examples, with counts
   per reason. Inference rejects overlong input without truncation.
@@ -82,22 +89,26 @@ contains preparation, training, evaluation, and MIDI commands.
   warning mode records incomplete/conflicting audits while retaining data checks.
 
 XAI training requires repo-mode `data/dali-xai` data. Existing prepared data is
-reusable when its manifest configuration matches; old paper-mode labels require
-separate preparation. Training uses FP32 or supported CUDA BF16, slot-weighted
+reusable when its manifest configuration matches. Schema v6 stores note anchors;
+older files recover them in memory from raw DALI without rerunning pronunciation.
+Recovery verifies note pitch/timing and records raw file checksums. The evaluator's
+`--dali-dir` overrides old cluster paths. Old paper-mode labels require separate
+preparation. Training uses FP32 or supported CUDA BF16, supervised-slot-weighted
 gradient accumulation, clipping, and validation-CE early stopping. It never
 loads the test split or lyric model. Label-history masking is rejected because
 there is no history.
 
 ## Evaluation and inference
 
-Evaluation schema v4 contains one `prediction` block. Loss, stress/length/pair
+Evaluation schema v5 contains one `prediction` block. Loss, stress/length/pair
 accuracy, exact phrase templates, and phrase-mean unsmoothed BLEU-4 come from the
-same parallel pass. Reference IPA counts define the skeleton; count mismatches
-with notes remain diagnostics. Duration baselines and constant controls retain
-identical coverage, including the equal-count subset. Equal counts do not prove
-phonetic alignment.
+same encoder pass. Slot metrics exclude masked targets. Exact-template accuracy
+and BLEU score only fully supervised phrases; both coverage counts are reported.
+Reference IPA counts define the skeleton; count mismatches remain diagnostics.
+Duration baselines use identical note anchors and masks, including the equal-count
+subset. Equal counts do not prove phonetic alignment.
 
-MIDI inference performs one parallel readout over all song queries. Hard head
+MIDI inference classifies every note once. Hard head
 predictions are serialized into the unchanged XAI source format, including its
 stress tokens, vowel-length IDs, remainder IDs, title, and count prompts.
 References never construct the model source. Reports retain source notes and a

@@ -23,7 +23,8 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, 
         / sum(len(e["note_duration_seconds"]) for e in examples)
     )
     totals = {name: Counter() for name in ("all_ipa_slots", "equal_note_ipa_count")}
-    missing, extra = 0, 0
+    missing, extra, masked = 0, 0, 0
+    aligned = "target_note_indices" in examples[0]
     for example in examples:
         durations = np.asarray(example["note_duration_seconds"], dtype=np.float64)
         line_ids = np.asarray(example["note_line_ids"]) - 1
@@ -37,20 +38,37 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, 
             "line": line_means[line_ids],
         }
         predictions = {scope: durations > threshold for scope, threshold in thresholds.items()}
+        offset = 0
         for index, line in enumerate(decode_bridge_tokens(example["labels"], pairs=pairs)):
             truth = np.asarray([s["length"] == "long" for s in line["syllables"]])
+            reference_count = len(truth)
             note_mask = line_ids == index
             note_count = int(note_mask.sum())
-            overlap = min(note_count, len(truth))
-            missing += max(0, len(truth) - note_count)
-            extra += max(0, note_count - len(truth))
-            correct = {
-                scope: int(np.sum(predicted[note_mask][:overlap] == truth[:overlap]))
-                for scope, predicted in predictions.items()
-            }
+            if aligned:
+                anchors = np.asarray(example["target_note_indices"][offset + 1:
+                                    offset + 1 + reference_count])
+                active = anchors >= 0
+                offset += reference_count + 1
+                masked += int((~active).sum())
+                truth = truth[active]
+                extra += note_count - len(truth)
+                if not len(truth):
+                    continue
+                correct = {
+                    scope: int(np.sum(predicted[anchors[active]] == truth))
+                    for scope, predicted in predictions.items()
+                }
+            else:
+                overlap = min(note_count, len(truth))
+                missing += max(0, len(truth) - note_count)
+                extra += max(0, note_count - len(truth))
+                correct = {
+                    scope: int(np.sum(predicted[note_mask][:overlap] == truth[:overlap]))
+                    for scope, predicted in predictions.items()
+                }
             correct.update(always_long=int(truth.sum()), always_short=int((~truth).sum()))
             subsets = ["all_ipa_slots"]
-            if note_count == len(truth):
+            if note_count == reference_count:
                 subsets.append("equal_note_ipa_count")
             for subset in subsets:
                 totals[subset].update(phrases=1, compared_slots=len(truth), **correct)
@@ -94,11 +112,15 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, 
         "global_mean_note_duration_seconds": global_mean,
         "slot_count_source": "ipa",
         "alignment": (
+            "Use the same observed first-note-per-sung-group anchors and word-level target "
+            "mask as the note heads; unmatched IPA slots are excluded from both scores."
+            if aligned else
             "Pair notes and IPA slots by phrase/slot order using reference IPA counts. "
             "Trim extra notes; missing-note slots count as incorrect. Equal counts do not "
             "guarantee phonetic alignment; compare the model and baseline on the same subset."
         ),
         "missing_note_slots": missing,
         "extra_notes_ignored": extra,
+        "masked_ipa_slots": masked,
         **scores,
     }

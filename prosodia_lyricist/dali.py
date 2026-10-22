@@ -196,9 +196,10 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical", pro
         try:
             line_start, line_end = interval(line)
             syllables, text, scaffold_words = [], [], []
-            for word_text, notes in aligned_words(
+            line_words = aligned_words(
                 words_by_line[line_id], notes_by_word, line_start, line_end
-            ):
+            )
+            for word_text, notes in line_words:
                 sung = sung_syllables(notes)
                 stresses = (
                     lexical_stresses(word_text, len(sung))
@@ -257,6 +258,10 @@ def extract_lines(info, annot, *, max_syllables=64, stress_source="lexical", pro
                     "sung_syllables": sung_template,
                 }
             )
+            if stress_source == "ipa":
+                from .bridge_alignment import prepare_note_alignment
+
+                records[-1]["note_alignment"] = prepare_note_alignment(records[-1], line_words)
         except AnnotationError as exc:
             rejected.append({"song_id": info["id"], "line_id": line_id, "reason": str(exc)})
     return records, rejected

@@ -27,6 +27,10 @@ def prepared(tmp_path):
         }
         record = {"song_id": song, "lines": [{
             "syllables": [{"stress": "strong", "length": "long"}],
+            "note_alignment": {
+                "scheme": "dali_word_note_starts_v1", "note_count": 1,
+                "words": [{"note_starts": [0], "syllable_indices": [0]}],
+            },
             "melody": {"midi_pitches": [60], "onset_seconds": [0],
                        "note_duration_seconds": [0.5]},
         }]}

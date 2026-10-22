@@ -83,7 +83,7 @@ def run_bridge_epoch(
     classification = ClassificationMetrics(
         getattr(model, "strength_labels", ("strong", "weak")), collect_length_scores=not training
     )
-    parallel = getattr(model, "query_mode", "autoregressive") == "parallel"
+    parallel = getattr(model, "query_mode", "autoregressive") in ("parallel", "note")
     if template_metrics and not parallel:
         raise ValueError("Single-pass template metrics require parallel queries")
     templates = (
@@ -93,7 +93,13 @@ def run_bridge_epoch(
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
-            group_tokens = sum(int(batch["syllable_counts"].sum()) for batch in group)
+            group_tokens = sum(
+                int(batch["target_note_indices"].ge(0).sum())
+                if "target_note_indices" in batch else int(batch["syllable_counts"].sum())
+                for batch in group
+            )
+            if not group_tokens:
+                continue
             if training:
                 optimizer.zero_grad(set_to_none=True)
             for batch in group:
@@ -101,7 +107,11 @@ def run_bridge_epoch(
                 active = batch["labels"].ge(PAIR_OFFSET) & batch["labels"].lt(
                     getattr(model, "first_line", FIRST_LINE)
                 )
+                if "target_note_indices" in batch:
+                    active &= batch["target_note_indices"].ge(0)
                 count = int(active.sum())
+                if not count:
+                    continue
                 line_count = int(batch["line_counts"].sum())
                 with (
                     torch.autocast("cuda", dtype=torch.bfloat16)
@@ -144,6 +154,9 @@ def run_bridge_epoch(
                     templates.record(
                         model.template_sequences(output).tolist(),
                         batch["labels"].tolist(), note_counts.tolist(),
+                        target_mask=(
+                            output.target_mask.tolist() if model.query_mode == "note" else None
+                        ),
                     )
                 tokens += count
                 phrases += line_count
@@ -187,6 +200,11 @@ def run_bridge_epoch(
 def evaluate_templates(model, loader, device, *, max_batches=None, precision="fp32"):
     """Predict with reference IPA counts, without supplying any label history."""
     model.eval()
+    if model.query_mode == "note":
+        return run_bridge_epoch(
+            model, loader, device, max_batches=max_batches, precision=precision,
+            template_metrics=True,
+        )["templates"]
     metrics = TemplateMetrics(
         pairs=getattr(model, "pairs", PAIRS), bridge_scope=model.bridge_scope
     )
@@ -262,10 +280,13 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         raise ValueError(
             "Remove training.history_mask_probability: parallel queries have no label history"
         )
-    if cfg.get("query_mode", "parallel") != "parallel" or (
+    mode = cfg.get("query_mode", "parallel" if (
+        "bridge_readout" in cfg or "bridge_decoder" in cfg
+    ) else "note")
+    if mode not in ("note", "parallel") or (
         cfg.get("bridge_scope", "song") != "song"
     ):
-        raise ValueError("New bridge training requires parallel song queries")
+        raise ValueError("Bridge training requires note heads or parallel song queries")
     with log_stage("Initializing bridge device and random seed"):
         seed_everything(settings["seed"])
         device = select_device(settings["device"])
@@ -338,7 +359,12 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     )
     if "bridge_readout" in cfg and "bridge_decoder" in cfg:
         raise ValueError("Use model.bridge_readout, without the old bridge_decoder alias")
-    readout = cfg.get("bridge_readout", cfg.get("bridge_decoder", {}))
+    if mode == "note" and ("bridge_readout" in cfg or "bridge_decoder" in cfg):
+        raise ValueError("Note heads use model.song_encoder; remove bridge_readout/bridge_decoder")
+    readout = (
+        cfg.get("song_encoder", {}) if mode == "note" else
+        cfg.get("bridge_readout", cfg.get("bridge_decoder", {}))
+    )
     if smoke_test:
         readout = dict(d_model=16, num_layers=1, num_heads=2, dim_feedforward=32, dropout=0.0)
     with log_stage("Building bridge model"):
@@ -348,8 +374,9 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             encoder_lines_per_window=encoder_lines,
             max_window_notes=max_window_notes,
             bridge_scope="song",
-            query_mode="parallel",
-            query_attention="cross",
+            query_mode=mode,
+            query_attention="none" if mode == "note" else "cross",
+            alignment_policy=cfg.get("alignment_policy", "strict"),
             strength_labels=(
                 REPO_STRESSES if data.get("prosody_mode", "paper") == "actual"
                 else ("strong", "weak")
@@ -371,6 +398,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             data["prepared_dir"],
             split,
             **model.dataset_options,
+            dali_dir=data.get("dali_dir"),
             limit=8 if smoke_test else None,
         )
         for split in ("train", "valid")
@@ -422,6 +450,10 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "output_design": model.output_design,
         "query_mode": model.query_mode,
         "query_attention": model.query_attention,
+        "alignment_policy": model.alignment_policy if mode == "note" else None,
+        "alignment_counts": {s: dict(ds.alignment_counts) for s, ds in datasets.items()},
+        "raw_alignment_sha256": {s: ds.raw_alignment_sha256 for s, ds in datasets.items()},
+        "skipped_no_alignment": {s: ds.skipped_alignment for s, ds in datasets.items()},
         "output_labels": {"strength": list(model.strength_labels), "length": ["long", "short"]},
         "prosody_rules": model.prosody_rules,
         "config": config,
@@ -490,9 +522,9 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             )
             handle.flush()
             logger.info(
-                "Epoch %d train %.4f valid %.4f; parallel prediction accuracy (IPA counts): "
+                "Epoch %d train %.4f valid %.4f; %s prediction accuracy (IPA targets): "
                 "strength=%s length=%s pair=%s",
-                epoch + 1, training["loss"], validation["loss"],
+                epoch + 1, training["loss"], validation["loss"], mode,
                 *(f"{validation[key]:.4f}"
                   for key in ("strength_accuracy", "length_accuracy", "pair_accuracy")),
             )

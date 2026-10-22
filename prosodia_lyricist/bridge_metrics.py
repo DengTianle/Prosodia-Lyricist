@@ -153,27 +153,47 @@ class TemplateMetrics:
             count_phrases=int(active.sum()),
         )
 
-    def record(self, sequences, labels, note_counts):
+    def record(self, sequences, labels, note_counts, target_mask=None):
         c = self.counts
-        for predicted, truth, phrase_notes in zip(sequences, labels, note_counts, strict=True):
+        for row, (predicted, truth, phrase_notes) in enumerate(
+            zip(sequences, labels, note_counts, strict=True)
+        ):
             expected = decode_bridge_tokens([t for t in truth if t != -100], pairs=self.pairs)
             actual = decode_bridge_tokens(predicted, pairs=self.pairs)
+            offset = 0
             for index, (a, b) in enumerate(zip(actual, expected, strict=True)):
                 hypothesis, reference = a["syllables"], b["syllables"]
+                mask = (
+                    target_mask[row][offset + 1:offset + 1 + len(reference)]
+                    if target_mask is not None else [True] * max(len(hypothesis), len(reference))
+                )
+                offset += len(reference) + 1
+                if target_mask is not None and len(hypothesis) != len(reference):
+                    raise ValueError("Aligned template metrics require the reference IPA skeleton")
+                c["masked_slots"] += len(mask) - sum(mask)
+                if not any(mask):
+                    c["unsupervised_phrases"] += 1
+                    continue
+                complete = all(mask)
                 c.update(
                     phrases=1,
-                    exact=int(a == b),
-                    bleu=prosody_bleu(reference, hypothesis),
-                    short_phrases=int(min(len(reference), len(hypothesis)) < 4),
-                    slots=max(len(hypothesis), len(reference)),
+                    template_phrases=int(complete),
+                    exact=int(complete and a == b),
+                    bleu=prosody_bleu(reference, hypothesis) if complete else 0,
+                    short_phrases=int(complete and min(len(reference), len(hypothesis)) < 4),
+                    slots=sum(mask),
                 )
                 equal_count = phrase_notes[index] == len(reference)
                 if equal_count:
                     c.update(
                         equal_count_phrases=1,
-                        equal_count_slots=max(len(hypothesis), len(reference)),
+                        equal_count_slots=sum(mask),
                     )
-                for predicted_slot, expected_slot in zip_longest(hypothesis, reference):
+                for position, (predicted_slot, expected_slot) in enumerate(
+                    zip_longest(hypothesis, reference)
+                ):
+                    if not mask[position]:
+                        continue
                     if predicted_slot is not None and expected_slot is not None:
                         length_correct = predicted_slot["length"] == expected_slot["length"]
                         c.update(
@@ -204,8 +224,13 @@ class TemplateMetrics:
                     else None
                 ),
             },
-            "exact_template_accuracy": c["exact"] / c["phrases"] if c["phrases"] else None,
-            "prosody_bleu": c["bleu"] / c["phrases"] if c["phrases"] else None,
+            "exact_template_accuracy": (
+                c["exact"] / c["template_phrases"] if c["template_phrases"] else None
+            ),
+            "prosody_bleu": c["bleu"] / c["template_phrases"] if c["template_phrases"] else None,
+            "fully_supervised_phrases": c["template_phrases"],
+            "unsupervised_phrases": c["unsupervised_phrases"],
+            "masked_slots": c["masked_slots"],
             "bleu_short_phrases": c["short_phrases"],
             "count_diagnostic_phrases": c["count_phrases"],
             "note_ipa_count_match_rate": (

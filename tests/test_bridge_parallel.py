@@ -318,8 +318,9 @@ def test_standalone_training_and_single_pass_evaluation(model, tmp_path, monkeyp
         )
 
 
+@pytest.mark.parametrize("query_mode", ["parallel", "note"])
 def test_midi_queries_preserve_secondary_stress_and_xai_decoding(
-    tmp_path, tiny_model, tokenizer, monkeypatch
+    tmp_path, tiny_model, tokenizer, monkeypatch, query_mode
 ):
     from prosodia_lyricist import ipa
     from prosodia_lyricist.infer import infer, main
@@ -341,8 +342,8 @@ def test_midi_queries_preserve_secondary_stress_and_xai_decoding(
     bridge = ProsodyBridge(
         dict(d_model=8, num_layers=1, num_heads=2, dim_feedforward=16, dropout=0, max_length=16),
         bridge_scope="song",
-        query_mode="parallel",
-        query_attention="cross",
+        query_mode=query_mode,
+        query_attention="cross" if query_mode == "parallel" else "none",
         strength_labels=REPO_STRESSES,
         encoder_lines_per_window=2,
         max_song_notes=32,
@@ -362,7 +363,8 @@ def test_midi_queries_preserve_secondary_stress_and_xai_decoding(
         bridge.length_head.bias.copy_(torch.tensor([-1000.0, 1000.0]))
     bridge.save(tmp_path / "bridge")
     records, metadata = predict_templates(tmp_path / "bridge", path)
-    assert metadata["decoding"] == "parallel_queries"
+    decoding = "parallel_queries" if query_mode == "parallel" else "note_heads"
+    assert metadata["decoding"] == decoding
     assert metadata["prosody_mode"] == "actual"
     assert metadata["encoder_windows"] == 2
     assert metadata["syllable_counts"] == metadata["note_counts"] == [2, 1, 1]
@@ -437,7 +439,7 @@ def test_midi_queries_preserve_secondary_stress_and_xai_decoding(
     main()
     assert (
         json.loads(prefix.with_suffix(".json").read_text())["bridge"]["decoding"]
-        == "parallel_queries"
+        == decoding
     )
 
 

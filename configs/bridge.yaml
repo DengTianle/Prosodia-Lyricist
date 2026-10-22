@@ -34,16 +34,16 @@ model:
     pooling: cls
     max_length: 4096
   bridge_scope: song
-  query_mode: parallel # Position queries only; no prior labels or causal attention.
+  query_mode: note # Two shared classification heads after the bidirectional song encoder.
+  alignment_policy: strict # Mask mismatched words; prefix optionally pairs min(sung, IPA).
   encoder_lines_per_window: 2 # Must match data.lines_per_window and pretraining.
   max_window_notes: 512
   max_song_notes: 2048
   max_song_lines: 256
   max_target_length: 4096 # Includes fixed line prefixes. Skip whole songs; never truncate.
   song_encoder_layers: 2
-  bridge_readout: # Cross-attention + FFN; each requested position reads the entire song.
+  song_encoder: # Width/attention/FFN settings for the song encoder; no query readout.
     d_model: 256
-    num_layers: 4
     num_heads: 4
     dim_feedforward: 1024
     dropout: 0.1
@@ -60,7 +60,7 @@ training:
   num_workers: 0
   precision: bf16 #fp32 bf16 is also supported on CUDA hardware with BF16 support.
   gradient_accumulation_steps: 2
-  # Zero-based: 1 warms up the song encoder/readout, then fine-tunes the trunk.
+  # Zero-based: 1 warms up the song encoder/heads, then fine-tunes the trunk.
   # null keeps the pretrained trunk frozen; 0 fine-tunes immediately.
   # Also applies to a random tower; use 0 to train it from the first epoch.
   melody_unfreeze_epoch: 1
