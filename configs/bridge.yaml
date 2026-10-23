@@ -21,8 +21,10 @@ data:
 
 model:
   conditioning: bridge
-  melody_initialization: pretrained # random never opens melody_checkpoint.
-  # Current note-based two-pool contrastive checkpoint (same format as prosodia-direct).
+  melody_initialization: pretrained # pretrained, random, or masked (full encoder).
+  # For masked: set this to checkpoints/bridge-pretrain/RUN/best (directory).
+  # Keep encoder architecture/window limits equal to the pretraining config.
+  # For pretrained: current note-based two-pool contrastive .pt checkpoint.
   melody_checkpoint: ../../try-contrastive/checkpoints/large_2line_16s/best.pt
   # Only used for random initialization; choose the tower size for the comparison.
   random_melody_encoder:

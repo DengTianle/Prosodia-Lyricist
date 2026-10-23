@@ -308,8 +308,8 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     if audit_mode not in ("strict", "warning"):
         raise ValueError("training.pretraining_audit_mode must be strict or warning")
     initialization = cfg.get("melody_initialization", "pretrained")
-    if initialization not in ("pretrained", "random"):
-        raise ValueError("model.melody_initialization must be pretrained or random")
+    if initialization not in ("pretrained", "random", "masked"):
+        raise ValueError("model.melody_initialization must be pretrained, random, or masked")
     random_config = (
         _random_melody_config(cfg.get("random_melody_encoder"))
         if initialization == "random" else None
@@ -374,19 +374,41 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     max_window_notes = cfg.get("max_window_notes", cfg.get("max_notes"))
     if cfg.get("max_notes") is not None and max_window_notes != cfg["max_notes"]:
         raise ValueError("Conflicting max_notes and max_window_notes settings")
-    tower = None
+    tower, masked_metadata = None, None
+    if initialization == "masked":
+        from .bridge_pretrain import read_pretraining_metadata
+
+        if not checkpoint:
+            raise ValueError("Set model.melody_checkpoint to a masked-pretraining best/ directory")
+        masked_metadata = read_pretraining_metadata(checkpoint, manifest=manifest)
     with log_stage("Checking pretraining splits (%s mode)", audit_mode):
-        split_check = check_training_splits(
-            data, manifest, mode=audit_mode,
-            required=bool(initialization == "pretrained" and checkpoint),
-            encoder_lines=encoder_lines,
-        )
+        if masked_metadata and masked_metadata["provenance"].get("initialization") == "random":
+            # No contrastive weights were used. The masked checkpoint's exact
+            # train/valid hashes above protect held-out songs without an old CSV.
+            split_check = {"mode": audit_mode, "status": "not_applicable",
+                           "basis": "masked_pretraining_train_valid_checksums"}
+        else:
+            split_check = check_training_splits(
+                data, manifest, mode=audit_mode,
+                required=bool(initialization == "pretrained" and checkpoint),
+                encoder_lines=encoder_lines,
+            )
     if initialization == "random":
         melody_config = random_config
         provenance = {
             "initialization": "random", "weights_loaded": False,
             "checkpoint": None, "sha256": None,
             "architecture_source": "model.random_melody_encoder",
+        }
+    elif initialization == "masked":
+        melody_config = masked_metadata["melody_config"]
+        provenance = {
+            "initialization": "masked", "weights_loaded": True,
+            "checkpoint": str(Path(checkpoint).resolve()),
+            "sha256": file_sha256(Path(checkpoint) / "encoder_weights.pt"),
+            "objective": masked_metadata["objective"], "loaded_scope": "full_encoder",
+            "pretraining_data_sha256": masked_metadata["data_sha256"],
+            "source_provenance": masked_metadata["provenance"],
         }
     elif checkpoint:
         tower, melody_config, provenance = load_contrastive_melody(checkpoint)
@@ -425,7 +447,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         cfg.get("song_encoder", {}) if mode == "note" else
         cfg.get("bridge_readout", cfg.get("bridge_decoder", {}))
     )
-    if smoke_test:
+    if smoke_test and masked_metadata is None:
         readout = dict(d_model=16, num_layers=1, num_heads=2, dim_feedforward=32, dropout=0.0)
     with log_stage("Building bridge model"):
         model = ProsodyBridge(
@@ -445,7 +467,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             max_song_lines=cfg.get("max_song_lines", 256),
             max_target_length=cfg.get("max_target_length"),
             song_encoder_layers=(
-                1 if smoke_test else cfg.get("song_encoder_layers", 2)
+                1 if smoke_test and masked_metadata is None else cfg.get("song_encoder_layers", 2)
             ),
             provenance=provenance,
             **readout,
@@ -453,6 +475,10 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         if tower is not None:
             model.melody_encoder.load_state_dict(tower.state_dict(), strict=True)
             del tower
+        if masked_metadata is not None:
+            from .bridge_pretrain import initialize_from_masked
+
+            initialize_from_masked(model, checkpoint, masked_metadata)
     datasets = {
         split: BridgeDataset(
             data["prepared_dir"],

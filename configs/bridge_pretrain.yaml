@@ -1,0 +1,51 @@
+# Self-supervised masked musical attributes; no IPA or lyric targets are read.
+# Paths are relative to this YAML. Reuse the downstream song splits.
+data:
+  prepared_dir: ../data/dali-xai
+  # For optional contrastive initialization only: override the manifest's CSV path here.
+  # pretraining_manifest: ../../try-contrastive/data/max_en_2line_16s/segments_manifest.csv
+
+model:
+  melody_initialization: random # Or pretrained to start from the contrastive tower.
+  melody_checkpoint: null # Contrastive .pt file, only when initialization is pretrained.
+  random_melody_encoder:
+    d_model: 256
+    num_layers: 4
+    num_heads: 4
+    dim_feedforward: 1024
+    dropout: 0.1
+    pooling: cls
+    max_length: 4096
+  bridge_scope: song
+  query_mode: note
+  encoder_lines_per_window: 2
+  max_window_notes: 512
+  max_song_notes: 2048
+  max_song_lines: 256
+  song_encoder_layers: 2
+  song_encoder:
+    d_model: 256
+    num_heads: 4
+    dim_feedforward: 1024
+    dropout: 0.1
+
+training:
+  output_dir: ../checkpoints/bridge-pretrain
+  pretraining_audit_mode: strict # Applies only to optional contrastive initialization.
+  device: cuda
+  seed: 1234
+  epochs: 100
+  batch_size: 8
+  num_workers: 0
+  precision: bf16
+  gradient_accumulation_steps: 2
+  mask_probability: 0.15 # Non-anchor notes; at least one masked note per song.
+  # All encoder layers train immediately at this rate, including the melody tower.
+  learning_rate: 0.0001
+  adam_betas: [0.9, 0.98]
+  adam_epsilon: 0.00001
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: constant_after_warmup
+  gradient_clip: 1.0
+  patience: 10

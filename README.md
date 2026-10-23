@@ -230,6 +230,36 @@ architecture for inference/evaluation. New training defaults to note heads;
 explicit legacy parallel-query configurations remain usable for comparisons.
 See [bridge details](docs/prosody-bridge.md) for features and configuration.
 
+### Self-supervised melody pretraining
+
+`configs/bridge_pretrain.yaml` reconstructs masked musical attributes: pitch
+displacement, pitch sign, duration bin, and inter-onset interval bin. It reads only
+melodies from the existing prepared train/valid splits; no IPA labels, alignment,
+raw DALI files, or lyric checkpoint are needed. By default it starts from scratch
+and trains the melody tower, adapter, global-feature projection, and bidirectional
+song encoder together at `1e-4`.
+
+```bash
+conda activate prosodia-lyricist
+python -m prosodia_lyricist.bridge_pretrain --config configs/bridge_pretrain.yaml --smoke-test
+python -m prosodia_lyricist.bridge_pretrain --config configs/bridge_pretrain.yaml
+```
+
+Then set `model.melody_initialization: masked` in `configs/bridge.yaml` and point
+`model.melody_checkpoint` to `../checkpoints/bridge-pretrain/RUN/best`. Keep its
+encoder architecture and source limits equal to the pretraining configuration.
+Run the normal bridge training command: it imports the full encoder with fresh
+stress/length heads. The resulting bridge uses the usual evaluation and MIDI
+commands. Import requires the same prepared train/valid checksums to preserve the
+held-out split.
+
+Masking selects 15% of non-anchor notes (at least one per song), zeroing both
+feature views before local encoding and hiding dependent successor intervals.
+Each local window's first note stays visible as its pitch reference. Loss is the
+sum of four CEs over masked notes only. Validation masks stay fixed; logs report
+each reconstruction loss/accuracy, class counts, and majority baselines.
+Validation CE selects `best/`.
+
 ## XAI lyric inference and reports
 
 Pass the original `checkpoints/bestM2LCkpt.pt` or an imported XAI directory as

@@ -76,8 +76,10 @@ contains preparation, training, evaluation, and MIDI commands.
 - `model.song_encoder` controls width, attention heads, FFN width, and dropout.
 - `model.alignment_policy` selects `strict` (default) or word-local `prefix`.
 - `model.song_encoder_layers` controls global source attention (zero bypasses it).
-- `model.melody_initialization` selects pretrained or random. Random mode never
-  reads the checkpoint, and requires `model.random_melody_encoder`.
+- `model.melody_initialization` selects pretrained (contrastive tower), random,
+  or masked (complete self-supervised encoder). Random mode never reads the
+  checkpoint, and requires `model.random_melody_encoder`. Masked mode reads a
+  `bridge-pretrain/RUN/best` directory and initializes fresh prosody heads.
 - `training.melody_unfreeze_epoch` is zero-based: 1 warms up the new components,
   0 trains the tower immediately, and null freezes it throughout.
 - `training.learning_rate` applies to the adapter/song encoder/heads;
@@ -102,6 +104,36 @@ preparation. Training uses FP32 or supported CUDA BF16, supervised-slot-weighted
 gradient accumulation, clipping, and validation-CE early stopping. It never
 loads the test split or lyric model. Label-history masking is rejected because
 there is no history.
+
+## Masked musical pretraining
+
+The README's pretraining commands use `configs/bridge_pretrain.yaml`. Four temporary
+heads after the bidirectional layers reconstruct the clean 177-D representation's
+pitch magnitude (128 classes), sign (2), duration (24), and onset shift (24).
+Their equally weighted CEs use only selected notes. All encoder layers train from
+the first update at the same pretraining learning rate. IPA, alignment, and target
+length limits play no part. Source limits still skip whole songs.
+
+Independent Bernoulli masking selects 15% of non-anchor notes, with at least one
+selected per song. Each window's first note is kept as its relative-pitch anchor;
+songs containing only such anchors are skipped. Selected notes have both local
+177-D and global 39-D inputs zeroed before any encoder sees them. At the following
+note, the local IOI and global pitch-interval/IOI channels (including the positive
+IOI flag) are also hidden, including across window boundaries. This prevents
+direct reconstruction from an unmasked duplicate feature. Positional/line IDs
+and the existing feature normalization remain intact. There are no unchanged
+or randomly substituted selected notes in this basic masking variant.
+
+Training resamples masks; validation resets its separate RNG every epoch.
+Gradient accumulation normalizes each CE over all masked notes in its update.
+`pretrain.json` describes the architecture, feature schemes, masking, and train/valid
+checksums; `encoder_weights.pt` contains the entire shared stack, while
+`reconstruction_weights.pt` contains the temporary heads. Downstream masked
+initialization checks architecture and split equality, imports only encoder
+weights, and records provenance in the standard bridge checkpoint. Optional
+`melody_initialization: pretrained` starts reconstruction from a contrastive tower
+and retains its upstream split audit. Scratch masked checkpoints need no
+contrastive checkpoint or CSV. Test melodies are never encoded or used as targets.
 
 ## Evaluation and inference
 
