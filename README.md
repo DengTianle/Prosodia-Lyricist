@@ -301,6 +301,35 @@ repo (`actual`) heuristic uses marked phrases only; `--prosody-mode paper`
 selects the explicit supplement comparison, retaining the tail. Heuristic
 `--stress-source` overrides require paper mode.
 
+### Rolling Stone MIDI pilot
+
+With `melismas/`, `stress-format-space/`, and `rs_lyrics/` under
+`data/rolling-stone`, convert two songs marked `absent` in the DALI overlap CSV:
+
+```bash
+conda activate prosodia-lyricist
+python scripts/prepare_rolling_stone_midi.py --limit 2
+# Choose songs explicitly and use a new output directory for another run:
+python scripts/prepare_rolling_stone_midi.py --songs 1999 a_day_in_the_life \
+  --output-dir outputs/rolling-stone-pilot
+```
+
+The default output is `data/rolling-stone/midi-pilot/`: melody MIDIs with 4/4
+meter and phrase-end markers, one-line-per-phrase reference text, annotation JSON
+with syllable-to-note links, and a manifest with source hashes and skipped songs.
+Exactly one note per `.str` syllable is emitted: only the first note of each
+melisma is retained. The full `.mel` validates pitch/onset and supplies exact
+timing, rests and meter; omitted continuation counts are recorded in annotations.
+Nonempty lyric lines define phrases after exact word-stream alignment.
+Meter filtering reads the full `.mel`, including silent bars. Longer phrases are
+rejected rather than split (`--max-phrase-notes`, default 40). Outputs are never
+overwritten. Tempo is synthetic (`--tempo`, default 120 BPM); durations are
+estimated up to the next syllabic onset/rest, capped at one local measure. This
+creates bridge input and corpus annotations, not a prepared `bridge_eval` split:
+RS stress is not bridge IPA supervision and vowel-length labels are absent. DALI
+exclusion follows the supplied CSV; it does not establish absence from other
+pretraining data.
+
 ## Development
 
 ```bash
