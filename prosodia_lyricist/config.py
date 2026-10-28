@@ -21,6 +21,11 @@ def load_config(path):
             value = Path(config[section][key]).expanduser()
             config[section][key] = str((path.parent / value).resolve())
     pretrained = config["model"].get("pretrained", "")
+    fusion = config["model"].get("contrastive_fusion")
+    if isinstance(fusion, dict) and fusion.get("checkpoint"):
+        config["model"]["contrastive_fusion"]["checkpoint"] = str(
+            (path.parent / Path(fusion["checkpoint"]).expanduser()).resolve()
+        )
     if pretrained.startswith((".", "/", "~")):
         config["model"]["pretrained"] = str((path.parent / Path(pretrained).expanduser()).resolve())
     return config

@@ -114,8 +114,8 @@ def audit_prepared_splits(prepared_dir, pretraining_manifest, *, dali_dir=None):
     return report
 
 
-def check_training_splits(data, manifest, *, mode, required, encoder_lines):
-    """Keep legacy strict enforcement, or audit the current CSV and warn."""
+def check_training_splits(data, manifest, *, mode, required):
+    """Enforce the preparation audit, or explicitly audit the current CSV and warn."""
     if mode not in ("strict", "warning"):
         raise ValueError("training.pretraining_audit_mode must be strict or warning")
     path = data.get("pretraining_manifest")
@@ -130,9 +130,6 @@ def check_training_splits(data, manifest, *, mode, required, encoder_lines):
             )
     report = audit_prepared_splits(data["prepared_dir"], path)
     report["mode"] = mode
-    sizes = set(report["line_counts"])
-    if sizes and sizes != {encoder_lines}:
-        raise ValueError("lines_per_window must match the contrastive pretraining manifest")
     if report["status"] != "passed":
         message = f"Pretraining split audit {report['status']}: {report['reason']}"
         if mode == "strict":

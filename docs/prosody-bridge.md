@@ -1,158 +1,123 @@
-# Note heads → IPA template → XAI lyrics
+# Global melody → IPA template → XAI lyrics
 
-The standalone bridge predicts XAI-compatible IPA templates using supervised
-note classification. The original XAI template-to-lyrics checkpoint is used only
-at inference and is not changed by bridge training. New bridge checkpoints use
-format v9; older v2-v8 checkpoints retain their original inference architecture.
+The bridge uses one bidirectional melody Transformer over every note in a song,
+followed by shared stress and vowel-length heads. BART/XAI receives the resulting
+discrete template and is unchanged. Bridge checkpoints are v10; older bridges
+and masked-pretraining v1 checkpoints require retraining. Prepared note arrays
+remain reusable, including files with obsolete window-size metadata.
 
-## Melody encoding
+## Source and supervision
 
-The contrastive melody tower receives its original 177-dimensional note features
-in consecutive two-line windows, including the shorter final window. It returns
-contextual note vectors before pooled projection. Real windows are packed into
-one tower call and scattered back into song order. Padding never creates notes
-or windows.
+The original 177-D representation is preserved: 128 pitch-displacement bins and
+a sign bit, 24 log-duration bins, and 24 log-IOI bins. The pitch reference and
+min/max normalization now cover the entire song. Global sinusoidal positions and
+phrase embeddings precede attention. No local windows, reassembly, separate
+39-D feature stream, second encoder stack, or query decoder remain.
 
-LayerNorm/linear/GELU adapts the vectors to song-encoder width. Global sinusoidal note
-positions and shared song-line embeddings are added after the tower, preserving
-its pretrained feature normalization.
+Two heads predict `strong/substrong/weak` and `long/short` by default. Observed
+DALI word/note links gather first-note predictions into IPA targets. With
+`alignment_policy: strict`, mismatched words are masked; `prefix` pairs their
+first `min(sung, IPA)` slots. All notes remain encoder context. Gold labels,
+counts, alignment and lyrics never enter the encoder. MIDI inference emits one
+pair per note, using phrase markers and retaining an unmarked tail.
 
-A separate 39-dimensional channel retains whole-song timing/pitch relationships.
-Its seven scalars are pitch from the song's first note and preceding-note pitch
-interval (in octaves), log2(duration/scale), log2(positive IOI/scale), previous-note
-and positive-IOI indicators, and log2(scale in seconds). Scale is the median
-positive song IOI, falling back to median duration. Missing/zero IOIs have zero
-log value and explicit indicators. The other 32 features are sine/cosine time
-coordinates for periods 2^-1 through 2^14 in scale units from the first onset.
-This is not an inferred beat grid. Window-boundary intervals are preserved.
+Training uses `CE_stress + CE_length`. Optional `length_class_weights: [long,
+short]` weights length CE and checkpoint selection; ordinary CE is still logged.
+Gradient accumulation weights supervised slots across the entire group. Dataset
+limits skip whole songs; inference rejects overlong input. Full attention uses
+quadratic memory, so batch size should reflect song lengths.
 
-A linear/GELU/linear/LayerNorm projection adds these features to the adapted
-vectors. After fusion normalization, two bidirectional song-encoder layers
-attend across the complete song.
+## DALI training and initialization
 
-## Note prediction and supervision
+Use `configs/bridge.yaml`. `model.melody_encoder` controls the single encoder's
+width, depth, heads, FFN, dropout and positional capacity. `max_song_notes` must
+fit that capacity. `melody_initialization` supports:
 
-Dropout and two shared linear classifiers read each note's contextual vector
-directly after the song encoder. There are no target queries, count/slot
-embeddings, cross-attention readout, or label-history inputs in this architecture.
-Stress and vowel length are predicted independently at all notes, with
+- `random`: train the configured encoder from scratch (default).
+- `masked`: import a global masked-pretraining `best/` directory via
+  `melody_checkpoint`, with fresh stress/length heads. Architecture and source
+  limits must match, as must prepared train/valid checksums.
+- `bridge`: fine-tune a v10 `best/` directory via `melody_checkpoint`, retaining
+  its heads and architecture. Conflicting architecture/limit overrides fail.
 
-```text
-loss = CE_stress + CE_length
+`training.melody_unfreeze_epoch: 0` trains the main encoder immediately; null
+freezes its weights. `melody_learning_rate` controls that encoder separately
+from heads and conditioning adapters (`learning_rate`). A frozen encoder still
+propagates gradients to its trainable conditioning inputs.
+
+## Optional meter fine-tuning
+
+DALI has no observed bar grid, so meter defaults to absent. A prepared record may
+add `melody.meter`, with one object or null per note:
+
+```json
+[{"numerator": 6, "denominator": 8, "beat_position": 1.5}, null]
 ```
 
-Observed DALI word membership and sung-group starts select the first note of
-each sung syllable. Its predictions are gathered into the corresponding IPA
-slot. Counts, note anchors, and labels affect supervision only; they never
-condition the encoder or heads. Fixed line prefixes and padding have no loss.
-Both losses train the song encoder and, when unfrozen, the melody tower.
+`beat_position` is zero-based within the bar, in denominator-note units; for
+6/8 it lies in `[0, 6)`. The encoder receives sine/cosine bar and beat phases,
+log2 numerator/denominator, and a separate observation mask. Missing meter,
+including mixed annotated/unannotated songs, contributes exactly zero. No beats
+are inferred from DALI durations or IPA stress. Labels and word/note alignment
+remain required for supervised fine-tuning; update the prepared manifest's
+checksums when adding annotations.
 
-`alignment_policy: strict` masks a word if its sung-group and IPA counts differ.
-`prefix` pairs their first `min(sung, IPA)` positions and masks the rest, always
-restarting at the next word. Spelling/token boundaries are matched within raw
-words; unresolved text is masked. All notes remain context. Examples with no
-supervised slots are skipped and counted. Continuation-note outputs have no
-direct CE target; there is no learned role head.
+To fine-tune on such prepared data, use the normal training command with:
 
-The default `prosody_mode: actual` uses XAI's `strong/substrong/weak` stress and
-`long/short` vowel length. Only the IPA long mark denotes long, matching the
-historical dictionary-first pronunciation path. Binary paper-mode bridges remain loadable for template evaluation;
-the current XAI handoff requires the three-class repo vocabulary. A checkpoint's vocabulary and IPA rules must match its prepared data and
-lyric decoder; secondary stress is not collapsed for XAI.
+```yaml
+model:
+  conditioning: bridge
+  melody_initialization: bridge
+  melody_checkpoint: ../checkpoints/bridge-xai/RUN/best
+  meter_conditioning: true
+```
 
-Reference IPA counts specify the scoring skeleton during training and evaluation.
-MIDI markers specify phrases at inference, and every note supplies one output pair.
-All notes, including an unmarked trailing phrase, are retained. Melisma can
-produce note/IPA count differences. There is no learned count head. No lyric
-words, title, or IPA labels enter the melody
-source. The title is supplied only to XAI.
+Keep the normal data/training sections, pointing data settings at the annotated
+corpus's manifest. The new meter adapter's final projection starts at zero,
+preserving the base model initially. MIDI inference extracts explicit time
+signatures and tick-based bar positions, with each signature change starting a
+new bar grid. Notes before the first signature remain unannotated; pickups
+requiring another grid origin should be explicitly annotated in prepared data.
 
-## Configuration and workflow
+## Optional contrastive fusion
 
-Use the `prosodia-lyricist` Conda environment and `configs/bridge.yaml`; the README
-contains preparation, training, evaluation, and MIDI commands.
+The main encoder does not depend on a contrastive checkpoint. To add one during
+initial training or when fine-tuning a v10 bridge:
 
-- `model.query_mode: note` selects direct note heads.
-- `model.song_encoder` controls width, attention heads, FFN width, and dropout.
-- `model.alignment_policy` selects `strict` (default) or word-local `prefix`.
-- `model.song_encoder_layers` controls global source attention (zero bypasses it).
-- `model.melody_initialization` selects pretrained (contrastive tower), random,
-  or masked (complete self-supervised encoder). Random mode never reads the
-  checkpoint, and requires `model.random_melody_encoder`. Masked mode reads a
-  `bridge-pretrain/RUN/best` directory and initializes fresh prosody heads.
-- `training.melody_unfreeze_epoch` is zero-based: 1 warms up the new components,
-  0 trains the tower immediately, and null freezes it throughout.
-- `training.learning_rate` applies to the adapter/song encoder/heads;
-  `melody_learning_rate` separately controls the tower.
-- `training.length_class_weights` is null (ordinary CE) or `[long, short]`, e.g.
-  `[2.0, 1.0]`. Only length CE is weighted. `loss`/`components` always report
-  ordinary CE; `objective_loss`/`objective_components` report the weighted
-  objective when enabled. Validation uses the same weights for checkpoint
-  selection. Gradient accumulation normalizes each head over the complete group.
-- Source/window/song and target limits skip entire training examples, with counts
-  per reason. Inference rejects overlong input without truncation.
-- The existing contrastive-import, song grouping, checksum, and pretraining-split
-  audits remain active. Strict audit mode requires the unchanged upstream CSV;
-  warning mode records incomplete/conflicting audits while retaining data checks.
+```yaml
+model:
+  contrastive_fusion:
+    checkpoint: ../../try-contrastive/checkpoints/large_2line_16s/best.pt
+    unfreeze_epoch: null
+    learning_rate: 0.000002
+```
 
-XAI training requires repo-mode `data/dali-xai` data. Existing prepared data is
-reusable when its manifest configuration matches. Schema v6 stores note anchors;
-older files recover them in memory from raw DALI without rerunning pronunciation.
-Recovery verifies note pitch/timing and records raw file checksums. The evaluator's
-`--dali-dir` overrides old cluster paths. Old paper-mode labels require separate
-preparation. Training uses FP32 or supported CUDA BF16, supervised-slot-weighted
-gradient accumulation, clipping, and validation-CE early stopping. It never
-loads the test split or lyric model. Label-history masking is rejected because
-there is no history.
+The imported melody trunk processes the **same whole-song 177-D sequence**.
+Its note vectors and pooled song vector are concatenated, projected to the main
+encoder width, and added before global attention through a learned `tanh` gate.
+The gate starts at zero. The audio tower and contrastive projection are unused.
+The trunk starts frozen, including dropout; the gate and adapter train normally.
+Set `unfreeze_epoch: 0` or a later zero-based epoch to tune the trunk separately.
+Global normalization/longer context differ from the original two-line training
+distribution; the benefit of fusion needs an ablation against the plain encoder.
 
-## Masked musical pretraining
+Set `data.pretraining_manifest` to the matching upstream CSV before preparation.
+Training retains song-identity leakage checks: strict mode requires the unchanged
+audited CSV; warning mode records missing/conflicting audits. Window sizes no
+longer need to match. Saved bridges include fusion weights, architecture and
+provenance, so inference needs no upstream files. When fine-tuning an already
+fused bridge, omit `contrastive_fusion.checkpoint` to retain its saved tower.
 
-The README's pretraining commands use `configs/bridge_pretrain.yaml`. Four temporary
-heads after the bidirectional layers reconstruct the clean 177-D representation's
-pitch magnitude (128 classes), sign (2), duration (24), and onset shift (24).
-Their equally weighted CEs use only selected notes. All encoder layers train from
-the first update at the same pretraining learning rate. IPA, alignment, and target
-length limits play no part. Source limits still skip whole songs.
+## Masked pretraining and evaluation
 
-Independent Bernoulli masking selects 15% of non-anchor notes, with at least one
-selected per song. Each window's first note is kept as its relative-pitch anchor;
-songs containing only such anchors are skipped. Selected notes have both local
-177-D and global 39-D inputs zeroed before any encoder sees them. At the following
-note, the local IOI and global pitch-interval/IOI channels (including the positive
-IOI flag) are also hidden, including across window boundaries. This prevents
-direct reconstruction from an unmasked duplicate feature. Positional/line IDs
-and the existing feature normalization remain intact. There are no unchanged
-or randomly substituted selected notes in this basic masking variant.
+`configs/bridge_pretrain.yaml` trains the same global encoder from scratch,
+reconstructing pitch displacement, sign, duration and IOI at masked notes. Only
+the song's first note is protected as a reference. Selected features and
+successor IOIs are hidden. Neither meter, lyrics nor IPA labels enter this
+objective. Validation masks are fixed, and validation CE selects `best/`.
 
-Training resamples masks; validation resets its separate RNG every epoch.
-Gradient accumulation normalizes each CE over all masked notes in its update.
-`pretrain.json` describes the architecture, feature schemes, masking, and train/valid
-checksums; `encoder_weights.pt` contains the entire shared stack, while
-`reconstruction_weights.pt` contains the temporary heads. Downstream masked
-initialization checks architecture and split equality, imports only encoder
-weights, and records provenance in the standard bridge checkpoint. Optional
-`melody_initialization: pretrained` starts reconstruction from a contrastive tower
-and retains its upstream split audit. Scratch masked checkpoints need no
-contrastive checkpoint or CSV. Test melodies are never encoded or used as targets.
-
-## Evaluation and inference
-
-Evaluation schema v5 contains one `prediction` block. Loss, stress/length/pair
-accuracy, exact phrase templates, and phrase-mean unsmoothed BLEU-4 come from the
-same encoder pass. Slot metrics exclude masked targets. Exact-template accuracy
-and BLEU score only fully supervised phrases; both coverage counts are reported.
-Reference IPA counts define the skeleton; count mismatches remain diagnostics.
-Duration baselines use identical note anchors and masks, including the equal-count
-subset. Equal counts do not prove phonetic alignment.
-
-MIDI inference classifies every note once. Hard head
-predictions are serialized into the unchanged XAI source format, including its
-stress tokens, vowel-length IDs, remainder IDs, title, and count prompts.
-References never construct the model source. Reports retain source notes and a
-separate heuristic comparison. Non-4/4 input and tempo changes are supported.
-The lyric model's original generation controls and source/target limits remain
-active. Template prediction does not guarantee exact lyric syllable agreement.
-
-Tests cover label independence, both losses and gradients, complete-song context,
-padding, accumulation, reload, vocabulary/rule checks, single-pass evaluation,
-MIDI tails/tempo/meter, and the XAI handoff including reference isolation.
+Evaluation schema v6 reports aligned slot CE/accuracy and classification
+statistics. Exact-template accuracy and BLEU use fully supervised phrases;
+coverage and masked targets are reported. Duration controls use corpus, song
+and phrase means on the same note anchors. The README retains the training,
+evaluation and MIDI-to-BART commands.

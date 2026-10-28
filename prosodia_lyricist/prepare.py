@@ -80,9 +80,6 @@ def plan_pretraining_splits(data, files, requested):
             require_lyrics=False,
             allow_split_overlap=True,
         )
-        sizes = {int(row["line_count"]) for row in rows if row.get("line_count")}
-        if sizes and sizes != {data["lines_per_window"]}:
-            raise ValueError("lines_per_window must match the contrastive pretraining manifest")
         del rows
     songs, rejections, sources = {}, [], {}
     for filename in tqdm(files, desc="Checking split identities", unit="song"):

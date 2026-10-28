@@ -128,10 +128,8 @@ def test_bridge_loaded_once_and_infers_without_lyric_counts(tmp_path, monkeypatc
     model = ProsodyBridge(
         dict(d_model=8, num_layers=1, num_heads=2, dim_feedforward=16,
              dropout=0, max_length=16),
-        bridge_scope="song", query_mode="note", max_syllables=8,
-        max_window_notes=8, max_song_notes=16, max_song_lines=4, max_target_length=16,
-        d_model=8, num_heads=2, num_layers=1, dim_feedforward=16,
-        song_encoder_layers=1, dropout=0,
+        max_syllables=8, strength_labels=("strong", "weak"),
+        max_song_notes=16, max_song_lines=4, max_target_length=16,
     )
     model.save(tmp_path / "checkpoint")
     make_midi(tmp_path / "song.mid")

@@ -62,7 +62,7 @@ def test_transitive_upstream_conflict_is_reported_before_extraction(preflight_co
     assert [path.name for path in directory.iterdir()] == ["split_preflight.json"]
 
 
-@pytest.mark.parametrize("problem", ["missing", "malformed", "windows"])
+@pytest.mark.parametrize("problem", ["missing", "malformed"])
 def test_invalid_upstream_fails_before_backend_and_extraction(
     preflight_config, monkeypatch, problem,
 ):
@@ -71,8 +71,6 @@ def test_invalid_upstream_fails_before_backend_and_extraction(
         preflight_config["data"]["pretraining_manifest"] = str(path.parent / "missing.csv")
     elif problem == "malformed":
         path.write_text("invalid,header\n1,2\n")
-    else:
-        preflight_config["data"]["lines_per_window"] = 4
     monkeypatch.setattr(ipa, "backend", forbidden)
     monkeypatch.setattr(prepare, "read_annotation", forbidden)
     monkeypatch.setattr(prepare, "extract_lines", forbidden)

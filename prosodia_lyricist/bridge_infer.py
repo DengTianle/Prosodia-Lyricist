@@ -8,7 +8,6 @@ from .bridge_data import (
     bridge_collate,
     decode_bridge_tokens,
     encode_bridge_song,
-    encode_bridge_source,
 )
 from .bridge_model import ProsodyBridge
 from .ipa import REPO_RULES
@@ -27,26 +26,37 @@ def predict_templates(
 ):
     model = ProsodyBridge.load(checkpoint).to(device).eval()
     return predict_midi_templates(
-        model, midi, title=title, track=track, device=device,
-        max_syllables=max_syllables, checkpoint=checkpoint,
+        model,
+        midi,
+        title=title,
+        track=track,
+        device=device,
+        max_syllables=max_syllables,
+        checkpoint=checkpoint,
     )
 
 
 @torch.inference_mode()
 def predict_midi_templates(
-    model, midi, *, title="", track=0, device="cpu", max_syllables=None,
-    checkpoint=None, phrase_policy=None,
+    model,
+    midi,
+    *,
+    title="",
+    track=0,
+    device="cpu",
+    max_syllables=None,
+    checkpoint=None,
+    phrase_policy=None,
 ):
     """Predict with an already loaded, eval-mode bridge (reusable across songs)."""
     if max_syllables is not None and model.max_syllables > max_syllables:
         raise ValueError("Bridge syllable limit exceeds the template decoder's limit")
     mode = "actual" if model.prosody_rules == REPO_RULES else "paper"
     source = midi_melody_record(
-        midi, title=title, track=track,
-        phrase_policy=phrase_policy or (
-            "repo" if mode == "actual" and model.query_mode != "note"
-            and model.query_attention != "cross" else "complete"
-        ),
+        midi,
+        title=title,
+        track=track,
+        phrase_policy=phrase_policy or "complete",
     )
     for index, line in enumerate(source["lines"]):
         count = len(line["melody"]["midi_pitches"])
@@ -55,26 +65,14 @@ def predict_midi_templates(
                 f"MIDI phrase {index} has {count} notes; bridge slot limit is "
                 f"{model.max_syllables}; no truncation"
             )
-    records = []
-    windows = 0
-    width = len(source["lines"]) if model.bridge_scope == "song" else model.lines_per_window
-    for offset in range(0, len(source["lines"]), width):
-        lines = source["lines"][offset : offset + width]
-        encoded = (
-            encode_bridge_song(lines, model.encoder_lines_per_window)
-            if model.bridge_scope == "song"
-            else encode_bridge_source(lines)
-        )
-        if model.bridge_scope == "window" and len(encoded["note_line_ids"]) > model.max_notes:
-            raise ValueError("MIDI window exceeds bridge note limit; no truncation")
-        inputs = {key: value.to(device) for key, value in bridge_collate([encoded]).items()}
-        result = model.generate(**inputs)
-        predicted = decode_bridge_tokens(result.sequences[0].tolist(), pairs=model.pairs)
-        for index, (line, template) in enumerate(zip(lines, predicted, strict=True), offset):
-            records.append({**line, **template, "line_id": index, "stress_source": "learned"})
-        windows += (
-            len(lines) + model.encoder_lines_per_window - 1
-        ) // model.encoder_lines_per_window
+    encoded = encode_bridge_song(source["lines"])
+    inputs = {key: value.to(device) for key, value in bridge_collate([encoded]).items()}
+    result = model.generate(**inputs)
+    predicted = decode_bridge_tokens(result.sequences[0].tolist(), pairs=model.pairs)
+    records = [
+        {**line, **template, "line_id": index, "stress_source": "learned"}
+        for index, (line, template) in enumerate(zip(source["lines"], predicted, strict=True))
+    ]
     if records and mode == "actual":
         records[-1]["unmarked_notes_omitted"] = source.get("unmarked_notes_omitted", 0)
     return records, {
@@ -83,14 +81,14 @@ def predict_midi_templates(
         "prosody_mode": mode,
         "stress_labels": list(model.strength_labels),
         "unmarked_notes_omitted": source.get("unmarked_notes_omitted", 0),
-        "lines_per_window": model.lines_per_window,
-        "encoder_lines_per_window": model.encoder_lines_per_window,
-        "bridge_scope": model.bridge_scope,
-        "encoder_windows": windows,
+        "bridge_scope": "song",
+        "source_scheme": "global_note_177d_v1",
+        "meter_conditioning": model.meter_conditioning,
+        "observed_meter_notes": int(inputs["meter_mask"].sum()),
+        "contrastive_fusion": model.contrastive_config is not None,
         "max_syllables": model.max_syllables,
-        "max_notes": model.max_notes,
-        "max_song_notes": model.max_song_notes if model.bridge_scope == "song" else None,
-        "max_song_lines": model.max_song_lines if model.bridge_scope == "song" else None,
+        "max_song_notes": model.max_song_notes,
+        "max_song_lines": model.max_song_lines,
         "max_target_length": model.max_target_length,
         "target_scheme": model.target_scheme,
         "output_design": model.output_design,
@@ -106,8 +104,5 @@ def predict_midi_templates(
         },
         "note_counts": [len(line["melody"]["midi_pitches"]) for line in records],
         "syllable_counts": [len(line["syllables"]) for line in records],
-        "decoding": (
-            "note_heads" if model.query_mode == "note" else
-            "parallel_queries" if model.query_mode == "parallel" else "greedy_skeleton"
-        ),
+        "decoding": "note_heads",
     }

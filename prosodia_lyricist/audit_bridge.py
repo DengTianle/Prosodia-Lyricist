@@ -293,26 +293,26 @@ def scan_raw(directory, prepared_ids, output):
     return result
 
 
-def make_plot(lines, windows, path):
+def make_plot(lines, songs, path):
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     train = [r for r in lines if r["split"] == "train"]
-    pairs = [r for r in windows if r["split"] == "train" and r["line_count"] == 2]
+    complete = [r for r in songs if r["split"] == "train" and r["retained"]]
     fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
     colors = {"notes": "#277da1", "ipa": "#f3722c", "sung": "#43aa8b"}
     for ax, rows, title, xmax in (
         (axes[0, 0], train, "Individual lines", 30),
-        (axes[0, 1], pairs, "Non-overlapping two-line windows", 50),
+        (axes[0, 1], complete, "Whole songs within source/target limits", 2048),
     ):
         for metric in METRICS:
             values = np.array([r[metric] for r in rows])
             ax.hist(
                 values,
                 bins=np.arange(0.5, xmax + 1.5),
-                weights=np.ones(len(rows)) * 100 / len(rows),
+                weights=np.ones(len(rows)) * 100 / max(1, len(rows)),
                 histtype="step",
                 linewidth=1.7,
                 label=metric.upper(),
@@ -368,23 +368,24 @@ def make_plot(lines, windows, path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--prepared-dir", type=Path, default=Path("data/dali-bridge"))
+    parser.add_argument("--prepared-dir", type=Path, default=Path("data/dali-xai"))
     parser.add_argument("--raw-dir", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/dali-bridge-audit"))
-    parser.add_argument("--max-notes", type=int, default=512)
+    parser.add_argument("--max-notes", type=int, default=2048)
+    parser.add_argument("--max-lines", type=int, default=256)
+    parser.add_argument("--max-target-length", type=int, default=4096)
     parser.add_argument("--plot", action="store_true")
     args = parser.parse_args()
-    if args.max_notes < 1:
-        parser.error("--max-notes must be positive")
+    if min(args.max_notes, args.max_lines, args.max_target_length) < 1:
+        parser.error("Source/target limits must be positive")
     output = args.output_dir
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = args.prepared_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     config = manifest["config"]
-    width = config.get("lines_per_window", 2)
-    if width != 2 or config.get("stress_source") != "ipa" or not config.get("include_melody"):
-        parser.error("This audit expects IPA bridge data with two-line windows and melody arrays")
-    lines, windows, markers, songs = [], [], [], []
+    if config.get("stress_source") != "ipa" or not config.get("include_melody"):
+        parser.error("This audit expects IPA bridge data with melody arrays")
+    lines, markers, songs = [], [], []
     integrity = Counter()
     hashes = {}
     for split in ("train", "valid", "test"):
@@ -436,37 +437,20 @@ def main():
                     if flags["has_brackets"] or flags["keyword_mention"] or flags["kinds"]:
                         markers.append({**row, **{**flags, "kinds": "|".join(flags["kinds"])}})
                     song_rows.append(row)
-                for offset in range(0, len(song_rows), width):
-                    group = song_rows[offset : offset + width]
-                    row = {
-                        "split": split,
-                        "song_id": sid,
-                        "title": song["title"],
-                        "offset": offset,
-                        "line_ids": "|".join(str(r["line_id"]) for r in group),
-                        "line_count": len(group),
-                        **{m: sum(r[m] for r in group) for m in METRICS},
-                        "duration_seconds": group[-1]["end"] - group[0]["start"],
-                        "gap_seconds": group[-1]["start"] - group[0]["end"]
-                        if len(group) == 2
-                        else 0,
-                        "crosses_paragraph": len({r["paragraph_id"] for r in group}) > 1,
-                        "any_ipa_le_2": any(r["ipa"] <= 2 for r in group),
-                        "both_ipa_le_2": len(group) == 2 and all(r["ipa"] <= 2 for r in group),
-                        "any_line_mismatch": any(r["ipa"] != r["notes"] for r in group),
-                        "section_label_candidate": any(r["section_label_candidate"] for r in group),
-                    }
-                    row["retained"] = row["notes"] <= args.max_notes
-                    windows.append(row)
                 lines.extend(song_rows)
-                songs.append(
-                    {
-                        "split": split,
-                        "song_id": sid,
-                        "lines": len(song_rows),
-                        **{m: sum(r[m] for r in song_rows) for m in METRICS},
-                    }
-                )
+                row = {
+                    "split": split, "song_id": sid, "title": song["title"],
+                    "line_count": len(song_rows),
+                    **{m: sum(r[m] for r in song_rows) for m in METRICS},
+                    "duration_seconds": song_rows[-1]["end"] - song_rows[0]["start"],
+                    "any_ipa_le_2": any(r["ipa"] <= 2 for r in song_rows),
+                    "any_line_mismatch": any(r["ipa"] != r["notes"] for r in song_rows),
+                    "section_label_candidate": any(r["section_label_candidate"] for r in song_rows),
+                }
+                row["retained"] = (row["notes"] <= args.max_notes
+                                   and row["line_count"] <= args.max_lines
+                                   and row["ipa"] + row["line_count"] <= args.max_target_length)
+                songs.append(row)
         hashes[path.name] = {
             "actual": digest.hexdigest(),
             "expected": manifest["sha256"][path.name],
@@ -476,7 +460,7 @@ def main():
         print(f"Read and verified {split}", flush=True)
     integrity["duplicate_song_ids"] = len(songs) - len({r["song_id"] for r in songs})
     write_csv(output / "lines.csv", lines)
-    write_csv(output / "windows.csv", windows)
+    write_csv(output / "songs.csv", songs)
     write_csv(output / "prepared_marker_candidates.csv", markers)
     summary = {
         "provenance": {
@@ -485,13 +469,15 @@ def main():
             "config": config,
             "preparation_counts": manifest["counts"],
             "hashes": hashes,
-            "window_max_notes": args.max_notes,
+            "max_song_notes": args.max_notes,
+            "max_song_lines": args.max_lines,
+            "max_target_length": args.max_target_length,
         },
         "definitions": {
             "ipa": "Prepared IPA target syllables",
             "sung": "DALI syllables after continuation-note merging",
             "notes": "All melody notes, including melisma continuations",
-            "windows": "Non-overlapping pairs starting at offset 0; final single retained",
+            "songs": "Complete songs; source/target limits exclude whole songs",
             "marker_scope": "Text labels only, not acoustic chorus/instrumental detection",
             "bare_labels": "Exact label-shaped text is a candidate, not confirmed metadata",
             "percentiles": "NumPy linear interpolation",
@@ -502,34 +488,23 @@ def main():
     conditional = []
     for split in ("all", "train", "valid", "test"):
         ls = [r for r in lines if split == "all" or r["split"] == split]
-        ws = [r for r in windows if (split == "all" or r["split"] == split) and r["retained"]]
-        pairs = [r for r in ws if r["line_count"] == 2]
+        retained = [r for r in songs if (split == "all" or r["split"] == split) and r["retained"]]
         group = {
             "lines": summarize(ls),
-            "two_line_windows": summarize(pairs),
-            "all_training_windows": summarize(ws),
-            "singleton_windows": sum(r["line_count"] == 1 for r in ws),
-            "skipped_windows": sum(
-                not r["retained"] for r in windows if split == "all" or r["split"] == split
+            "retained_songs": summarize(retained),
+            "skipped_songs": sum(
+                not r["retained"] for r in songs if split == "all" or r["split"] == split
             ),
             "song_line_counts": describe(
-                [s["lines"] for s in songs if split == "all" or s["split"] == split]
+                [s["line_count"] for s in songs if split == "all" or s["split"] == split]
             ),
-            "two_line_diagnostics": {
-                key: fraction(pairs, [r for r in pairs if r[key]])
-                for key in (
-                    "crosses_paragraph",
-                    "any_ipa_le_2",
-                    "both_ipa_le_2",
-                    "any_line_mismatch",
-                )
-            },
             "melismatic_syllables": sum(r["melismatic_syllables"] for r in ls),
-            "max_notes_per_sung_syllable": max(r["max_notes_per_sung_syllable"] for r in ls),
+            "max_notes_per_sung_syllable": max(
+                (r["max_notes_per_sung_syllable"] for r in ls), default=0
+            ),
         }
-        group["two_line_gap_seconds"] = describe([r["gap_seconds"] for r in pairs])
         group["cleanup_impact"] = {
-            key: fraction(ws, [r for r in ws if predicate(r)])
+            key: fraction(retained, [r for r in retained if predicate(r)])
             for key, predicate in (
                 ("drop_any_ipa_le_2", lambda r: r["any_ipa_le_2"]),
                 ("drop_total_ipa_le_4", lambda r: r["ipa"] <= 4),
@@ -538,7 +513,7 @@ def main():
             )
         }
         summary["groups"][split] = group
-        for unit, rows in (("lines", ls), ("two_line_windows", pairs)):
+        for unit, rows in (("lines", ls), ("songs", retained)):
             conditional.extend({"split": split, **r} for r in conditional_counts(rows, unit))
     write_csv(output / "conditional_counts.csv", conditional)
     write_csv(output / "count_baselines.csv", baseline_results(lines, config["max_syllables"]))
@@ -554,7 +529,7 @@ def main():
         summary["raw_markers"] = scan_raw(args.raw_dir, {s["song_id"] for s in songs}, output)
     (output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     if args.plot:
-        make_plot(lines, windows, output / "length_distributions.png")
+        make_plot(lines, songs, output / "length_distributions.png")
     print(f"Wrote audit to {output.resolve()}", flush=True)
 
 

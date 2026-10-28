@@ -58,8 +58,10 @@ def train_config(prepared, path):
     return {
         "data": {**manifest["config"], "pretraining_manifest": str(path) if path else None},
         "model": {
-            "conditioning": "bridge", "melody_initialization": "pretrained",
-            "melody_checkpoint": "checkpoint.pt", "max_window_notes": 16,
+            "conditioning": "bridge", "melody_initialization": "random",
+            "melody_encoder": dict(d_model=8, num_layers=1, num_heads=2,
+                                   dim_feedforward=16, dropout=0, max_length=32),
+            "contrastive_fusion": {"checkpoint": "checkpoint.pt"},
             "max_song_notes": 16, "max_song_lines": 4, "max_target_length": 16,
         },
         "training": dict(
@@ -239,10 +241,13 @@ def test_warning_keeps_feature_config_and_integrity_checks(prepared, tmp_path):
         bridge_train.train_bridge(config, smoke_test=True)
 
 
-def test_warning_keeps_window_compatibility_checks(prepared, tmp_path):
-    config = train_config(prepared, upstream(tmp_path, lines=4))
-    with pytest.raises(ValueError, match="lines_per_window must match"):
-        bridge_train.train_bridge(config, smoke_test=True)
+def test_global_encoder_does_not_require_upstream_window_size(prepared, tmp_path):
+    path = upstream(tmp_path, lines=4)
+    report = audit_bridge_splits.check_training_splits(
+        {**prepared[1]["config"], "pretraining_manifest": str(path)}, prepared[1],
+        mode="warning", required=True,
+    )
+    assert report["status"] == "passed"
 
 
 def test_strict_still_rejects_changed_upstream_and_invalid_mode(prepared, tmp_path):
@@ -252,7 +257,7 @@ def test_strict_still_rejects_changed_upstream_and_invalid_mode(prepared, tmp_pa
     with pytest.raises(ValueError, match="unchanged melody pretraining manifest"):
         audit_bridge_splits.check_training_splits(
             {**manifest["config"], "pretraining_manifest": str(path)}, manifest,
-            mode="strict", required=True, encoder_lines=2,
+            mode="strict", required=True,
         )
     config = train_config(prepared, path)
     config["training"]["pretraining_audit_mode"] = "typo"

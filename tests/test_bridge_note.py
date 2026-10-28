@@ -35,21 +35,12 @@ from prosodia_lyricist.prepare import SCHEMA_VERSION
 def model():
     torch.manual_seed(17)
     return ProsodyBridge(
-        dict(d_model=8, num_layers=1, num_heads=2, dim_feedforward=16, dropout=0, max_length=16),
-        bridge_scope="song",
-        query_mode="note",
+        dict(d_model=8, num_layers=1, num_heads=2, dim_feedforward=16, dropout=0, max_length=32),
         strength_labels=REPO_STRESSES,
-        encoder_lines_per_window=1,
-        max_window_notes=16,
         max_song_notes=32,
         max_song_lines=4,
         max_target_length=32,
         max_syllables=8,
-        song_encoder_layers=1,
-        d_model=8,
-        num_heads=2,
-        dim_feedforward=16,
-        dropout=0,
     )
 
 
@@ -91,7 +82,7 @@ def lines():
 def example(source, policy="strict"):
     indices, _ = aligned_note_indices(source, policy)
     return {
-        **encode_bridge_song(source, 1),
+        **encode_bridge_song(source),
         "labels": encode_bridge_targets(
             source, 8, pairs=tuple((s, n) for s in REPO_STRESSES for n in ("long", "short"))
         ),
@@ -186,31 +177,31 @@ def test_direct_heads_gather_first_notes_and_gold_labels_only_affect_loss(model)
 def test_gradients_reach_both_heads_and_global_context_and_padding_is_ignored(model, tmp_path):
     model.eval()
     batch = batch_for(model)
-    batch["song_features"].requires_grad_()
+    batch["melody_features"].requires_grad_()
     output = model(**batch)
     gradient = torch.autograd.grad(
-        output.strength_logits[0, 1, 0], batch["song_features"], retain_graph=True
+        output.strength_logits[0, 1, 0], batch["melody_features"], retain_graph=True
     )[0]
     assert gradient[0, 7].abs().sum() > 0
     output.loss.backward()
     for parameter in (
         model.strength_head.weight,
         model.length_head.weight,
-        model.song_encoder.layers[0].self_attn.in_proj_weight,
+        model.melody_encoder.transformer.layers[0].self_attn.in_proj_weight,
         model.melody_encoder.input_projection[0].weight,
     ):
         assert parameter.grad is not None and parameter.grad.abs().sum() > 0
     padded = dict(batch)
-    for key in ("melody_features", "song_features"):
+    for key in ("melody_features", "meter_features"):
         padded[key] = F.pad(batch[key], (0, 0, 0, 2), value=99)
-    for key in ("melody_attention_mask", "note_line_ids"):
+    for key in ("melody_attention_mask", "note_line_ids", "meter_mask"):
         padded[key] = F.pad(batch[key], (0, 2), value=0)
     padded["labels"] = F.pad(batch["labels"], (0, 2), value=-100)
     padded["target_note_indices"] = F.pad(batch["target_note_indices"], (0, 2), value=-1)
     torch.testing.assert_close(model(**padded).loss, output.loss, atol=1e-6, rtol=1e-5)
     model.save(tmp_path)
     metadata = json.loads((tmp_path / "bridge.json").read_text())
-    assert metadata["format_version"] == 9 and metadata["query_attention"] == "none"
+    assert metadata["format_version"] == 10
     assert "decoder_config" not in metadata and "readout_config" not in metadata
     restored = ProsodyBridge.load(tmp_path).eval()
     torch.testing.assert_close(restored(**batch).logits, output.logits, rtol=0, atol=0)
@@ -300,16 +291,11 @@ def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
     config = dict(
         data=data,
         model=dict(
-            query_mode="note",
             melody_initialization="random",
-            random_melody_encoder=tower,
-            encoder_lines_per_window=1,
-            max_window_notes=16,
+            melody_encoder=tower,
             max_song_notes=32,
             max_song_lines=4,
             max_target_length=32,
-            song_encoder_layers=1,
-            song_encoder={k: v for k, v in model.decoder_config.items() if k != "num_layers"},
         ),
         training=dict(
             output_dir=str(tmp_path / "runs"),
@@ -340,7 +326,7 @@ def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
         )
     report = evaluate_bridge(output / "best", tmp_path, split="valid", device="cpu")
     assert report["prediction"]["loss"] == pytest.approx(epoch["valid"]["loss"])
-    assert report["schema_version"] == 5 and report["query_mode"] == "note"
+    assert report["schema_version"] == 6 and report["query_mode"] == "note"
     assert report["prediction"]["slots"] == report["prediction"]["compared_slots"] == 4
     assert report["prediction"]["fully_supervised_phrases"] == 1
     assert report["duration_baselines"]["all_ipa_slots"]["compared_slots"] == 4

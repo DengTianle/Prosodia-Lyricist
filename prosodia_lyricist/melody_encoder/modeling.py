@@ -113,6 +113,7 @@ class MelodyTransformerEncoder(nn.Module):
         note_mask: torch.Tensor | None = None,
         normalize: bool = True,
         project: bool = True,
+        note_context: torch.Tensor | None = None,
     ) -> MelodyEncoderOutput:
         if melody_features.ndim != 3:
             raise ValueError(
@@ -126,6 +127,10 @@ class MelodyTransformerEncoder(nn.Module):
             )
 
         x = self.input_projection(melody_features)
+        if note_context is not None:
+            if note_context.shape != x.shape:
+                raise ValueError("note_context must match projected note embeddings")
+            x = x + note_context
         if note_mask is not None:
             if note_mask.shape != melody_features.shape[:2]:
                 raise ValueError(

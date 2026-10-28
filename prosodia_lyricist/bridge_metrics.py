@@ -142,8 +142,8 @@ class ClassificationMetrics:
 
 
 class TemplateMetrics:
-    def __init__(self, *, pairs, bridge_scope):
-        self.pairs, self.bridge_scope = pairs, bridge_scope
+    def __init__(self, *, pairs):
+        self.pairs = pairs
         self.counts = Counter()
 
     def diagnose_counts(self, counts, note_counts):
@@ -240,11 +240,5 @@ class TemplateMetrics:
             "note_ipa_count_mae": (
                 c["count_error"] / c["count_phrases"] if c["count_phrases"] else None
             ),
-            f"skipped_slot_limit_{'songs' if self.bridge_scope == 'song' else 'windows'}": (
-                c["skipped_examples"]
-            ),
-            "skipped_slot_limit_phrases": c["skipped_phrases"],
-            "skipped_target_limit_examples": c["skipped_target_examples"],
-            "skipped_target_limit_phrases": c["skipped_target_phrases"],
-            "example_scope": self.bridge_scope,
+            "example_scope": "song",
         }

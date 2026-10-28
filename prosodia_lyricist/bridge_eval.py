@@ -13,7 +13,7 @@ from tqdm import tqdm
 from .bridge_baselines import evaluate_duration_baselines
 from .bridge_data import BridgeDataset, bridge_collate, decode_bridge_tokens
 from .bridge_model import ProsodyBridge
-from .bridge_train import evaluate_templates, run_bridge_epoch
+from .bridge_train import run_bridge_epoch
 from .data import read_manifest
 from .evaluation import METRIC_VERSION
 from .melody_checkpoint import file_sha256
@@ -67,24 +67,15 @@ def evaluate_bridge(
         num_workers=num_workers,
     )
     model.to(device)
-    note_heads = model.query_mode == "note"
-    parallel = model.query_mode in ("parallel", "note")
-    description = (
-        "Aligned note-head prediction" if note_heads else
-        "Parallel IPA-slot prediction" if parallel else "Teacher-forced evaluation"
-    )
-    with tqdm(loader, desc=description, unit="batch", disable=not progress) as bar:
-        scores = run_bridge_epoch(
-            model, bar, device, precision=precision, template_metrics=parallel
-        )
-    if parallel:
-        generated = scores.pop("templates")
-    else:
-        with tqdm(loader, desc="IPA-count generation", unit="batch", disable=not progress) as bar:
-            generated = evaluate_templates(model, bar, device, precision=precision)
+    with tqdm(
+        loader, desc="Global note-head prediction", unit="batch", disable=not progress
+    ) as bar:
+        scores = run_bridge_epoch(model, bar, device, precision=precision, template_metrics=True)
+    generated = scores.pop("templates")
     duration_baselines = evaluate_duration_baselines(
-        dataset.examples, lines_per_window=model.encoder_lines_per_window,
-        generation=generated, pairs=model.pairs,
+        dataset.examples,
+        generation=generated,
+        pairs=model.pairs,
     )
     generated["accuracy"] = {
         "strength": generated.pop("strength_accuracy"),
@@ -92,7 +83,7 @@ def evaluate_bridge(
         "combined": generated.pop("pair_accuracy"),
     }
     report = {
-        "schema_version": 5 if note_heads else 4 if parallel else 3,
+        "schema_version": 6,
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "checkpoint_weights_sha256": file_sha256(checkpoint / "bridge_weights.pt"),
@@ -105,19 +96,12 @@ def evaluate_bridge(
             "limit_examples": limit,
             "examples": len(dataset),
             "songs": len(dataset.songs),
-            "encoder_windows": dataset.encoder_windows,
             "skipped_examples": dataset.skipped,
             "skipped_limits": dataset.skipped_limits,
-            **({
-                "alignment_policy": model.alignment_policy,
-                "alignment_counts": dict(dataset.alignment_counts),
-                "raw_alignment_sha256": dataset.raw_alignment_sha256,
-                "skipped_no_alignment": dataset.skipped_alignment,
-            } if note_heads else {}),
-            **({
-                "limit_windows": limit, "windows": len(dataset),
-                "skipped_note_limit_windows": dataset.skipped_limits["window_notes"],
-            } if model.bridge_scope == "window" else {}),
+            "alignment_policy": model.alignment_policy,
+            "alignment_counts": dict(dataset.alignment_counts),
+            "raw_alignment_sha256": dataset.raw_alignment_sha256,
+            "skipped_no_alignment": dataset.skipped_alignment,
         },
         "runtime": {
             "device": str(device),
@@ -126,16 +110,14 @@ def evaluate_bridge(
             "num_workers": num_workers,
         },
         "model_limits": {
-            "lines_per_window": model.lines_per_window,
-            "max_notes": model.max_notes,
+            "max_song_notes": model.max_song_notes,
+            "max_song_lines": model.max_song_lines,
             "max_syllables": model.max_syllables,
             "max_target_length": model.max_target_length,
-            **({
-                "encoder_lines_per_window": model.encoder_lines_per_window,
-                "max_window_notes": model.max_notes,
-                "max_song_notes": model.max_song_notes, "max_song_lines": model.max_song_lines,
-            } if model.bridge_scope == "song" else {}),
         },
+        "source_scheme": "global_note_177d_v1",
+        "meter_conditioning": model.meter_conditioning,
+        "contrastive_fusion": model.contrastive_config is not None,
         "bridge_scope": model.bridge_scope,
         "output_design": model.output_design,
         "query_mode": model.query_mode,
@@ -143,40 +125,34 @@ def evaluate_bridge(
         "prosody_rules": model.prosody_rules,
         "output_labels": {"strength": list(model.strength_labels), "length": ["long", "short"]},
         "target_scheme": model.target_scheme,
-        "prediction" if parallel else "teacher_forced": {
-            **(generated if parallel else {}),
+        "prediction": {
+            **generated,
             "loss": scores["loss"],
             "loss_components": scores["components"],
             "classification": scores["classification"],
             "accuracy": {
-                name: scores[f"{'' if parallel else 'teacher_forced_'}{key}_accuracy"]
+                name: scores[f"{key}_accuracy"]
                 for name, key in (
-                    ("strength", "strength"), ("length", "length"), ("combined", "pair")
+                    ("strength", "strength"),
+                    ("length", "length"),
+                    ("combined", "pair"),
                 )
             },
             "slots": scores["tokens"],
-            "phrases": generated["phrases"] if note_heads else scores["phrases"],
+            "phrases": generated["phrases"],
             "batches": scores["batches"],
             "slot_count_source": "ipa",
         },
-        "generation": generated,
         "duration_baselines": duration_baselines,
         "metric_definitions": {
-            "loss": (
-                "Sum of mean stress and length cross-entropies per IPA slot; "
-                "prefixes/padding excluded."
-                if model.output_design == "separate"
-                else "Mean joint pair cross-entropy per IPA slot; prefixes/padding excluded."
+            "loss": "Sum of mean stress/length CE on aligned IPA slots; unmatched slots excluded.",
+            "prediction_accuracy": (
+                "Micro accuracy on observed first-note anchors gathered into the IPA skeleton. "
+                "Gold labels, counts and alignment are never inputs to the global encoder/heads."
             ),
-            "prediction_accuracy" if parallel else "teacher_forced_accuracy": (
-                "Micro accuracy over IPA slots. All position queries attend to the song encoding "
-                "in parallel; gold stress/length labels are used only for scoring and loss."
-                if parallel else "Micro accuracy over IPA slots with gold prior labels."
-            ),
-            "generation_accuracy": (
-                "Greedy free-running labels with reference IPA counts, without gold prior labels. "
-                "Micro accuracy over IPA slots, compared by phrase/slot order. "
-                "MIDI inference still uses note counts."
+            "slot_count_source": (
+                "Reference IPA skeleton and observed word/note anchors are used for scoring. "
+                "MIDI inference directly emits one stress/length pair per note."
             ),
             "combined_accuracy": "Both strength and length must match at the same slot.",
             "classification": (
@@ -200,32 +176,6 @@ def evaluate_bridge(
             ),
         },
     }
-    if parallel:
-        report.pop("generation")
-        report["metric_definitions"].pop("generation_accuracy")
-        report["metric_definitions"]["slot_count_source"] = (
-            "Reference IPA counts supply query positions during evaluation. MIDI inference "
-            "uses one query per note; no syllable-count predictor or alignment is trained."
-        )
-    if note_heads:
-        report["metric_definitions"].update(
-            prediction_accuracy=(
-                "Micro accuracy on observed first-note anchors gathered into the IPA skeleton. "
-                "Only aligned targets enter stress/length CE and classification metrics; "
-                "gold labels, counts and alignment are never inputs to the note encoder/heads."
-            ),
-            slot_count_source=(
-                "Reference IPA skeleton and observed word/note anchors are used for scoring. "
-                "MIDI inference directly emits one stress/length pair per note."
-            ),
-            coverage=(
-                "Source/target limits exclude whole examples. Unaligned word targets are masked "
-                "while every retained note remains encoder context. Slot accuracy includes all "
-                "supervised slots; exact-template accuracy and BLEU include only fully supervised "
-                "phrases. Alignment counts include scanned examples; --limit selects a subset."
-            ),
-            loss="Sum of mean stress/length CE on aligned IPA slots; unmatched slots are excluded.",
-        )
     return report
 
 
@@ -233,16 +183,17 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--prepared-dir", required=True, type=Path)
-    parser.add_argument("--dali-dir", type=Path,
-                        help="Raw annotations for older prepared files without word/note links")
+    parser.add_argument(
+        "--dali-dir",
+        type=Path,
+        help="Raw annotations for older prepared files without word/note links",
+    )
     parser.add_argument("--split", choices=("test", "valid"), default="test")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument(
-        "--limit", type=int, help="First N retained songs (windows for legacy checkpoints)"
-    )
+    parser.add_argument("--limit", type=int, help="First N retained songs")
     parser.add_argument("--output", type=Path, help="Also save the JSON summary to this path")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)

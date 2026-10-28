@@ -68,12 +68,9 @@ def config(tmp_path):
         "data": data,
         "model": dict(
             conditioning="bridge", melody_initialization="random", melody_checkpoint=None,
-            random_melody_encoder=dict(d_model=8, num_heads=2, num_layers=1,
+            melody_encoder=dict(d_model=8, num_heads=2, num_layers=1,
                                        dim_feedforward=16, dropout=0, max_length=32),
-            bridge_scope="song", query_mode="note", encoder_lines_per_window=2,
-            max_window_notes=16, max_song_notes=32, max_song_lines=4, max_target_length=32,
-            song_encoder_layers=1,
-            song_encoder=dict(d_model=8, num_heads=2, dim_feedforward=16, dropout=0),
+            max_song_notes=32, max_song_lines=4, max_target_length=32,
         ),
         "training": dict(device="cpu", precision="fp32", seed=123, epochs=2, batch_size=2,
                          output_dir=str(tmp_path / "runs"), patience=2, learning_rate=1e-3,
@@ -86,18 +83,14 @@ def config(tmp_path):
 def dataset(config, split="train"):
     cfg = config["model"]
     return MelodyPretrainDataset(config["data"]["prepared_dir"], split, **{
-        k: cfg[k] for k in ("encoder_lines_per_window", "max_window_notes",
-                            "max_song_notes", "max_song_lines")
+        k: cfg[k] for k in ("max_song_notes", "max_song_lines")
     })
 
 
 def model_for(config):
     cfg = config["model"]
-    return MaskedMelodyModel(cfg["random_melody_encoder"], {
-        **cfg["song_encoder"], **{k: cfg[k] for k in (
-            "encoder_lines_per_window", "max_window_notes", "max_song_notes",
-            "max_song_lines", "song_encoder_layers",
-        )},
+    return MaskedMelodyModel(cfg["melody_encoder"], {
+        k: cfg[k] for k in ("max_song_notes", "max_song_lines")
     })
 
 
@@ -123,39 +116,36 @@ def test_source_only_pretraining_ignores_ipa_and_alignment(config):
     assert not any(k in new for k in ("labels", "target_note_indices", "syllable_counts"))
 
 
-def test_masking_keeps_window_references_and_padding(config):
+def test_masking_keeps_song_reference_and_padding(config):
     batch = bridge_collate(dataset(config).examples)
-    eligible = eligible_notes(batch, 2)
-    assert not eligible[:, 0].any() and not eligible[0, 8]
+    eligible = eligible_notes(batch)
+    assert not eligible[:, 0].any() and eligible[0, 8]
     assert not eligible[~batch["melody_attention_mask"].bool()].any()
-    full = sample_note_mask(batch, 1, 2, generator=torch.Generator().manual_seed(5))
+    full = sample_note_mask(batch, 1, generator=torch.Generator().manual_seed(5))
     assert torch.equal(full, eligible)
-    small = sample_note_mask(batch, 1e-10, 2, generator=torch.Generator().manual_seed(5))
+    small = sample_note_mask(batch, 1e-10, generator=torch.Generator().manual_seed(5))
     assert small.sum(1).tolist() == [1, 1, 1]
-    repeated = sample_note_mask(batch, 1e-10, 2, generator=torch.Generator().manual_seed(5))
+    repeated = sample_note_mask(batch, 1e-10, generator=torch.Generator().manual_seed(5))
     assert torch.equal(small, repeated)
 
 
 @pytest.mark.parametrize("probability", [0, -0.1, 1.1, None, True, float("nan")])
 def test_invalid_mask_probability(config, probability):
     with pytest.raises(ValueError, match="mask_probability"):
-        sample_note_mask(bridge_collate(dataset(config).examples), probability, 2,
+        sample_note_mask(bridge_collate(dataset(config).examples), probability,
                          generator=torch.Generator())
 
 
-def test_both_views_and_successor_intervals_are_masked_before_local_tower(config, monkeypatch):
+def test_note_and_successor_intervals_are_masked_before_global_encoder(config, monkeypatch):
     model = model_for(config)
     batch = bridge_collate(dataset(config).examples[:1])
     selected = torch.zeros_like(batch["melody_attention_mask"], dtype=torch.bool)
-    selected[0, [2, 7, 10]] = True  # Include the last note before a local-window boundary.
+    selected[0, [2, 7, 10]] = True  # Include notes from all three phrases.
     original = {k: v.clone() for k, v in batch.items()}
     masked = corrupt_notes(batch, selected)
     assert masked["melody_features"][selected].eq(0).all()
-    assert masked["song_features"][selected].eq(0).all()
     assert masked["melody_features"][0, [3, 8, 11], ONSET_SHIFT_SLICE].eq(0).all()
-    assert masked["song_features"][0, [3, 8, 11]][:, [1, 3, 5]].eq(0).all()
     assert torch.equal(masked["melody_features"][0, 1], original["melody_features"][0, 1])
-    assert torch.equal(masked["song_features"][0, 3, 7:], original["song_features"][0, 3, 7:])
     assert all(torch.equal(batch[k], original[k]) for k in batch)
     captured, encode = [], model.encoder.melody_encoder.encode
 
@@ -165,19 +155,18 @@ def test_both_views_and_successor_intervals_are_masked_before_local_tower(config
 
     monkeypatch.setattr(model.encoder.melody_encoder, "encode", capture)
     output = model(**batch, selected=selected)
-    assert captured[0][0, 2].eq(0).all() and captured[0][1, 2].eq(0).all()
+    assert captured[0][0, 2].eq(0).all() and captured[0][0, 10].eq(0).all()
     assert output.targets["pitch"].tolist() == [2, 5, 2]
     assert output.targets["pitch_sign"].tolist() == [0, 1, 0]
     assert output.count == 3
 
 
-def test_gradients_reach_both_encoders_and_fusion_without_ipa_heads(config):
+def test_gradients_reach_global_encoder_without_ipa_heads(config):
     model = model_for(config)
     batch = bridge_collate(dataset(config).examples)
-    selected = sample_note_mask(batch, 0.5, 2, generator=torch.Generator())
+    selected = sample_note_mask(batch, 0.5, generator=torch.Generator())
     model(**batch, selected=selected).loss.backward()
-    for prefix in ("encoder.melody_encoder.transformer.", "encoder.adapter.",
-                   "encoder.song_features.", "encoder.song_encoder.", "heads."):
+    for prefix in ("encoder.melody_encoder.transformer.", "encoder.line_embedding.", "heads."):
         assert any(p.grad is not None and p.grad.abs().sum() > 0
                    for n, p in model.named_parameters() if n.startswith(prefix))
     assert not any("strength_head" in n or "length_head" in n for n, _ in model.named_parameters())
@@ -187,7 +176,7 @@ def test_fixed_mask_reconstruction_can_learn(config):
     torch.manual_seed(123)
     model = model_for(config)
     batch = bridge_collate(dataset(config).examples[:1])
-    selected = sample_note_mask(batch, 0.3, 2, generator=torch.Generator().manual_seed(17))
+    selected = sample_note_mask(batch, 0.3, generator=torch.Generator().manual_seed(17))
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
     initial = model(**batch, selected=selected).loss.item()
     for _ in range(40):
@@ -212,7 +201,7 @@ def test_deterministic_validation_and_masked_token_weighted_accumulation(config,
     # Different numbers of masked tokens in each microbatch must give the same
     # update as their concatenated batch, including a partial accumulation group.
     monkeypatch.setattr(bridge_pretrain, "sample_note_mask", lambda batch, *a, **kw:
-                        eligible_notes(batch, 2))
+                        eligible_notes(batch))
     combined, accumulated = copy.deepcopy(model), copy.deepcopy(model)
     opt_combined = torch.optim.SGD(combined.parameters(), lr=0.01)
     opt_accumulated = torch.optim.SGD(accumulated.parameters(), lr=0.01)
@@ -229,7 +218,7 @@ def test_deterministic_validation_and_masked_token_weighted_accumulation(config,
 def test_checkpoint_roundtrip_and_full_encoder_transfer_with_fresh_prosody_heads(config, tmp_path):
     model = model_for(config).eval()
     batch = bridge_collate(dataset(config).examples)
-    selected = sample_note_mask(batch, 0.3, 2, generator=torch.Generator())
+    selected = sample_note_mask(batch, 0.3, generator=torch.Generator())
     directory = tmp_path / "pretrained"
     manifest_path = Path(config["data"]["prepared_dir"]) / "manifest.json"
     hashes = json.loads(manifest_path.read_text())["sha256"]
@@ -239,7 +228,6 @@ def test_checkpoint_roundtrip_and_full_encoder_transfer_with_fresh_prosody_heads
         torch.testing.assert_close(logits, restored(**batch, selected=selected).logits[name])
     spec = encoder_configuration(model.encoder)
     bridge = ProsodyBridge(spec["melody_config"], **spec["encoder_config"],
-                            bridge_scope="song", query_mode="note",
                             strength_labels=REPO_STRESSES).eval()
     heads_before = bridge.strength_head.weight.detach().clone()
     meta = read_pretraining_metadata(directory)
@@ -252,7 +240,7 @@ def test_checkpoint_roundtrip_and_full_encoder_transfer_with_fresh_prosody_heads
         initialize_from_masked(bridge, directory, {**meta, "encoder_config": {}})
     with pytest.raises(ValueError, match="splits differ"):
         read_pretraining_metadata(directory, manifest={"sha256": {}})
-    meta["song_feature_scheme"] = "wrong"
+    meta["source_scheme"] = "wrong"
     (directory / "pretrain.json").write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="feature representation"):
         MaskedMelodyModel.load(directory)
@@ -266,7 +254,6 @@ def test_end_to_end_self_supervision_then_ipa_finetune(config, tmp_path, monkeyp
     def forbidden(*args, **kwargs):
         pytest.fail("Random pretraining and masked fine-tuning must not import contrastive weights")
 
-    monkeypatch.setattr(bridge_pretrain, "load_contrastive_melody", forbidden)
     monkeypatch.setattr(bridge_train, "load_contrastive_melody", forbidden)
     output = train_pretrain(config, smoke_test=smoke_test)
     pretrained = MaskedMelodyModel.load(output / "best")
@@ -310,6 +297,9 @@ def test_end_to_end_self_supervision_then_ipa_finetune(config, tmp_path, monkeyp
     assert bridge.predict_notes(**bridge_collate(dataset(config).examples)).length_logits.shape == (
         3, 12, 2,
     )
+    config["model"]["melody_encoder"]["d_model"] *= 2
+    with pytest.raises(ValueError, match="Configured melody_encoder differs"):
+        bridge_train.train_bridge(config)
 
 
 def test_source_checksums_and_melody_limits(config):

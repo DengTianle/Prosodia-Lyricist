@@ -6,18 +6,18 @@ import numpy as np
 
 from .bridge_data import PAIRS, decode_bridge_tokens
 
-SCOPES = ("global", "song", "window", "line")
+SCOPES = ("global", "song", "line")
 
 
-def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, pairs=PAIRS):
+def evaluate_duration_baselines(examples, *, generation=None, pairs=PAIRS):
     """Compare raw note duration to arithmetic means, without inspecting target labels.
 
     Like bridge generation, the comparison uses known IPA counts. Notes and slots
     are paired in phrase order; extra notes are trimmed and absent notes are wrong.
     The equal-count subset also reports the model's accuracy on those same phrases.
     """
-    if not examples or lines_per_window < 1:
-        raise ValueError("Duration baselines require examples and positive window size")
+    if not examples:
+        raise ValueError("Duration baselines require examples")
     global_mean = float(
         sum(np.sum(e["note_duration_seconds"]) for e in examples)
         / sum(len(e["note_duration_seconds"]) for e in examples)
@@ -28,13 +28,10 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, 
     for example in examples:
         durations = np.asarray(example["note_duration_seconds"], dtype=np.float64)
         line_ids = np.asarray(example["note_line_ids"]) - 1
-        window_ids = line_ids // lines_per_window
         line_means = np.bincount(line_ids, weights=durations) / np.bincount(line_ids)
-        window_means = np.bincount(window_ids, weights=durations) / np.bincount(window_ids)
         thresholds = {
             "global": global_mean,
             "song": example["song_mean_note_duration_seconds"],
-            "window": window_means[window_ids],
             "line": line_means[line_ids],
         }
         predictions = {scope: durations > threshold for scope, threshold in thresholds.items()}
@@ -82,7 +79,7 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, 
         if model is not None:
             if any(model[key] != counts[key] for key in ("phrases", "compared_slots")):
                 raise ValueError("Duration baseline coverage differs from model generation")
-            # Accept both evaluate_templates results and serialized bridge_eval reports.
+            # Accept both epoch template metrics and serialized bridge_eval reports.
             model_accuracy = model.get("length_accuracy", model.get("accuracy", {}).get("length"))
         slots = counts["compared_slots"]
         scores[subset] = {
@@ -105,8 +102,7 @@ def evaluate_duration_baselines(examples, *, lines_per_window, generation=None, 
         "prediction_rule": "long iff raw note duration > arithmetic mean; ties are short",
         "threshold_scopes": {
             "global": "All notes in retained evaluation examples; no target labels used.",
-            "song": "All notes in the prepared song, including other legacy encoder windows.",
-            "window": f"Consecutive {lines_per_window}-line encoder windows, including short tail.",
+            "song": "All notes in the prepared song.",
             "line": "All notes in the current phrase.",
         },
         "global_mean_note_duration_seconds": global_mean,

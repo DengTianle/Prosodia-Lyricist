@@ -1,6 +1,7 @@
 """4/4 MIDI templates; explicit supplement conventions are in docs/evaluation.md."""
 
 import math
+from bisect import bisect_right
 from collections import defaultdict
 
 from .dali import normalize_text
@@ -30,6 +31,22 @@ def midi_melody_record(path, *, track=0, title="", phrase_policy="complete"):
     if phrase_policy == "complete" and boundaries[-1] < notes[-1].end:
         boundaries.append(notes[-1].end)
     times = midi.get_tick_to_time_mapping()
+    signatures = sorted(midi.time_signature_changes, key=lambda signature: signature.time)
+    signature_times = [signature.time for signature in signatures]
+
+    def observed_meter(note):
+        index = bisect_right(signature_times, note.start) - 1
+        if index < 0:
+            return None
+        signature = signatures[index]
+        beat_ticks = midi.ticks_per_beat * 4 / signature.denominator
+        return {
+            "numerator": signature.numerator,
+            "denominator": signature.denominator,
+            # MIDI tick zero / a signature change is the bar-grid origin.
+            "beat_position": ((note.start - signature.time) / beat_ticks) % signature.numerator,
+        }
+
     lines, cursor = [], 0
     for boundary in boundaries:
         group = []
@@ -47,6 +64,7 @@ def midi_melody_record(path, *, track=0, title="", phrase_policy="complete"):
                         "note_duration_seconds": [
                             float(times[n.end] - times[n.start]) for n in group
                         ],
+                        "meter": [observed_meter(n) for n in group],
                     },
                 }
             )

@@ -1,11 +1,10 @@
 # Prosodia Lyricist
 
 Prosody-conditioned lyric generation with BART, trained on the **DALI music
-annotation dataset**. This branch trains a supervised parallel bridge from melody
-to IPA templates, then feeds its discrete predictions to the original
-XAI-Lyricist `bestM2LCkpt.pt`. Each requested syllable position attends to the
-whole melody encoding and predicts stress and vowel length with separate CE
-losses. The bridge has no label feedback or autoregressive decoding. `train.sh`,
+annotation dataset**. This branch trains a global melody encoder with direct note
+classification into IPA templates, then feeds its discrete predictions to the original
+XAI-Lyricist `bestM2LCkpt.pt`. Each note attends to the complete song and predicts stress and vowel
+length with separate CE losses. The bridge has no label feedback or autoregressive decoding. `train.sh`,
 `prep.sh`, and `configs/bridge.yaml` select this workflow; see the
 [bridge commands](#learned-melody-to-template-bridge) below. XAI's single-stream
 lyric decoder and compound meter/length/remainder source embeddings are preserved.
@@ -60,8 +59,8 @@ Preparation can be rerun and replaces only these generated outputs. Raw data
 and old local experiment outputs are ignored by Git.
 
 The default configuration selects English songs and uses a seeded hash for
-approximately 80%/10%/10% train/validation/test song groups. Groups exposed to
-contrastive pretraining's training split are then assigned to downstream train. All
+approximately 80%/10%/10% train/validation/test song groups. When a contrastive manifest is configured, groups exposed to its training
+split are assigned to downstream train. All
 lines from a song stay together. Entries sharing normalized artist/title or
 the same audio ID are grouped together, including transitive duplicates.
 This does not identify every cover or near-duplicate recording in DALI.
@@ -129,21 +128,27 @@ small subsets may have empty splits, in which case training fails clearly.
 
 ## Learned melody-to-template bridge
 
-The bridge uses the window-preserving melody encoder and global song features
-from `prosodia-bridge2`. Two bidirectional song-encoder layers provide whole-song
-context. Shared stress and vowel-length classifiers read each contextual note
-directly after those bidirectional layers:
+The bridge encodes a whole song in one bidirectional Transformer pass. It uses
+the same 177-dimensional pitch-displacement, log-duration and inter-onset-interval
+representation, normalized once across the song. Phrase embeddings enter before
+attention; shared stress and vowel-length classifiers read each contextual note.
+There is no window splitting/reassembly or second song encoder.
 
 ```text
-MIDI notes → pretrained two-line windows → whole-song encoder
-           → per-note stress/length heads → discrete IPA template
-           → original XAI-Lyricist template encoder and lyric decoder → lyrics
+whole-song 177-D notes + phrase embeddings + optional meter / contrastive context
+  → global melody Transformer → note stress/length heads → discrete IPA template
+  → original XAI-Lyricist template encoder and lyric decoder → lyrics
 ```
+
+DALI training starts from scratch by default, or from global masked-note
+pretraining. Optional meter conditioning and a gated contrastive tower can be
+added when fine-tuning a saved global bridge. See the
+[configuration recipes](docs/prosody-bridge.md) for both.
 
 Observed DALI word/note links map the first note of each sung-syllable group to
 an IPA slot. Gold labels and this mapping select losses and scores; they never
 enter the encoder or classification heads. Both supervised losses backpropagate
-through the song encoder and, when unfrozen, the melody tower:
+through the global melody encoder when it is unfrozen:
 
 ```text
 loss = CE_stress + CE_length
@@ -168,12 +173,14 @@ alignment is masked. All notes remain encoder context, including continuations
 and masked words. MIDI inference emits one pair per note and retains an unmarked
 tail as a final phrase. There is no role or count predictor.
 
-Configure `configs/bridge.yaml` with the original contrastive checkpoint and its
-pretraining CSV. Set those paths before preparation so identity groups exposed to
-upstream training stay in downstream training. Other duplicate song/audio groups
-also stay together. Source limits remain 512 notes per encoder window, 2,048 notes
-and 256 lines per song, and 4,096 IPA/structural positions per song. Overlong
-training songs are skipped whole and counted; inference rejects them.
+Configure `configs/bridge.yaml` for the encoder size and training device. For
+contrastive fusion, set `model.contrastive_fusion.checkpoint` and
+`data.pretraining_manifest` before preparation so upstream training identities
+remain in downstream training. Duplicate song/audio groups also stay together.
+Limits are 2,048 notes, 256 lines, and 4,096 IPA/structural positions per song.
+Overlong training songs are skipped whole and counted; inference rejects them.
+Global attention memory grows quadratically with note count; adjust batch size
+for the available device.
 
 ```bash
 conda activate prosodia-lyricist
@@ -210,7 +217,7 @@ bridge. For upstream CSV changes, `training.pretraining_audit_mode: warning`
 retains prepared-file integrity checks and records missing/conflicting audit
 information; `strict` requires the unchanged original CSV.
 
-Evaluation schema v5 reports one `prediction` block: slot-weighted loss, separate
+Evaluation schema v6 reports one `prediction` block: slot-weighted loss, separate
 loss components, head/pair accuracies, exact phrase accuracy, prosody-BLEU, and
 note/IPA count diagnostics. Slot metrics use only aligned targets. Exact-template
 accuracy and BLEU use fully supervised phrases, with coverage reported explicitly.
@@ -225,10 +232,10 @@ recall, so majority-class collapse is visible without opening the JSON.
 Validation additionally reports long-vs-short ROC AUC and average precision:
 these reveal useful ranking even when every argmax prediction is still short.
 
-New checkpoints use bridge format v9. Older v2-v8 checkpoints retain their original
-architecture for inference/evaluation. New training defaults to note heads;
-explicit legacy parallel-query configurations remain usable for comparisons.
-See [bridge details](docs/prosody-bridge.md) for features and configuration.
+New checkpoints use bridge format v10; masked pretraining uses format v2.
+Older window/query bridge and masked checkpoints require retraining. Prepared
+note arrays remain reusable: obsolete `lines_per_window` metadata is ignored.
+The BART/XAI architecture and checkpoint format are unchanged.
 
 ### Self-supervised melody pretraining
 
@@ -236,8 +243,7 @@ See [bridge details](docs/prosody-bridge.md) for features and configuration.
 displacement, pitch sign, duration bin, and inter-onset interval bin. It reads only
 melodies from the existing prepared train/valid splits; no IPA labels, alignment,
 raw DALI files, or lyric checkpoint are needed. By default it starts from scratch
-and trains the melody tower, adapter, global-feature projection, and bidirectional
-song encoder together at `1e-4`.
+and trains the global encoder and phrase embeddings together at `1e-4`.
 
 ```bash
 conda activate prosodia-lyricist
@@ -253,9 +259,9 @@ stress/length heads. The resulting bridge uses the usual evaluation and MIDI
 commands. Import requires the same prepared train/valid checksums to preserve the
 held-out split.
 
-Masking selects 15% of non-anchor notes (at least one per song), zeroing both
-feature views before local encoding and hiding dependent successor intervals.
-Each local window's first note stays visible as its pitch reference. Loss is the
+Masking selects 15% of non-anchor notes (at least one per song), zeroing their
+177-D inputs and hiding dependent successor IOIs. Only the song's first note
+stays visible as its pitch reference. Loss is the
 sum of four CEs over masked notes only. Validation masks stay fixed; logs report
 each reconstruction loss/accuracy, class counts, and majority baselines.
 Validation CE selects `best/`.
@@ -428,8 +434,8 @@ ruff check prosodia_lyricist tests
 ```
 
 Tests use synthetic annotations and tiny local models. Real IPA integration tests
-require installed pronunciation resources. Coverage includes song packing,
-pretraining-split audits, global feature fusion, parallel label independence,
+require installed pronunciation resources. Coverage includes global encoding,
+pretraining-split audits, optional meter/contrastive fusion, label independence,
 head gradients, padding, accumulation, checkpoint reload, MIDI tails/tempo/meter,
 XAI import and causal scoring, and reference isolation.
 
@@ -438,10 +444,10 @@ prosodia_lyricist/
   prepare.py, dali.py, ipa.py   DALI preparation and IPA supervision
   melody_encoder/             pretrained note representation and tower
   melody_checkpoint.py        strict trunk import and provenance
-  bridge_data.py              windows, global song features, targets, padding
-  bridge_model.py              source fusion, song encoder, direct note heads
+  bridge_data.py              global note features, targets, padding
+  bridge_model.py              global encoder, optional fusion, direct note heads
   bridge_alignment.py         word-local IPA targets and observed note anchors
-  bridge_readout.py           legacy cross-attention query readout
+  meter.py                    observed meter features and missing-data masks
   bridge_train.py, train.py    supervised training and validation
   bridge_eval.py              held-out template evaluation and controls
   bridge_infer.py              MIDI-to-template prediction

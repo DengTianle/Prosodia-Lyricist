@@ -1,4 +1,4 @@
-# All paths are relative to this YAML. The XAI lyric checkpoint is used only at inference.
+# Paths are relative to this YAML. BART/XAI is used only at inference.
 data:
   dali_dir: ../../DALI_v2
   prepared_dir: ../data/dali-xai
@@ -10,67 +10,49 @@ data:
   test_fraction: 0.1
   seed: 1234
   stress_source: ipa
-  prosody_mode: actual # Preserve XAI primary/secondary stress and long-vowel rules.
+  prosody_mode: actual
   include_melody: true
-  # Preparation puts contrastive-trained identity groups in downstream train;
-  # upstream val/test songs otherwise retain downstream random assignments.
-  # Inspect early with: python -m prosodia_lyricist.prepare --config ... --check-splits
-  # With warning mode, it may be changed or unavailable when reusing prepared data.
-  pretraining_manifest: ../../try-contrastive/data/max_en_2line_16s/segments_manifest.csv
-  lines_per_window: 2 # Pretrained tower's window size; retain existing prepared data.
+  # Set the contrastive training CSV before preparation if fusion will be used.
+  pretraining_manifest: null
 
 model:
   conditioning: bridge
-  melody_initialization: pretrained # pretrained, random, or masked (full encoder).
-  # For masked: set this to checkpoints/bridge-pretrain/RUN/best (directory).
-  # Keep encoder architecture/window limits equal to the pretraining config.
-  # For pretrained: current note-based two-pool contrastive .pt checkpoint.
-  melody_checkpoint: ../../try-contrastive/checkpoints/large_2line_16s/best.pt
-  # Only used for random initialization; choose the tower size for the comparison.
-  random_melody_encoder:
+  melody_initialization: random # random, masked (encoder), or bridge (fine-tune).
+  melody_checkpoint: null # best/ directory for masked or bridge initialization.
+  melody_encoder:
     d_model: 256
     num_layers: 4
     num_heads: 4
     dim_feedforward: 1024
     dropout: 0.1
     pooling: cls
-    max_length: 4096
-  bridge_scope: song
-  query_mode: note # Two shared classification heads after the bidirectional song encoder.
-  alignment_policy: strict # Mask mismatched words; prefix optionally pairs min(sung, IPA).
-  encoder_lines_per_window: 2 # Must match data.lines_per_window and pretraining.
-  max_window_notes: 512
-  max_song_notes: 2048
+    max_length: 2048
+  max_song_notes: 2048 # Entire songs are skipped/rejected above limits; never truncated.
   max_song_lines: 256
-  max_target_length: 4096 # Includes fixed line prefixes. Skip whole songs; never truncate.
-  song_encoder_layers: 2
-  song_encoder: # Width/attention/FFN settings for the song encoder; no query readout.
-    d_model: 256
-    num_heads: 4
-    dim_feedforward: 1024
-    dropout: 0.1
+  max_target_length: 4096
+  alignment_policy: strict # prefix pairs min(sung, IPA) within mismatched words.
+  meter_conditioning: false # Enable for fine-tuning on explicitly annotated meter.
+  # Optional whole-song contextual branch; independent of the main encoder.
+  # On a fused bridge fine-tune, omit checkpoint to keep its saved tower.
+  contrastive_fusion:
+    checkpoint: null # ../../try-contrastive/checkpoints/large_2line_16s/best.pt
+    unfreeze_epoch: null # Frozen by default; 0 fine-tunes immediately.
+    learning_rate: 0.000002
 
 training:
-  # strict retains the preparation-time CSV requirement; warning permits reuse
-  # with a changed/missing CSV and records the current audit status in run.json.
   pretraining_audit_mode: strict
   output_dir: ../checkpoints/bridge-xai
   device: cuda
   seed: 1234
   epochs: 100
-  batch_size: 8 # Songs per batch (each song includes all of its encoder windows).
+  batch_size: 8 # Full songs; attention memory scales quadratically with note count.
   num_workers: 0
-  precision: bf16 #fp32 bf16 is also supported on CUDA hardware with BF16 support.
+  precision: bf16 # Use fp32 on CPU/MPS.
   gradient_accumulation_steps: 2
-  # Zero-based: 1 warms up the song encoder/heads, then fine-tunes the trunk.
-  # null keeps the pretrained trunk frozen; 0 fine-tunes immediately.
-  # Also applies to a random tower; use 0 to train it from the first epoch.
-  melody_unfreeze_epoch: 1
-  learning_rate: 0.0001
-  melody_learning_rate: 0.000002
-  # [long, short], e.g. [2.0, 1.0]; null keeps ordinary CE. Stress is unweighted.
-  # When enabled, best/ uses weighted validation objective; ordinary CE is also logged.
-  length_class_weights: null
+  melody_unfreeze_epoch: 0 # Train global encoder immediately; null keeps it frozen.
+  learning_rate: 0.0001 # Heads, phrase embeddings, meter/fusion adapters.
+  melody_learning_rate: 0.0001 # Main global encoder.
+  length_class_weights: null # Optional [long, short], e.g. [2.0, 1.0].
   adam_betas: [0.9, 0.98]
   adam_epsilon: 0.00001
   weight_decay: 0.01

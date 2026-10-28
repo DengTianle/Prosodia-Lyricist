@@ -29,6 +29,8 @@ def config(tmp_path):
             records.append({"song_id": name, "lines": [{
                 "syllables": [{"stress": "strong", "length": "long"},
                               {"stress": "weak", "length": "short"}],
+                "note_alignment": {"scheme": "dali_word_note_starts_v1", "note_count": 3,
+                                   "words": [{"note_starts": [0, 1], "syllable_indices": [0, 1]}]},
                 "melody": {"midi_pitches": [60, 62, 64], "onset_seconds": [0, 1, 2],
                            "note_duration_seconds": [0.5, 0.25, 0.5]},
             }]})
@@ -43,12 +45,9 @@ def config(tmp_path):
         "data": data,
         "model": dict(
             conditioning="bridge", melody_initialization="random", melody_checkpoint=None,
-            random_melody_encoder=dict(d_model=8, num_layers=2, num_heads=2,
+            melody_encoder=dict(d_model=8, num_layers=2, num_heads=2,
                                        dim_feedforward=16, dropout=0, pooling="cls", max_length=32),
-            bridge_scope="song", encoder_lines_per_window=2, max_window_notes=16,
-            max_song_notes=32, max_song_lines=4, max_target_length=32, song_encoder_layers=1,
-            bridge_decoder=dict(d_model=8, num_layers=1, num_heads=2,
-                                dim_feedforward=16, dropout=0),
+            max_song_notes=32, max_song_lines=4, max_target_length=32,
         ),
         "training": dict(
             output_dir=str(tmp_path / "runs"), device="cpu", seed=1234, epochs=1,
@@ -93,7 +92,7 @@ def test_random_tower_never_loads_weights_and_trains_full_architecture(
     metrics = json.loads((output / "metrics.jsonl").read_text())
     restored = ProsodyBridge.load(output / "best")
     assert restored.melody_config == {
-        **config["model"]["random_melody_encoder"], "projection_dim": None,
+        **config["model"]["melody_encoder"], "projection_dim": None,
     }
     assert restored.melody_encoder.projection is None
     assert run["smoke_test"] == smoke_test
@@ -102,7 +101,7 @@ def test_random_tower_never_loads_weights_and_trains_full_architecture(
     assert run["melody_provenance"] == restored.provenance == {
         "initialization": "random", "weights_loaded": False,
         "checkpoint": None, "sha256": None,
-        "architecture_source": "model.random_melody_encoder",
+        "architecture_source": "model.melody_encoder",
     }
     assert not metrics["melody_frozen"]
     assert metrics["train"]["loss"] > 0
@@ -170,8 +169,8 @@ def test_invalid_random_architecture_fails_before_loading_data(override):
     if override:
         architecture = dict(d_model=8, num_layers=1, num_heads=2, dim_feedforward=16)
         architecture.update(override)
-    with pytest.raises(ValueError, match="random_melody_encoder"):
+    with pytest.raises(ValueError, match="melody_encoder"):
         bridge_train.train_bridge({
             "data": {}, "training": {},
-            "model": {"melody_initialization": "random", "random_melody_encoder": architecture},
+            "model": {"melody_initialization": "random", "melody_encoder": architecture},
         })

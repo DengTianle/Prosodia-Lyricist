@@ -1,4 +1,4 @@
-"""Window-preserving melody inputs and whole-song IPA template supervision."""
+"""Globally encoded melody inputs and whole-song IPA template supervision."""
 
 import json
 import logging
@@ -15,24 +15,14 @@ from .data import read_manifest
 from .ipa import REPO_RULES, REPO_STRESSES
 from .melody_checkpoint import file_sha256
 from .melody_encoder.encoding import MELODY_FEATURE_DIM, encode_note_sequence
+from .meter import METER_FEATURE_DIM, encode_meter
 from .runtime import log_stage
 
 logger = logging.getLogger(__name__)
 
-PAD, BOS, SLOT = range(3)
+PAD, SLOT = range(2)
 PAIRS = (("strong", "long"), ("strong", "short"), ("weak", "long"), ("weak", "short"))
-PAIR_OFFSET = 3
-FIRST_LINE = PAIR_OFFSET + len(PAIRS)
-
-# Continuous song coordinates supplement, never replace, the pretrained 177-D inputs.
-SONG_FEATURE_SCHEME = "song_pitch_timing_v1"
-SONG_TIME_PERIODS = 2.0 ** np.arange(-1, 15, dtype=np.float64)
-SONG_SCALARS = (
-    "pitch_from_song_start_octaves", "previous_pitch_interval_octaves",
-    "log2_duration_over_scale", "log2_positive_ioi_over_scale",
-    "has_previous_note", "has_positive_ioi", "log2_scale_seconds",
-)
-SONG_FEATURE_DIM = len(SONG_SCALARS) + 2 * len(SONG_TIME_PERIODS)
+PAIR_OFFSET = 2
 
 
 def prosody_pairs(strength_labels=("strong", "weak")):
@@ -41,11 +31,11 @@ def prosody_pairs(strength_labels=("strong", "weak")):
     return tuple((s, n) for s in strength_labels for n in ("long", "short"))
 
 
-def bridge_vocabulary(lines_per_window, *, pairs=PAIRS):
+def bridge_vocabulary(max_lines, *, pairs=PAIRS):
     return (
-        ["pad", "bos", "slot"]
+        ["pad", "slot"]
         + [f"{s}_{n}" for s, n in pairs]
-        + [f"line_{index}" for index in range(lines_per_window)]
+        + [f"line_{index}" for index in range(max_lines)]
     )
 
 
@@ -84,50 +74,18 @@ def melody_arrays(lines):
     return pitches, onsets, durations, line_ids
 
 
-def encode_bridge_source(lines):
-    """Legacy single window, with exactly the pretrained feature normalization."""
-    pitches, onsets, durations, line_ids = melody_arrays(lines)
-    return {
-        "melody_features": encode_note_sequence(
-            pitches, onsets - onsets[0], durations
-        ),
-        "note_line_ids": line_ids,
-        "line_count": len(lines),
-    }
+def encode_bridge_song(lines):
+    """Encode the entire song once with the original 177-D representation.
 
-
-def encode_bridge_song(lines, encoder_lines_per_window=2):
-    """Gather locally encoded windows in song order and add common musical coordinates.
-
-    Scale is the median positive song IOI (median duration if none exists), not
-    an estimated beat. Zero/missing IOIs have explicit indicators and log value
-    zero. Fourier time periods are 0.5 .. 16384 scale units. Pitch is in octaves;
-    changing the song key or shifting its time origin leaves these features intact.
+    Pitch reference, log-duration bins and IOI bins are shared by all phrases.
+    Phrase IDs and optional observed meter are separate conditioning inputs.
     """
-    if not isinstance(encoder_lines_per_window, int) or encoder_lines_per_window < 1:
-        raise ValueError("encoder_lines_per_window must be a positive integer")
     pitches, onsets, durations, line_ids = melody_arrays(lines)
-    windows = [
-        encode_bridge_source(lines[start : start + encoder_lines_per_window])
-        for start in range(0, len(lines), encoder_lines_per_window)
-    ]
-    intervals = np.diff(onsets, prepend=onsets[0])
-    positive = intervals > 0
-    scale = np.median(intervals[positive]) if positive.any() else np.median(durations)
-    log_ioi = np.zeros_like(intervals)
-    log_ioi[positive] = np.log2(intervals[positive] / scale)
-    previous = np.arange(len(pitches)) > 0
-    scalars = np.stack([
-        (pitches - pitches[0]) / 12,
-        np.diff(pitches, prepend=pitches[0]) / 12,
-        np.log2(durations / scale), log_ioi, previous, positive,
-        np.full(len(pitches), np.log2(scale)),
-    ], axis=-1)
-    phase = (2 * np.pi * ((onsets - onsets[0]) / scale))[:, None] / SONG_TIME_PERIODS
-    features = np.concatenate((scalars, np.sin(phase), np.cos(phase)), axis=-1)
+    meter, observed = encode_meter(lines)
     return {
-        "melody_features": np.concatenate([w["melody_features"] for w in windows]),
-        "song_features": features.astype(np.float32),
+        "melody_features": encode_note_sequence(pitches, onsets - onsets[0], durations),
+        "meter_features": meter,
+        "meter_mask": observed,
         "note_line_ids": line_ids,
         "line_count": len(lines),
     }
@@ -176,19 +134,26 @@ def decode_bridge_tokens(tokens, *, pairs=PAIRS):
 
 class BridgeDataset(Dataset):
     def __init__(
-        self, directory, split, *, lines_per_window, max_notes, limit=None,
-        bridge_scope="window", max_song_notes=2048, max_song_lines=256, max_target_length=None,
-        strength_labels=None, alignment_policy=None, dali_dir=None,
+        self,
+        directory,
+        split,
+        *,
+        limit=None,
+        max_song_notes=2048,
+        max_song_lines=256,
+        max_target_length=4096,
+        strength_labels=None,
+        alignment_policy="strict",
+        dali_dir=None,
     ):
-        if lines_per_window < 1 or max_notes < 1:
-            raise ValueError("Window sizes must be positive")
-        if bridge_scope not in ("window", "song"):
-            raise ValueError("Unknown bridge scope")
         if alignment_policy is not None and alignment_policy not in ALIGNMENT_POLICIES:
             raise ValueError("alignment_policy must be strict or prefix")
-        if max_song_notes < 1 or max_song_lines < 1 or (
-            max_target_length is not None and max_target_length < 1
-        ) or (limit is not None and limit < 1):
+        if (
+            max_song_notes < 1
+            or max_song_lines < 1
+            or (max_target_length is not None and max_target_length < 1)
+            or (limit is not None and limit < 1)
+        ):
             raise ValueError("Song/target limits must be positive")
         manifest = read_manifest(directory)
         data = manifest["config"]
@@ -203,8 +168,6 @@ class BridgeDataset(Dataset):
             manifest.get("pronunciation", {}).get("rules") != REPO_RULES
         ):
             raise ValueError("Prepared IPA rules must record XAI historical pronunciation")
-        if data.get("lines_per_window", lines_per_window) != lines_per_window:
-            raise ValueError("Prepared encoder window size differs from the bridge")
         self.strength_labels = prepared_labels
         self.pairs = prosody_pairs(prepared_labels)
         path = Path(directory) / f"{split}.jsonl"
@@ -214,93 +177,84 @@ class BridgeDataset(Dataset):
         self.examples, self.skipped, self.songs = [], 0, set()
         self.alignment_counts, self.raw_alignment_sha256 = Counter(), {}
         self.skipped_alignment = 0
-        self.bridge_scope, self.encoder_windows = bridge_scope, 0
-        self.skipped_limits = dict(window_notes=0, song_notes=0, song_lines=0, target_tokens=0)
+        self.skipped_limits = dict(song_notes=0, song_lines=0, target_tokens=0)
         with log_stage("Encoding bridge %s data", split), path.open(encoding="utf-8") as handle:
             for row in tqdm(handle, desc=f"Encoding {split}", unit="song", leave=False):
                 song = json.loads(row)
                 if manifest["songs"][song["song_id"]]["split"] != split:
                     raise ValueError("Song appears in incorrect split")
-                if alignment_policy is not None and any(
-                    "note_alignment" not in line for line in song["lines"]
-                ):
-                    checksum = recover_note_alignment(song, dali_dir or data.get("dali_dir"))
-                    self.raw_alignment_sha256[song["song_id"]] = checksum
-                width = len(song["lines"]) if bridge_scope == "song" else lines_per_window
-                if not width:
+                lines = song["lines"]
+                if not lines:
                     raise ValueError("Empty bridge song")
-                song_mean_duration = float(np.mean([
-                    duration for line in song["lines"]
-                    for duration in line["melody"]["note_duration_seconds"]
-                ]))
-                for offset in range(0, len(song["lines"]), width):
-                    lines = song["lines"][offset : offset + width]
-                    note_counts = [len(line["melody"]["midi_pitches"]) for line in lines]
-                    over = {
-                        "window_notes": any(
-                            sum(note_counts[start : start + lines_per_window]) > max_notes
-                            for start in range(0, len(lines), lines_per_window)
-                        ),
-                        "song_notes": bridge_scope == "song" and sum(note_counts) > max_song_notes,
-                        "song_lines": bridge_scope == "song" and len(lines) > max_song_lines,
-                        "target_tokens": max_target_length is not None and (
-                            sum(len(line["syllables"]) + 1 for line in lines) > max_target_length
-                        ),
-                    }
-                    if any(over.values()):
+                note_counts = [len(line["melody"]["midi_pitches"]) for line in lines]
+                over = {
+                    "song_notes": sum(note_counts) > max_song_notes,
+                    "song_lines": len(lines) > max_song_lines,
+                    "target_tokens": max_target_length is not None
+                    and (sum(len(line["syllables"]) + 1 for line in lines) > max_target_length),
+                }
+                if any(over.values()):
+                    self.skipped += 1
+                    for reason, exceeded in over.items():
+                        self.skipped_limits[reason] += int(exceeded)
+                    continue
+                alignment = {}
+                if alignment_policy is not None:
+                    if any("note_alignment" not in line for line in lines):
+                        checksum = recover_note_alignment(song, dali_dir or data.get("dali_dir"))
+                        self.raw_alignment_sha256[song["song_id"]] = checksum
+                    indices, counts = aligned_note_indices(lines, alignment_policy)
+                    self.alignment_counts.update(counts)
+                    if not counts["supervised_slots"]:
                         self.skipped += 1
-                        for reason, exceeded in over.items():
-                            self.skipped_limits[reason] += int(exceeded)
+                        self.skipped_alignment += 1
                         continue
-                    alignment = {}
-                    if alignment_policy is not None:
-                        indices, counts = aligned_note_indices(lines, alignment_policy)
-                        self.alignment_counts.update(counts)
-                        if not counts["supervised_slots"]:
-                            self.skipped += 1
-                            self.skipped_alignment += 1
-                            continue
-                        alignment["target_note_indices"] = indices
-                    source = (
-                        encode_bridge_song(lines, lines_per_window)
-                        if bridge_scope == "song" else encode_bridge_source(lines)
-                    )
-                    self.examples.append(
-                        {
-                            **source,
-                            **alignment,
-                            "labels": encode_bridge_targets(
-                                lines, data["max_syllables"], pairs=self.pairs
-                            ),
-                            # Evaluation metadata; bridge_collate never passes it to the model.
-                            "note_duration_seconds": np.asarray([
-                                duration for line in lines
-                                for duration in line["melody"]["note_duration_seconds"]
-                            ], dtype=np.float64),
-                            "song_mean_note_duration_seconds": song_mean_duration,
-                        }
-                    )
-                    self.songs.add(song["song_id"])
-                    self.encoder_windows += (len(lines) + lines_per_window - 1) // lines_per_window
-                    if limit is not None and len(self.examples) >= limit:
-                        break
+                    alignment["target_note_indices"] = indices
+                durations = np.asarray(
+                    [
+                        duration
+                        for line in lines
+                        for duration in line["melody"]["note_duration_seconds"]
+                    ],
+                    dtype=np.float64,
+                )
+                self.examples.append(
+                    {
+                        **encode_bridge_song(lines),
+                        **alignment,
+                        "labels": encode_bridge_targets(
+                            lines, data["max_syllables"], pairs=self.pairs
+                        ),
+                        # Evaluation metadata; never passed to the model.
+                        "note_duration_seconds": durations,
+                        "song_mean_note_duration_seconds": float(durations.mean()),
+                    }
+                )
+                self.songs.add(song["song_id"])
                 if limit is not None and len(self.examples) >= limit:
                     break
         if not self.examples:
-            raise ValueError(f"No usable bridge {bridge_scope} examples in {split}; inspect limits")
+            raise ValueError(f"No usable bridge songs in {split}; inspect limits")
         array_bytes = sum(
-            value.nbytes for example in self.examples for value in example.values()
+            value.nbytes
+            for example in self.examples
+            for value in example.values()
             if isinstance(value, np.ndarray)
         )
         logger.info(
-            "%s: %d %s examples, %d encoder windows, %.1f MiB feature arrays; skipped %s",
-            split, len(self.examples), bridge_scope, self.encoder_windows,
-            array_bytes / 1024**2, self.skipped_limits,
+            "%s: %d songs, %.1f MiB feature arrays; skipped %s",
+            split,
+            len(self.examples),
+            array_bytes / 1024**2,
+            self.skipped_limits,
         )
         if alignment_policy is not None:
             logger.info(
                 "%s note alignment (%s): %s; %d examples without targets skipped",
-                split, alignment_policy, dict(self.alignment_counts), self.skipped_alignment,
+                split,
+                alignment_policy,
+                dict(self.alignment_counts),
+                self.skipped_alignment,
             )
 
     def __len__(self):
@@ -313,18 +267,18 @@ class BridgeDataset(Dataset):
 def bridge_collate(examples, *, pairs=PAIRS):
     if not examples:
         raise ValueError("Cannot collate an empty bridge batch")
-    for key in ("song_features", "labels", "target_note_indices"):
+    for key in ("labels", "target_note_indices"):
         if any((key in e) != (key in examples[0]) for e in examples):
-            raise ValueError("Cannot mix bridge scopes or labeled/unlabeled examples")
+            raise ValueError("Cannot mix labeled/unlabeled or aligned/unaligned examples")
     width = max(len(e["note_line_ids"]) for e in examples)
     batch = {
         "melody_features": torch.zeros(len(examples), width, MELODY_FEATURE_DIM),
         "melody_attention_mask": torch.zeros(len(examples), width, dtype=torch.long),
         "note_line_ids": torch.zeros(len(examples), width, dtype=torch.long),
         "line_counts": torch.tensor([e["line_count"] for e in examples]),
+        "meter_features": torch.zeros(len(examples), width, METER_FEATURE_DIM),
+        "meter_mask": torch.zeros(len(examples), width, dtype=torch.bool),
     }
-    if "song_features" in examples[0]:
-        batch["song_features"] = torch.zeros(len(examples), width, SONG_FEATURE_DIM)
     if "labels" in examples[0]:
         batch["labels"] = torch.full(
             (len(examples), max(len(e["labels"]) for e in examples)), -100, dtype=torch.long
@@ -339,8 +293,9 @@ def bridge_collate(examples, *, pairs=PAIRS):
         batch["melody_features"][row, :n] = torch.from_numpy(example["melody_features"])
         batch["melody_attention_mask"][row, :n] = 1
         batch["note_line_ids"][row, :n] = torch.tensor(example["note_line_ids"])
-        if "song_features" in batch:
-            batch["song_features"][row, :n] = torch.from_numpy(example["song_features"])
+        if "meter_features" in example:
+            batch["meter_features"][row, :n] = torch.from_numpy(example["meter_features"])
+            batch["meter_mask"][row, :n] = torch.from_numpy(example["meter_mask"])
         if "labels" in batch:
             batch["labels"][row, : len(example["labels"])] = torch.tensor(example["labels"])
             counts = [
@@ -354,5 +309,5 @@ def bridge_collate(examples, *, pairs=PAIRS):
                 indices = example["target_note_indices"]
                 if len(indices) != len(example["labels"]):
                     raise ValueError("Note alignment must match the IPA target skeleton")
-                batch["target_note_indices"][row, :len(indices)] = torch.tensor(indices)
+                batch["target_note_indices"][row, : len(indices)] = torch.tensor(indices)
     return batch
