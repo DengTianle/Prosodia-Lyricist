@@ -6,6 +6,22 @@ The standalone bridge evaluator scores predicted templates against held-out IPA.
 MIDI inference reports separately measure generated-lyric agreement with the
 predicted input template and optional reference conditional perplexity.
 
+For the paired 25-song `data/bridge-eval` set, use `python -m
+prosodia_lyricist.pipeline_eval`; the [README](../README.md#full-pipeline-on-the-25-song-set)
+has a complete command. It reuses `midi_eval` template producers and the same
+`infer.TemplateDecoder` as single-song inference. Defaults compare the repo MIDI
+algorithm with bridge predictions using greedy whole-song BART generation.
+Reports distinguish template/reference, output/template, and output/reference
+prosody agreement. All producers retain complete MIDI phrases; missing/extra
+reference or output phrases are scored by ordinal position. Reference PPL can be
+computed despite phrase/count differences because its targets form a whole-song
+sequence. No overlap exclusion is applied. Compare the common successful-song
+subset and separate common reference-PPL coverage; aggregate NLL by token count.
+The CLI exports `infer`-style Markdown and plain lyrics for three random songs by
+default. Use `--report-count K`, `--report-songs SONG ...`, and `--report-dir` to
+control selection and destination. `--from-report FILE.json` exports directly from
+saved pipeline results, with no checkpoint loading, MIDI reads, or new IPA extraction.
+
 XAI defaults to repo-compatible MIDI/IPA rules and historical dictionary-first
 pronunciation. The current bridge retains every phrase, including an unmarked
 tail. Without a bridge, the repo heuristic uses marked phrases only.

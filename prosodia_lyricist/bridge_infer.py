@@ -26,12 +26,24 @@ def predict_templates(
     max_syllables=None,
 ):
     model = ProsodyBridge.load(checkpoint).to(device).eval()
+    return predict_midi_templates(
+        model, midi, title=title, track=track, device=device,
+        max_syllables=max_syllables, checkpoint=checkpoint,
+    )
+
+
+@torch.inference_mode()
+def predict_midi_templates(
+    model, midi, *, title="", track=0, device="cpu", max_syllables=None,
+    checkpoint=None, phrase_policy=None,
+):
+    """Predict with an already loaded, eval-mode bridge (reusable across songs)."""
     if max_syllables is not None and model.max_syllables > max_syllables:
         raise ValueError("Bridge syllable limit exceeds the template decoder's limit")
     mode = "actual" if model.prosody_rules == REPO_RULES else "paper"
     source = midi_melody_record(
         midi, title=title, track=track,
-        phrase_policy=(
+        phrase_policy=phrase_policy or (
             "repo" if mode == "actual" and model.query_mode != "note"
             and model.query_attention != "cross" else "complete"
         ),
@@ -66,7 +78,7 @@ def predict_templates(
     if records and mode == "actual":
         records[-1]["unmarked_notes_omitted"] = source.get("unmarked_notes_omitted", 0)
     return records, {
-        "checkpoint": str(Path(checkpoint).resolve()),
+        "checkpoint": str(Path(checkpoint).resolve()) if checkpoint is not None else None,
         "melody_provenance": model.provenance,
         "prosody_mode": mode,
         "stress_labels": list(model.strength_labels),

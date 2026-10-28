@@ -303,6 +303,95 @@ selects the explicit supplement comparison, retaining the tail. Heuristic
 
 ### Rolling Stone MIDI pilot
 
+Evaluate MIDI prosody against the reference lyrics in `data/bridge-eval`:
+
+```bash
+conda activate prosodia-lyricist
+python -m prosodia_lyricist.midi_eval --output outputs/bridge-eval-midi.json
+# Add a learned bridge (loaded once for the entire evaluation):
+python -m prosodia_lyricist.midi_eval \
+  --bridge-checkpoint checkpoints/bridge-xai/RUN/best \
+  --output outputs/bridge-eval-comparison.json
+```
+
+The default MIDI methods are `actual`, `supplement`, and `heuristic`; use
+`--methods actual bridge` or `--methods bridge` to select methods. References use
+the checkpoint's IPA rules, or `actual` without a bridge; `--prosody-mode paper`
+selects binary stress and diphthong-aware length. Numeric lyric markers such as
+`(1)` and `(2)` are removed before pronunciation. Corpus stress annotations are
+not IPA references and do not supply vowel-length labels.
+
+The JSON report contains per-song/per-phrase results and micro accuracy for
+strength, length, and their joint correctness. Phrases and syllables are paired
+by position, with missing/extra slots counted as errors; equal-count phrases are
+also reported separately. All methods retain unmarked MIDI tails. Inference uses
+one slot per note and receives no reference text or counts. Failures (including
+unsupported non-4/4 supplement inputs) are listed with coverage; `common_subset`
+compares methods on the same successfully evaluated songs. `--songs SONG ...`,
+`--limit N`, `--track`, and `--device` control the run. These are lyric IPA
+agreement scores; count differences can shift comparisons within a phrase.
+
+### Full pipeline on the 25-song set
+
+`pipeline_eval` compares MIDI algorithm inputs and bridge predictions through the
+same unchanged BART lyric decoder. Both models load once for the full run:
+
+```bash
+python -m prosodia_lyricist.pipeline_eval \
+  --checkpoint checkpoints/xai-original \
+  --bridge-checkpoint checkpoints/bridge-xai/20261022T151203578546Z/best \
+  --output outputs/bridge-eval-pipeline.json
+```
+
+Defaults are `--data-dir data/bridge-eval`, `--methods actual bridge`, repo IPA
+rules, and greedy decoding (`--top-k 1`). Other MIDI algorithms can be selected
+with `--methods actual supplement heuristic bridge`. The decoder uses the same
+whole-song generation and limits as `infer`; no chunking or truncation. All input
+methods retain unmarked tails for a matched comparison. `--songs`, `--limit`,
+`--track`, `--device`, and the usual generation overrides are supported.
+
+Reports separate template/reference agreement, generated-lyric/input-template
+adherence, and generated-lyric/reference agreement, using prosody-BLEU and
+strength/length/joint accuracy. They also include teacher-forced reference PPL,
+generated-text self PPL, count mismatches, completion flags, and coverage. Reference
+phrase/count mismatches are scored rather than rejected; references supply targets
+only. No training-overlap filter is applied. Aggregate PPL sums NLL and token counts;
+the summary compares the common successful songs, with separate common PPL coverage.
+
+The command writes detailed `.json`, a short `.md` summary, and `.songs.jsonl`
+flushed after each song. Use a new output path for each run. JSON includes templates,
+lyrics, IPA, token IDs, file/checkpoint hashes, seeds, and settings for inspection.
+
+By default, it also writes readable reports for **3 random songs** in
+`OUTPUT.details/`, using the same sampled songs for every input method. Start at
+`index.md`: each song has an `actual.md` / `bridge.md` report in the same format as
+`infer` (lyrics, MIDI notes, per-phrase counts, prosody patterns, and word/IPA tables),
+matching `.lyrics.txt` files, and `reference.lyrics.txt`. The reports also compare
+input/reference, generated/input, and generated/reference metrics.
+
+Use `--report-count K` to change the sample size (`0` disables reports), or
+`--report-songs SONG ...` to choose songs from the evaluated set. Sampling uses the
+evaluation seed; `--report-seed N` changes only the report sample. Samples are capped
+at the number of songs with a successful generation. `--report-dir` selects a new
+destination folder. `--songs` still controls which songs are actually evaluated.
+
+Export reports from existing pipeline JSON **without rerunning models or IPA**:
+
+```bash
+python -m prosodia_lyricist.pipeline_eval \
+  --from-report outputs/bridge-eval-pipeline.json \
+  --report-songs a_day_in_the_life hotel_california \
+  --report-dir outputs/pipeline-selected
+```
+
+Omit `--report-songs` to export the default random three. Report-only mode leaves
+the saved JSON unchanged and does not require checkpoints or the original MIDI files.
+
+Architecturally, `bridge_eval` scores held-out bridge labels, `midi_eval` compares
+MIDI-to-template producers, `infer.TemplateDecoder` owns reusable BART inference,
+and `pipeline_eval` composes those producers with the decoder and dataset scoring.
+`pipeline_reports` adapts saved results to the shared inference report renderer.
+
 With `melismas/`, `stress-format-space/`, and `rs_lyrics/` under
 `data/rolling-stone`, convert two songs marked `absent` in the DALI overlap CSV:
 
@@ -356,6 +445,8 @@ prosodia_lyricist/
   bridge_train.py, train.py    supervised training and validation
   bridge_eval.py              held-out template evaluation and controls
   bridge_infer.py              MIDI-to-template prediction
+  midi_eval.py                 MIDI/bridge template comparison on paired songs
+  pipeline_eval.py             matched template-to-BART pipeline evaluation
   xai_features.py              XAI title/count/stress/length/remainder encoding
   xai_model.py                 original checkpoint import and lyric generation
   infer.py                    bridge-to-XAI generation CLI

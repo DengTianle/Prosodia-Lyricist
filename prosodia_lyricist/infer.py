@@ -42,6 +42,177 @@ def resolve_stress_source(prosody_mode, stress_source, training_stress="ipa"):
     return stress_source or ("unknown" if training_stress == "unknown" else "supplement")
 
 
+class TemplateDecoder:
+    """Load XAI once and decode whole-song templates, independent of their producer."""
+
+    def __init__(
+        self,
+        checkpoint,
+        *,
+        device="auto",
+        tokenizer_dir=None,
+        bart_config=None,
+        local_files_only=False,
+    ):
+        checkpoint = Path(checkpoint)
+        device = select_device(device)
+        if checkpoint.is_file():
+            model, tokenizer = load_template(
+                checkpoint,
+                tokenizer_dir=tokenizer_dir,
+                bart_config=bart_config,
+                local_files_only=local_files_only,
+            )
+            model = model.to(device).eval()
+            run = dict(
+                data_schema_version=SCHEMA_VERSION,
+                provenance=model.provenance,
+                config=dict(
+                    data=dict(stress_source="ipa"),
+                    model=dict(
+                        max_source_length=model.bart.config.max_position_embeddings,
+                        max_target_length=model.bart.config.max_position_embeddings,
+                    ),
+                ),
+            )
+        else:
+            if not (checkpoint / "xai.json").is_file():
+                raise ValueError(
+                    "Expected an imported XAI directory or original XAI checkpoint file"
+                )
+            if tokenizer_dir is not None or bart_config is not None:
+                raise ValueError(
+                    "Tokenizer/config overrides require an original XAI checkpoint file"
+                )
+            tokenizer = AutoTokenizer.from_pretrained(
+                checkpoint / "tokenizer", local_files_only=True
+            )
+            run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
+        if not checkpoint.is_file():
+            model = XAILyricist.load(checkpoint).to(device).eval()
+        if run.get("data_schema_version") not in (3, 4, 5, SCHEMA_VERSION):
+            raise ValueError(
+                "Checkpoint uses an older input scheme; prepare and train song-level data"
+            )
+        validate_tokenizer(tokenizer, model)
+        self.checkpoint, self.device = checkpoint, device
+        self.model, self.tokenizer, self.run = model, tokenizer, run
+        self.source_limit = min(
+            run["config"]["model"]["max_source_length"], model.bart.config.max_position_embeddings
+        )
+        self.target_limit = min(
+            run["config"]["model"]["max_target_length"], model.bart.config.max_position_embeddings
+        )
+
+    def generation_settings(
+        self,
+        *,
+        top_k=3,
+        temperature=1.0,
+        max_new_tokens=None,
+        no_repeat_ngram_size=None,
+        repetition_penalty=None,
+    ):
+        if temperature <= 0 or top_k < 1 or (max_new_tokens is not None and max_new_tokens < 1):
+            raise ValueError("temperature, top_k, and max_new_tokens must be positive")
+        if max_new_tokens is None:
+            max_new_tokens = self.target_limit - 1
+        if max_new_tokens >= self.target_limit:
+            raise ValueError(
+                "max_new_tokens must be smaller than the checkpoint's target token limit"
+            )
+        return dict(
+            top_k=top_k,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            **resolve_repetition_settings(self.model, no_repeat_ngram_size, repetition_penalty),
+        )
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        records,
+        *,
+        title="",
+        prosody_mode="actual",
+        seed=1234,
+        return_report=True,
+        **generation_options,
+    ):
+        seed_everything(seed)
+        settings = self.generation_settings(**generation_options)
+        encoded = encode_source(
+            {"title": title, "lines": records}, self.tokenizer, self.model.max_syllables
+        )
+        if len(encoded["input_ids"]) > self.source_limit:
+            raise ValueError("MIDI song template exceeds the checkpoint's source token limit")
+        inputs = self._inputs(encoded)
+        options = {
+            "max_new_tokens": settings["max_new_tokens"],
+            "do_sample": settings["top_k"] > 1,
+            "no_repeat_ngram_size": settings["no_repeat_ngram_size"],
+            "repetition_penalty": settings["repetition_penalty"],
+        }
+        if options["do_sample"]:
+            options.update(top_k=settings["top_k"], temperature=settings["temperature"])
+        result = self.model.generate(**inputs, tokenizer=self.tokenizer, **options)
+        tokens, explanation = result.sequences, result.explanations[0]
+        explanation["source"] = {"title": title, "lines": records}
+        text = explanation["text"]
+        lyrics = [line.strip() for line in text.split(".") if line.strip()]
+        report = dict(lyrics=lyrics, decoder_explanation=explanation)
+        if return_report:
+            report.update(
+                decoder_mode="xai_single_stream",
+                generation={
+                    "seed": seed,
+                    "device": str(self.device),
+                    **settings,
+                    "hit_token_limit": explanation["hit_token_limit"],
+                },
+                encoded_source=encoded,
+                generated_token_ids=tokens[0].tolist(),
+                raw_text=text,
+                metrics=evaluate_prosody(
+                    records,
+                    lyrics,
+                    **({"prosody_mode": "actual"} if prosody_mode == "actual" else {}),
+                ),
+                generated_perplexity=conditional_perplexity(
+                    self.model, inputs, tokens[:, 1:], self.tokenizer
+                ),
+            )
+        return report
+
+    def _inputs(self, encoded):
+        return {key: torch.tensor([value], device=self.device) for key, value in encoded.items()}
+
+    @torch.inference_mode()
+    def score_reference(self, encoded_source, reference_lines, *, prosody_mode="actual"):
+        # Gold text supplies target tokens only; phrase/count mismatches do not affect PPL.
+        labels = encode_targets(
+            {
+                "lines": [
+                    {
+                        "words": ipa.parse_words(
+                            text, **({"prosody_mode": "actual"} if prosody_mode == "actual" else {})
+                        )
+                    }
+                    for text in reference_lines
+                ]
+            },
+            self.tokenizer,
+        )["labels"]
+        if len(labels) > self.target_limit:
+            raise ValueError("Reference exceeds checkpoint target token limit; no truncation")
+        return conditional_perplexity(
+            self.model,
+            self._inputs(encoded_source),
+            torch.tensor([labels], device=self.device),
+            self.tokenizer,
+        )
+
+
 @torch.inference_mode()
 def infer(
     checkpoint,
@@ -74,49 +245,25 @@ def infer(
         raise ValueError("prosody_mode must be paper or actual")
     if bridge_checkpoint and stress_source is not None:
         raise ValueError("stress_source is a heuristic option; omit it when using a bridge")
-    device = select_device(device)
-    if checkpoint.is_file():
-        model, tokenizer = load_template(
-            checkpoint,
-            tokenizer_dir=tokenizer_dir,
-            bart_config=bart_config,
-            local_files_only=local_files_only,
-        )
-        model = model.to(device).eval()
-        run = dict(
-            data_schema_version=SCHEMA_VERSION,
-            provenance=model.provenance,
-            config=dict(
-                data=dict(stress_source="ipa"),
-                model=dict(
-                    max_source_length=model.bart.config.max_position_embeddings,
-                    max_target_length=model.bart.config.max_position_embeddings,
-                ),
-            ),
-        )
-    else:
-        if not (checkpoint / "xai.json").is_file():
-            raise ValueError("Expected an imported XAI directory or original XAI checkpoint file")
-        if tokenizer_dir is not None or bart_config is not None:
-            raise ValueError("Tokenizer/config overrides require an original XAI checkpoint file")
-        tokenizer = AutoTokenizer.from_pretrained(checkpoint / "tokenizer", local_files_only=True)
-        run = json.loads((checkpoint / "run.json").read_text(encoding="utf-8"))
-    if not checkpoint.is_file():
-        model = XAILyricist.load(checkpoint).to(device).eval()
-    if run.get("data_schema_version") not in (3, 4, 5, SCHEMA_VERSION):
-        raise ValueError("Checkpoint uses an older input scheme; prepare and train song-level data")
-    validate_tokenizer(tokenizer, model)
+    decoder = TemplateDecoder(
+        checkpoint,
+        device=device,
+        tokenizer_dir=tokenizer_dir,
+        bart_config=bart_config,
+        local_files_only=local_files_only,
+    )
+    model, run, device = decoder.model, decoder.run, decoder.device
     mode = prosody_mode or "actual"
     stress_source = resolve_stress_source(
         mode, stress_source, run["config"]["data"].get("stress_source", "ipa")
     )
-    target_limit = min(
-        run["config"]["model"]["max_target_length"], model.bart.config.max_position_embeddings
+    decoder.generation_settings(
+        top_k=top_k,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        repetition_penalty=repetition_penalty,
     )
-    if max_new_tokens is None:
-        max_new_tokens = target_limit - 1  # Generation also includes the decoder start token.
-    if max_new_tokens >= target_limit:
-        raise ValueError("max_new_tokens must be smaller than the checkpoint's target token limit")
     bridge = None
     if bridge_checkpoint:
         from .bridge_infer import predict_templates
@@ -158,33 +305,23 @@ def infer(
                 " aligned to the marked phrases"
             )
         raise ValueError(f"Reference must have one nonempty line per MIDI phrase ({details})")
-    encoded = encode_source({"title": title, "lines": records}, tokenizer, model.max_syllables)
-    source_limit = min(
-        run["config"]["model"]["max_source_length"], model.bart.config.max_position_embeddings
+    decoded = decoder.generate(
+        records,
+        title=title,
+        prosody_mode=mode,
+        seed=seed,
+        top_k=top_k,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        repetition_penalty=repetition_penalty,
+        return_report=return_report,
     )
-    if len(encoded["input_ids"]) > source_limit:
-        raise ValueError("MIDI song template exceeds the checkpoint's source token limit")
-    inputs = {key: torch.tensor([value], device=device) for key, value in encoded.items()}
-    repetition = resolve_repetition_settings(model, no_repeat_ngram_size, repetition_penalty)
-    generation = {
-        "max_new_tokens": max_new_tokens,
-        "do_sample": top_k > 1,
-        **repetition,
-    }
-    if top_k > 1:
-        generation.update(temperature=temperature, top_k=top_k)
-    result = model.generate(**inputs, tokenizer=tokenizer, **generation)
-    tokens = result.sequences
-    explanation = result.explanations[0]
-    explanation["source"] = {"title": title, "lines": records}
+    explanation, lyrics = decoded["decoder_explanation"], decoded["lyrics"]
     if bridge:
         explanation["bridge"] = bridge
-    text = explanation["text"]
-    lyrics = [line.strip() for line in text.split(".") if line.strip()]
     if not return_report:
-        if return_explanations:
-            return explanation
-        return lyrics or [""]
+        return explanation if return_explanations else (lyrics or [""])
     report = template_report(
         midi, records, title=title, track=track, stress_source=stress_source, prosody_mode=mode
     )
@@ -198,27 +335,9 @@ def infer(
     report.update(
         checkpoint=str(checkpoint.resolve()),
         checkpoint_run=run,
-        decoder_mode="xai_single_stream",
-        generation={
-            "seed": seed,
-            "top_k": top_k,
-            "temperature": temperature,
-            "max_new_tokens": max_new_tokens,
-            "device": str(device),
-            **repetition,
-            "hit_token_limit": explanation["hit_token_limit"],
-        },
-        encoded_source=encoded,
-        generated_token_ids=tokens[0].tolist(),
-        raw_text=text,
-        lyrics=lyrics,
-        metrics=evaluate_prosody(
-            records, lyrics, **({"prosody_mode": "actual"} if mode == "actual" else {})
-        ),
-        generated_perplexity=conditional_perplexity(model, inputs, tokens[:, 1:], tokenizer),
+        **decoded,
         software_versions=package_versions(),
     )
-    report["decoder_explanation"] = explanation
     if report["generation"]["hit_token_limit"]:
         report["warnings"].append("Generation reached its token budget; output may be incomplete.")
     if len(lyrics) != len(records):
@@ -227,34 +346,15 @@ def infer(
             "position; later pairs may be misaligned."
         )
     if reference_lines is not None:
-        streams = [
-            encode_targets(
-                {
-                    "lines": [
-                        {
-                            "words": ipa.parse_words(
-                                text, **({"prosody_mode": "actual"} if mode == "actual" else {})
-                            )
-                        }
-                        for text in reference_lines
-                    ]
-                },
-                tokenizer,
-            )["labels"]
-        ]
-        if len(streams[0]) > target_limit:
-            raise ValueError("Reference exceeds checkpoint target token limit; no truncation")
         report["reference_lines"] = reference_lines
         report["reference_syllables"] = [
             text_prosody(line, **({"prosody_mode": "actual"} if mode == "actual" else {}))
             for line in reference_lines
         ]
-        targets = [torch.tensor([stream], device=device) for stream in streams]
-        report["reference_perplexity"] = conditional_perplexity(
-            model,
-            inputs,
-            targets[0],
-            tokenizer,
+        report["reference_perplexity"] = decoder.score_reference(
+            report["encoded_source"],
+            reference_lines,
+            prosody_mode=mode,
         )
     return report
 

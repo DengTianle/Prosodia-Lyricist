@@ -99,10 +99,10 @@ def markdown_report(report):
     references = report.get("reference_lines", [])
     reference_labels = report.get("reference_syllables", [])
     reference_columns = bool(references)
-    count = max(len(report["template"]), len(report.get("lyrics", [])))
+    count = max(len(report["template"]), len(report.get("lyrics", [])), len(references))
     for index in range(count):
         source = report["template"][index] if index < len(report["template"]) else None
-        entry = metrics["phrases"][index] if metrics else None
+        entry = metrics["phrases"][index] if metrics and index < len(metrics["phrases"]) else None
         reference = reference_labels[index] if index < len(reference_labels) else []
         rows.extend(["", f"## Phrase {index + 1}", ""])
         if source:
@@ -124,7 +124,11 @@ def markdown_report(report):
                 ]
             )
         else:
-            rows.append("**Extra generated phrase; no corresponding input phrase.**")
+            rows.append(
+                "**Extra generated phrase; no corresponding input phrase.**"
+                if index < len(report.get("lyrics", []))
+                else "**Reference-only phrase; no corresponding input or generated phrase.**"
+            )
         comparison = report.get("note_comparison")
         if learned and comparison and index < len(comparison["lines"]):
             musical = comparison["lines"][index]
