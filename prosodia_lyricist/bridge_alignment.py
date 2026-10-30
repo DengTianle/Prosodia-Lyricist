@@ -6,6 +6,9 @@ from pathlib import Path
 import numpy as np
 
 ALIGNMENT_SCHEME = "dali_word_note_starts_v1"
+LAKH_ALIGNMENT_SCHEME = "lakh_word_note_starts_v1"
+ALIGNMENT_FORMAT = "word_note_starts_v1"
+ALIGNMENT_SCHEMES = (ALIGNMENT_SCHEME, LAKH_ALIGNMENT_SCHEME)
 ALIGNMENT_POLICIES = ("strict", "prefix")
 
 
@@ -127,7 +130,7 @@ def aligned_note_indices(lines, policy="strict"):
     for line in lines:
         alignment = line.get("note_alignment", {})
         n, p = len(line["melody"]["midi_pitches"]), len(line["syllables"])
-        if alignment.get("scheme") != ALIGNMENT_SCHEME or alignment.get("note_count") != n:
+        if alignment.get("scheme") not in ALIGNMENT_SCHEMES or alignment.get("note_count") != n:
             raise ValueError("Missing/incompatible prepared note alignment; prepare again")
         selected, used_notes, used_slots = [-1] * p, set(), set()
         counts.update(ipa_slots=p, notes=n)

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .bridge_alignment import ALIGNMENT_POLICIES, ALIGNMENT_SCHEME
+from .bridge_alignment import ALIGNMENT_FORMAT, ALIGNMENT_POLICIES, ALIGNMENT_SCHEME
 from .bridge_data import PAD, PAIR_OFFSET, SLOT, bridge_vocabulary, prosody_pairs
 from .ipa import PAPER_RULES, REPO_RULES, REPO_STRESSES
 from .melody_encoder.encoding import MELODY_REPRESENTATION
@@ -465,7 +465,7 @@ class ProsodyBridge(nn.Module):
             target_scheme=TARGET_SCHEME,
             melody_representation=MELODY_REPRESENTATION,
             meter_feature_scheme=METER_FEATURE_SCHEME,
-            alignment_scheme=ALIGNMENT_SCHEME,
+            alignment_scheme=ALIGNMENT_FORMAT,
             prosody_rules=self.prosody_rules,
             vocabulary=self.vocabulary,
             configuration=self.configuration(),
@@ -489,9 +489,8 @@ class ProsodyBridge(nn.Module):
                 target_scheme=TARGET_SCHEME,
                 melody_representation=MELODY_REPRESENTATION,
                 meter_feature_scheme=METER_FEATURE_SCHEME,
-                alignment_scheme=ALIGNMENT_SCHEME,
             ).items()
-        ):
+        ) or meta.get("alignment_scheme") not in (ALIGNMENT_FORMAT, ALIGNMENT_SCHEME):
             raise ValueError("Incompatible bridge checkpoint feature rules")
         model = cls(**meta["configuration"], provenance=meta["provenance"])
         if (

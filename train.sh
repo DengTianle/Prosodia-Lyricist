@@ -11,4 +11,4 @@
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate prosodia-lyricist
 
-time prosodia-train --config configs/bridge.yaml
+time prosodia-train --config "${1:-configs/bridge.yaml}"

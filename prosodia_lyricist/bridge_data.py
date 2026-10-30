@@ -201,6 +201,8 @@ class BridgeDataset(Dataset):
                 alignment = {}
                 if alignment_policy is not None:
                     if any("note_alignment" not in line for line in lines):
+                        if data.get("source") == "lakh":
+                            raise ValueError("Missing prepared Lakh note alignment; prepare again")
                         checksum = recover_note_alignment(song, dali_dir or data.get("dali_dir"))
                         self.raw_alignment_sha256[song["song_id"]] = checksum
                     indices, counts = aligned_note_indices(lines, alignment_policy)

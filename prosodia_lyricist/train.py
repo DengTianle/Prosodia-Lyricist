@@ -1,4 +1,4 @@
-"""Train the supervised melody-to-IPA bridge on prepared DALI songs."""
+"""Train the supervised melody-to-IPA bridge on prepared songs."""
 
 import argparse
 import logging

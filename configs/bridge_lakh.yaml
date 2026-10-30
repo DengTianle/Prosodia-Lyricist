@@ -1,0 +1,52 @@
+# Calibrated, deduplicated spelling alignments from the local Melistas/Lakh audit.
+data:
+  source: lakh
+  lakh_file: ../outputs/lakh-alignment-audit/deduplicated-orthographic.jsonl.gz
+  prepared_dir: ../data/lakh-bridge
+  stress_source: ipa
+  prosody_mode: actual
+  include_melody: true
+  require_meter: true
+  max_syllables: 40
+  valid_fraction: 0.1
+  test_fraction: 0.1
+  seed: 1234
+
+model:
+  conditioning: bridge
+  melody_initialization: random # Use bridge + melody_checkpoint to fine-tune a saved bridge.
+  melody_checkpoint: null
+  melody_encoder:
+    d_model: 256
+    num_layers: 4
+    num_heads: 4
+    dim_feedforward: 1024
+    dropout: 0.1
+    pooling: cls
+    max_length: 2048
+  max_song_notes: 2048
+  max_song_lines: 256
+  max_target_length: 4096
+  alignment_policy: strict
+  meter_conditioning: true
+
+training:
+  output_dir: ../checkpoints/bridge-lakh
+  device: cuda
+  precision: bf16
+  seed: 1234
+  epochs: 100
+  batch_size: 8
+  num_workers: 0
+  gradient_accumulation_steps: 2
+  melody_unfreeze_epoch: 0
+  learning_rate: 0.0001
+  melody_learning_rate: 0.0001
+  length_class_weights: null
+  adam_betas: [0.9, 0.98]
+  adam_epsilon: 0.00001
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: constant_after_warmup
+  gradient_clip: 1.0
+  patience: 5

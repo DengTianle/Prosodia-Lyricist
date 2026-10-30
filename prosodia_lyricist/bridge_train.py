@@ -322,7 +322,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         manifest = read_manifest(data["prepared_dir"])
     # Storage relocation and obsolete window metadata do not change note arrays.
     # Prepared checksums, recovered raw notes and upstream splits are checked separately.
-    ignored = {"lines_per_window", "pretraining_manifest", "prepared_dir", "dali_dir"}
+    ignored = {"lines_per_window", "pretraining_manifest", "prepared_dir", "dali_dir", "lakh_file"}
     if {key: value for key, value in manifest["config"].items() if key not in ignored} != {
         key: value for key, value in data.items() if key not in ignored
     }:

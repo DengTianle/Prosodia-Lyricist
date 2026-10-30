@@ -237,6 +237,41 @@ Older window/query bridge and masked checkpoints require retraining. Prepared
 note arrays remain reusable: obsolete `lines_per_window` metadata is ignored.
 The BART/XAI architecture and checkpoint format are unchanged.
 
+### Metered training on Melistas/Lakh
+
+The calibrated alignment export in `outputs/lakh-alignment-audit` can be prepared
+and trained with the same bridge commands:
+
+```bash
+conda activate prosodia-lyricist
+python -m prosodia_lyricist.prepare --config configs/bridge_lakh.yaml
+python -m prosodia_lyricist.train --config configs/bridge_lakh.yaml
+# Slurm wrappers also accept the configuration path:
+sbatch prep.sh configs/bridge_lakh.yaml
+sbatch train.sh configs/bridge_lakh.yaml
+```
+
+`data.lakh_file` points to `deduplicated-orthographic.jsonl.gz`; outputs go to
+`data/lakh-bridge`. The preparer retains the authors' processed notes and handles
+melisma with the same word-local continuation rules as DALI. Reconstructed words
+use the XAI `actual` historical IPA policy, including secondary stress and
+long-mark-only vowel length. Strict word-count mismatches mask supervision while
+retaining melody context. Whole songs with unusable lines or over-limit sequences
+are rejected with reasons.
+
+The default Lakh configuration requires explicit meter at every melody note and
+enables `model.meter_conditioning`. Bar phase uses MIDI tick zero/signature changes
+as grid origins, matching MIDI inference; pickups are not independently corrected.
+Unresolved tempo or conflicting meter metadata rejects the song. The manifest
+records source hashes, original note indices/ticks, pronunciation, alignment
+coverage, and exclusions. Seeded splits group identical source hashes and exact
+full lyrics of at least 100 normalized characters; no DALI overlap filter is applied.
+The phonetic-only export does not supply the required spelling alignment.
+
+For local CPU/MPS runs, set `training.device` to `auto` and `precision` to `fp32`.
+To fine-tune an existing bridge, set `melody_initialization: bridge` and
+`melody_checkpoint` to its `best/` directory, preserving its architecture and limits.
+
 ### Self-supervised melody pretraining
 
 `configs/bridge_pretrain.yaml` reconstructs masked musical attributes: pitch

@@ -1,4 +1,4 @@
-"""Prepare reproducible song-disjoint DALI JSONL splits without audio or MIDI."""
+"""Prepare reproducible song-disjoint DALI or calibrated Lakh JSONL splits."""
 
 import argparse
 import hashlib
@@ -154,6 +154,12 @@ def plan_pretraining_splits(data, files, requested):
 
 def prepare(config, *, limit=None, check_splits=False):
     data = config["data"]
+    if data.get("source", "dali") == "lakh":
+        from .lakh import prepare_lakh
+
+        return prepare_lakh(config, limit=limit, check_splits=check_splits)
+    if data.get("source", "dali") != "dali":
+        raise ValueError("data.source must be dali or lakh")
     valid, test = data["valid_fraction"], data["test_fraction"]
     if not (0 < valid < 1 and 0 <= test < 1 and valid + test < 1):
         raise ValueError("Require valid_fraction > 0, test_fraction >= 0, and their sum < 1")
@@ -380,7 +386,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--limit", type=int, help="Scan only the first N files for a smoke test")
-    parser.add_argument("--song-ids-file", help="Text file containing one exact DALI ID per line")
+    parser.add_argument("--song-ids-file", help="Text file containing one exact song ID per line")
     parser.add_argument(
         "--check-splits",
         action="store_true",
