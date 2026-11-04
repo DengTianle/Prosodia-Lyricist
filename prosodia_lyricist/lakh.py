@@ -17,7 +17,8 @@ from .bridge_alignment import ALIGNMENT_POLICIES, LAKH_ALIGNMENT_SCHEME, aligned
 from .dali import AnnotationError, extract_lines
 from .ipa import HISTORICAL_POLICY, REPO_RULES, backend, historical_provenance
 from .melody_checkpoint import file_sha256
-from .prepare import SCHEMA_VERSION, normalized_identity, split_for
+from .prepare import SCHEMA_VERSION, assign_content_splits, normalized_identity, split_for
+from .split_integrity import CONTENT_POLICY, content_fingerprints
 
 DATASET = "melistas_lakh_2021"
 METER_PHASE = "midi_signature_change_origin_v1"
@@ -291,6 +292,7 @@ def prepare_lakh(config, *, limit=None, check_splits=False):
             name: stack.enter_context((staging / name).open("w", encoding="utf-8"))
             for name in names
         }
+        rows = stack.enter_context((staging / "rows.jsonl").open("w+", encoding="utf-8"))
         for record in tqdm(
             read_records(source, limit), total=len(candidates), desc="Preparing Lakh"
         ):
@@ -330,12 +332,10 @@ def prepare_lakh(config, *, limit=None, check_splits=False):
                     + "\n"
                 )
                 continue
-            info = candidates[song_id]
-            split = info["split"]
+            info = {**candidates[song_id],
+                    "content_fingerprints": content_fingerprints(song["lines"])}
             songs[song_id] = info
-            handles[f"{split}.jsonl"].write(json.dumps(song, ensure_ascii=False) + "\n")
-            counts[f"{split}_songs"] += 1
-            counts[f"{split}_lines"] += len(song["lines"])
+            rows.write(json.dumps(song, ensure_ascii=False) + "\n")
             counts["notes"] += len(record["notes"])
             counts["notes_with_meter"] += sum(
                 entry is not None for line in song["lines"] for entry in line["melody"]["meter"]
@@ -346,6 +346,18 @@ def prepare_lakh(config, *, limit=None, check_splits=False):
             raise ValueError("No usable Lakh songs: " + json.dumps(dict(rejections)))
         if file_sha256(source) != source_hash:
             raise ValueError("Lakh source changed during preparation")
+        groups, splits = assign_content_splits(
+            songs, data, planned_groups={s: info["group"] for s, info in songs.items()},
+        )
+        for song_id, info in songs.items():
+            info.update(group=groups[song_id], split=splits[song_id])
+        rows.seek(0)
+        for row in rows:
+            song = json.loads(row)
+            split = splits[song["song_id"]]
+            handles[f"{split}.jsonl"].write(row)
+            counts[f"{split}_songs"] += 1
+            counts[f"{split}_lines"] += len(song["lines"])
         stack.close()
         manifest = dict(
             schema_version=SCHEMA_VERSION,
@@ -362,7 +374,8 @@ def prepare_lakh(config, *, limit=None, check_splits=False):
             meter_phase=METER_PHASE,
             alignment_counts=dict(alignment_counts),
             rejection_reasons=dict(rejections),
-            grouping_policy="midi_hash_and_exact_full_lyrics_at_least_100_characters_v1",
+            grouping_policy=CONTENT_POLICY,
+            content_split_policy=CONTENT_POLICY,
             selection=dict(
                 sha256=selection_hash,
                 requested_ids=sorted(requested) if requested is not None else None,

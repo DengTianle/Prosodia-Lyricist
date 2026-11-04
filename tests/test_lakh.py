@@ -239,6 +239,8 @@ def test_unknown_meter_prefix_is_masked_and_later_signature_observed(pronunciati
 
 def test_preparation_and_metered_training_roundtrip(tmp_path, pronunciation):
     records = [source_record(i) for i in range(40)]
+    for index, record in enumerate(records):
+        record["notes"][1]["pitch"] = 61 + index
     bad = source_record(100)
     bad["notes"][0]["onset_seconds"] = None
     cfg = configuration(tmp_path, records + [bad])

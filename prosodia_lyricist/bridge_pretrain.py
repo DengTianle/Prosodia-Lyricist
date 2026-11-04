@@ -33,6 +33,7 @@ from .melody_encoder.encoding import (
     PITCH_SIGN_INDEX,
 )
 from .runtime import log_stage, seed_everything, select_device
+from .split_integrity import read_content_index, require_clean_splits
 from .train import build_scheduler
 
 logger = logging.getLogger(__name__)
@@ -412,6 +413,7 @@ def train_pretrain(config, *, output_dir=None, smoke_test=False):
     ):
         raise ValueError("Use fp32 on CPU/MPS; bf16 requires supported CUDA hardware")
     manifest = read_manifest(data["prepared_dir"])
+    supervised_split_check = require_clean_splits(read_content_index(data["prepared_dir"]))
     melody_config = _melody_encoder_config(cfg.get("melody_encoder"))
     provenance = {"initialization": "random", "weights_loaded": False}
     model = MaskedMelodyModel(
@@ -476,6 +478,7 @@ def train_pretrain(config, *, output_dir=None, smoke_test=False):
         "checkpoint_selection_metric": "valid.loss",
         "total_steps": epochs * steps,
         "melody_provenance": provenance,
+        "supervised_split_check": supervised_split_check,
         "examples": {s: len(ds) for s, ds in datasets.items()},
         "skipped": {s: ds.skipped for s, ds in datasets.items()},
     }

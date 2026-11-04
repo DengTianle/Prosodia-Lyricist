@@ -19,7 +19,7 @@ def prepared(tmp_path):
                 max_syllables=8, lines_per_window=2, pretraining_manifest="old.csv")
     manifest = dict(schema_version=SCHEMA_VERSION, config=data, songs={}, sha256={},
                     pronunciation={"rules": "test"})
-    for split in ("train", "valid", "test"):
+    for split_index, split in enumerate(("train", "valid", "test")):
         song = f"song-{split}"
         manifest["songs"][song] = {
             "split": split, "group": song,
@@ -28,11 +28,11 @@ def prepared(tmp_path):
         record = {"song_id": song, "lines": [{
             "syllables": [{"stress": "strong", "length": "long"}],
             "note_alignment": {
-                "scheme": "dali_word_note_starts_v1", "note_count": 1,
+                "scheme": "dali_word_note_starts_v1", "note_count": 2,
                 "words": [{"note_starts": [0], "syllable_indices": [0]}],
             },
-            "melody": {"midi_pitches": [60], "onset_seconds": [0],
-                       "note_duration_seconds": [0.5]},
+            "melody": {"midi_pitches": [60, 61 + split_index], "onset_seconds": [0, 1],
+                       "note_duration_seconds": [0.5, 0.5]},
         }]}
         path = directory / f"{split}.jsonl"
         path.write_text(json.dumps(record) + "\n")

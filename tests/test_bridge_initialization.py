@@ -31,7 +31,8 @@ def config(tmp_path):
                               {"stress": "weak", "length": "short"}],
                 "note_alignment": {"scheme": "dali_word_note_starts_v1", "note_count": 3,
                                    "words": [{"note_starts": [0, 1], "syllable_indices": [0, 1]}]},
-                "melody": {"midi_pitches": [60, 62, 64], "onset_seconds": [0, 1, 2],
+                "melody": {"midi_pitches": [60, 61 + index + 12 * (split == "valid"), 64],
+                           "onset_seconds": [0, 1, 2],
                            "note_duration_seconds": [0.5, 0.25, 0.5]},
             }]})
         path = directory / f"{split}.jsonl"

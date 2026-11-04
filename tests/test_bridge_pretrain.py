@@ -46,7 +46,7 @@ def config(tmp_path):
             for phrase in range(3 - index % 2):
                 n = 4 + index % 2
                 lines.append(dict(
-                    melody=dict(midi_pitches=[60, 62, 58, 65, 61][:n],
+                    melody=dict(midi_pitches=[60, 62 + (split == "valid"), 58, 65, 61][:n],
                                 onset_seconds=[phrase * 10 + t for t in (0, 1, 2.5, 4, 5.5)][:n],
                                 note_duration_seconds=[0.25, 0.5, 0.75, 1, 0.25][:n]),
                     syllables=[dict(stress=REPO_STRESSES[i % 3],

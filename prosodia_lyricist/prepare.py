@@ -16,6 +16,7 @@ from tqdm import tqdm
 
 from .config import load_config
 from .dali import AnnotationError, extract_lines, normalize_text, read_annotation
+from .split_integrity import CONTENT_POLICY, GROUP_FINGERPRINTS, content_fingerprints
 
 SCHEMA_VERSION = 6
 
@@ -25,7 +26,7 @@ def normalized_identity(value):
 
 
 def song_groups(songs):
-    """Keep duplicate artist/title entries and repeated audio ids in one split."""
+    """Join metadata, persisted groups and exact content identities transitively."""
     parent = {song_id: song_id for song_id in songs}
 
     def root(key):
@@ -44,6 +45,13 @@ def song_groups(songs):
             identities.append(("song", artist, title))
         if audio and audio != "None":
             identities.append(("audio", audio))
+        for key in ("group", "source_song_id"):
+            if info.get(key):
+                identities.append((key, info[key]))
+        for key in GROUP_FINGERPRINTS:
+            value = info.get("content_fingerprints", {}).get(key)
+            if value:
+                identities.append(("content", key, value))
         for identity in identities:
             if identity in seen:
                 a, b = sorted((root(song_id), root(seen[identity])))
@@ -60,6 +68,28 @@ def split_for(group, seed, valid_fraction, test_fraction):
     if value < test_fraction + valid_fraction:
         return "valid"
     return "train"
+
+
+def assign_content_splits(songs, data, *, planned_groups=None, upstream=None):
+    """Finalize groups after content is available, then apply upstream train pins."""
+    infos = {song: {**info, **({"group": planned_groups[song]} if planned_groups else {})}
+             for song, info in songs.items()}
+    groups = song_groups(infos)
+    representatives = {}
+    for song, group in groups.items():
+        candidate = min(song, planned_groups[song]) if planned_groups else song
+        representatives[group] = min(representatives.get(group, candidate), candidate)
+    groups = {song: representatives[group] for song, group in groups.items()}
+    splits = {song: split_for(group, data["seed"], data["valid_fraction"], data["test_fraction"])
+              for song, group in groups.items()}
+    if data.get("include_melody") and data.get("pretraining_manifest"):
+        from .melody_data import preserve_pretraining_splits
+
+        splits = preserve_pretraining_splits(
+            {song: {**info, "group": groups[song]} for song, info in infos.items()},
+            splits, data["pretraining_manifest"], upstream=upstream,
+        )
+    return groups, splits
 
 
 def plan_pretraining_splits(data, files, requested):
@@ -130,6 +160,7 @@ def plan_pretraining_splits(data, files, requested):
         "manifest": str(Path(path).resolve()) if path else None,
         "sha256": upstream_hash,
         "scope": "metadata_candidates_before_line_rejection",
+        "content_checked": False,
         "candidate_songs": len(songs),
         "metadata_rejections": rejections,
         "random_split_conflicts": before["conflicts"],
@@ -259,7 +290,7 @@ def prepare(config, *, limit=None, check_splits=False):
                     from .melody_data import attach_melody
 
                     attach_melody(records, annot)
-                songs[song_id] = info
+                songs[song_id] = {**info, "content_fingerprints": content_fingerprints(records)}
                 song = {
                     "id": song_id,
                     "song_id": song_id,
@@ -286,16 +317,11 @@ def prepare(config, *, limit=None, check_splits=False):
                 rejects.write(json.dumps({"file": path.name, "reason": str(exc)}) + "\n")
         if not songs:
             raise ValueError("No usable DALI songs; check language, quality, and annotation format")
-        if planned_splits is not None:
-            # Rejected lyrics cannot change the assignments already checked before extraction.
-            groups = {song: planned_groups[song] for song in songs}
-            splits = {song: planned_splits[song] for song in songs}
-        else:
-            groups = song_groups(songs)
-            splits = {
-                song_id: split_for(group, data["seed"], valid, test)
-                for song_id, group in groups.items()
-            }
+        # Metadata preflight cannot see musical duplicates. Content may join its
+        # groups; preserve rejected metadata representatives and reapply train pins.
+        groups, splits = assign_content_splits(
+            songs, data, planned_groups=planned_groups, upstream=upstream,
+        )
         split_audit = None
         if data.get("include_melody") and data.get("pretraining_manifest"):
             from .melody_checkpoint import file_sha256
@@ -304,7 +330,8 @@ def prepare(config, *, limit=None, check_splits=False):
             if file_sha256(data["pretraining_manifest"]) != preflight["sha256"]:
                 raise ValueError("Pretraining manifest changed during preparation")
             split_audit = audit_pretraining_splits(
-                {key: {**info, "split": splits[key]} for key, info in songs.items()},
+                {key: {**info, "split": splits[key], "group": groups[key]}
+                 for key, info in songs.items()},
                 data["pretraining_manifest"],
                 upstream=upstream,
             )
@@ -324,6 +351,7 @@ def prepare(config, *, limit=None, check_splits=False):
         stack.close()
         manifest = {
             "schema_version": SCHEMA_VERSION,
+            "content_split_policy": CONTENT_POLICY,
             "pronunciation": (
                 {
                     "package": "prosodic",
@@ -361,6 +389,7 @@ def prepare(config, *, limit=None, check_splits=False):
                 song_id: {
                     "split": splits[song_id],
                     "group": groups[song_id],
+                    "content_fingerprints": songs[song_id]["content_fingerprints"],
                     "identity": {
                         "artist": songs[song_id].get("artist", ""),
                         "title": songs[song_id].get("title", ""),
@@ -390,7 +419,7 @@ def main():
     parser.add_argument(
         "--check-splits",
         action="store_true",
-        help="Write split_preflight.json from metadata; do not extract notes/IPA",
+        help="Metadata/pretraining preflight only; full content grouping follows extraction",
     )
     parser.add_argument(
         "--english-only", action="store_true", help="Exclude other/unknown languages"

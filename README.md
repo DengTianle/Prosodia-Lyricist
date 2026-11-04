@@ -61,11 +61,35 @@ and old local experiment outputs are ignored by Git.
 The default configuration selects English songs and uses a seeded hash for
 approximately 80%/10%/10% train/validation/test song groups. When a contrastive manifest is configured, groups exposed to its training
 split are assigned to downstream train. All
-lines from a song stay together. Entries sharing normalized artist/title or
-the same audio ID are grouped together, including transitive duplicates.
+lines from a song stay together. Entries sharing normalized artist/title,
+the same audio ID, exact encoded melody inputs, or normalized full lyrics
+(at least 100 alphanumeric characters) are grouped transitively. Optional meter
+and target labels cannot hide an identical melody. The metadata-only
+`--check-splits` preflight runs before IPA; final content grouping follows extraction.
 This does not identify every cover or near-duplicate recording in DALI.
 `min_ncc` optionally filters DALI's alignment score; the default 0.0 adds no
 quality threshold. Unknown-language songs are excluded by the English filter.
+
+Existing exports need an explicit content audit; their file checksums and song IDs
+do not prove split independence. Audit DALI and Lakh together and optionally create
+repaired copies in a **new** directory:
+
+```bash
+python -m prosodia_lyricist.split_integrity \
+  --prepared-dir data/dali-xai --prepared-dir data/lakh-bridge \
+  --output outputs/content-split-audit.json --repair-root data/content-clean
+```
+
+Repair moves connected groups to train before validation before test, preserving
+the source exports. Point training configs at the repaired copies and start from
+random weights; repartitioning cannot remove an old checkpoint's training exposure.
+Training and masked pretraining reject content conflicts. New supervised bridges
+record ancestor training and validation identities; fine-tuning rejects ancestor
+training in a held-out split and ancestor validation reused as a test set. Legacy
+bridges without that provenance remain readable for inference, but cannot serve
+as verified fine-tuning parents. Evaluation reports split integrity separately
+from prediction metrics, including unverified legacy ancestry. Near duplicates
+and shared compositions still require independent review.
 
 To select an exact subset, set `data.song_ids_file: ../song_ids.txt` in the YAML
 (one exact annotation `info.id` per line; blank lines and duplicates are ignored).

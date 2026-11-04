@@ -71,6 +71,7 @@ class ProsodyBridge(nn.Module):
         self.prosody_rules = REPO_RULES if self.strength_labels == REPO_STRESSES else PAPER_RULES
         self.vocabulary = bridge_vocabulary(self.max_lines, pairs=self.pairs)
         self.provenance = provenance or {}
+        self.supervised_exposure = None
         self.melody_encoder = MelodyTransformerEncoder(**self.melody_config)
         width = self.melody_encoder.d_model
         self.line_embedding = nn.Embedding(self.max_lines + 1, width, padding_idx=0)
@@ -470,6 +471,7 @@ class ProsodyBridge(nn.Module):
             vocabulary=self.vocabulary,
             configuration=self.configuration(),
             provenance=self.provenance,
+            supervised_exposure=self.supervised_exposure,
         )
         (directory / "bridge.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         torch.save(self.state_dict(), directory / "bridge_weights.pt")
@@ -493,6 +495,7 @@ class ProsodyBridge(nn.Module):
         ) or meta.get("alignment_scheme") not in (ALIGNMENT_FORMAT, ALIGNMENT_SCHEME):
             raise ValueError("Incompatible bridge checkpoint feature rules")
         model = cls(**meta["configuration"], provenance=meta["provenance"])
+        model.supervised_exposure = meta.get("supervised_exposure")
         if (
             meta.get("prosody_rules") != model.prosody_rules
             or meta.get("vocabulary") != model.vocabulary

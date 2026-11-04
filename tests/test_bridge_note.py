@@ -272,6 +272,8 @@ def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
     songs, hashes = {}, {}
     for split in ("train", "valid"):
         song = dict(song_id=split, lines=lines())
+        if split == "valid":
+            song["lines"][0]["melody"]["midi_pitches"][1] += 1
         path = tmp_path / f"{split}.jsonl"
         path.write_text(json.dumps(song) + "\n")
         hashes[path.name] = file_sha256(path)
@@ -325,6 +327,7 @@ def test_training_reload_and_evaluation_use_identical_aligned_baseline_coverage(
             sum(epoch["valid"]["objective_components"].values())
         )
     report = evaluate_bridge(output / "best", tmp_path, split="valid", device="cpu")
+    assert report["split_integrity"]["status"] == "passed"
     assert report["prediction"]["loss"] == pytest.approx(epoch["valid"]["loss"])
     assert report["schema_version"] == 6 and report["query_mode"] == "note"
     assert report["prediction"]["slots"] == report["prediction"]["compared_slots"] == 4

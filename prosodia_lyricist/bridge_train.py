@@ -27,6 +27,7 @@ from .data import read_manifest
 from .ipa import REPO_STRESSES
 from .melody_checkpoint import file_sha256, load_contrastive_melody
 from .runtime import log_stage, seed_everything, select_device
+from .split_integrity import read_content_index, require_clean_splits, training_exposure
 from .train import build_scheduler
 
 logger = logging.getLogger(__name__)
@@ -331,6 +332,9 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         file_sha256(data["song_ids_file"]) != manifest["selection"]["sha256"]
     ):
         raise ValueError("Song allowlist changed; prepare again")
+    with log_stage("Checking supervised content identities across prepared splits"):
+        content_index = read_content_index(data["prepared_dir"])
+        supervised_split_check = require_clean_splits(content_index)
     checkpoint = cfg.get("melody_checkpoint")
     strength_labels = (
         REPO_STRESSES if data.get("prosody_mode", "paper") == "actual" else ("strong", "weak")
@@ -341,6 +345,13 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         if not checkpoint:
             raise ValueError("Set model.melody_checkpoint to a global bridge best/ directory")
         model = ProsodyBridge.load(checkpoint)
+        if model.supervised_exposure is None:
+            raise ValueError(
+                "Legacy bridge has no supervised training exposure index. Its ancestor "
+                "DALI/Lakh identities cannot be verified; retrain from random initialization "
+                "on repaired splits before using it as a fine-tuning parent."
+            )
+        supervised_split_check = require_clean_splits(content_index, model.supervised_exposure)
         if model.strength_labels != strength_labels or model.max_syllables != data["max_syllables"]:
             raise ValueError("Fine-tuning data vocabulary/slot limits differ from the checkpoint")
         # The loaded architecture is authoritative; conflicting overrides are errors.
@@ -432,6 +443,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         provenance["contrastive"] = contrastive_provenance
         del tower
     model.provenance = provenance
+    model.supervised_exposure = training_exposure(content_index, model.supervised_exposure)
     datasets = {
         split: BridgeDataset(
             data["prepared_dir"],
@@ -516,6 +528,7 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "data_sha256": manifest["sha256"],
         "pretraining_split_audit": manifest.get("pretraining_split_audit"),
         "pretraining_split_check": split_check,
+        "supervised_split_check": supervised_split_check,
         "melody_provenance": provenance,
         "precision": precision,
         "total_steps": steps * epochs,

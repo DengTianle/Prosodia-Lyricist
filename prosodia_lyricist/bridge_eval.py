@@ -18,6 +18,7 @@ from .data import read_manifest
 from .evaluation import METRIC_VERSION
 from .melody_checkpoint import file_sha256
 from .runtime import select_device
+from .split_integrity import audit_content_splits, read_content_index
 
 
 def evaluate_bridge(
@@ -46,6 +47,13 @@ def evaluate_bridge(
     checkpoint, prepared_dir = Path(checkpoint).resolve(), Path(prepared_dir).resolve()
     model = ProsodyBridge.load(checkpoint)
     manifest = read_manifest(prepared_dir)
+    split_integrity = audit_content_splits(
+        read_content_index(prepared_dir), model.supervised_exposure,
+    )
+    if model.supervised_exposure is None:
+        split_integrity["ancestor_exposure"] = "unverified_legacy_checkpoint"
+        if split_integrity["status"] == "passed":
+            split_integrity["status"] = "unverified"
     dataset = BridgeDataset(
         prepared_dir,
         split,
@@ -87,6 +95,7 @@ def evaluate_bridge(
         "evaluated_at": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(checkpoint),
         "checkpoint_weights_sha256": file_sha256(checkpoint / "bridge_weights.pt"),
+        "split_integrity": split_integrity,
         "data": {
             "prepared_dir": str(prepared_dir),
             "split": split,
