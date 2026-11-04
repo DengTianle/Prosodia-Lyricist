@@ -269,6 +269,8 @@ def read_pretraining_metadata(directory, *, manifest=None):
 
 
 def initialize_from_masked(bridge, directory, metadata):
+    if bridge.representation != MELODY_REPRESENTATION:
+        raise ValueError("Masked 177-D weights cannot initialize an octuple encoder")
     if encoder_configuration(bridge) != {
         k: metadata[k] for k in ("melody_config", "encoder_config")
     }:
@@ -374,6 +376,8 @@ def run_pretrain_epoch(
 
 def train_pretrain(config, *, output_dir=None, smoke_test=False):
     data, cfg, settings = config["data"], config["model"], config["training"]
+    if cfg.get("representation", MELODY_REPRESENTATION) != MELODY_REPRESENTATION:
+        raise ValueError("Masked 177-D pretraining cannot initialize an octuple encoder")
     if cfg.get("melody_initialization", "random") != "random":
         raise ValueError(
             "Global masked pretraining starts from random weights; add fusion downstream"

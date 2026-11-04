@@ -206,6 +206,10 @@ def extract_song(record, *, max_syllables=40, require_meter=True):
 
 
 def prepare_lakh(config, *, limit=None, check_splits=False):
+    if config["data"].get("base_prepared_dir"):
+        from .lakh_octuple import prepare_canonical_lakh
+
+        return prepare_canonical_lakh(config, limit=limit, check_splits=check_splits)
     data, model = config["data"], config.get("model", {})
     if (
         data.get("stress_source") != "ipa"

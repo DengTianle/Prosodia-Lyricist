@@ -10,7 +10,8 @@ def load_config(path):
     with path.open(encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     for section, keys in {
-        "data": ("dali_dir", "lakh_file", "prepared_dir", "song_ids_file", "pretraining_manifest"),
+        "data": ("dali_dir", "lakh_file", "prepared_dir", "song_ids_file", "pretraining_manifest",
+                 "base_prepared_dir"),
         "model": ("melody_checkpoint", "template_checkpoint", "xai_tokenizer_dir",
                   "xai_bart_config", "xai_cache_dir"),
         "training": ("output_dir",),

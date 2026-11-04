@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 
 CONTENT_POLICY = "metadata_encoded_melody_full_lyrics_v1"
-GROUP_FINGERPRINTS = ("input", "melody", "lyrics")
+GROUP_FINGERPRINTS = ("input", "melody", "lyrics", "canonical_melody", "octuple_input")
 
 
 def _digest(value):
@@ -31,7 +31,7 @@ def _array_digest(encoded, keys):
     return digest.hexdigest()
 
 
-def content_fingerprints(lines):
+def content_fingerprints(lines, source=None, *, octuple_config=None):
     """Hash what the encoder sees, separately from targets and full lyric text.
 
     The melody identity excludes optional meter so disabling that branch cannot
@@ -50,6 +50,21 @@ def content_fingerprints(lines):
         keys = ("melody_features", "note_line_ids", "line_count")
         result["melody"] = _array_digest(encoded, keys)
         result["input"] = _array_digest(encoded, (*keys, "meter_features", "meter_mask"))
+        if source and source.get("meter_phase") == "explicit_meter_continuous_bars_v1":
+            from .melody_encoder.octuple import canonical_notes, encode_octuple
+
+            notes, _, _ = canonical_notes(lines, source)
+            origin = notes[0][1]
+            # Exclude phrase boundaries, tempo and optional meter from melody identity.
+            result["canonical_melody"] = _digest([
+                (pitch, str(onset-origin), str(duration)) for pitch, onset, duration in notes
+            ])
+            octuple = encode_octuple(lines, source, octuple_config)
+            if octuple_config and not octuple_config.get("timing_residuals", True):
+                octuple["timing_residuals"] = np.zeros_like(octuple["timing_residuals"])
+            result["octuple_input"] = _array_digest(octuple, (
+                "melody_features", "timing_residuals", "note_line_ids", "line_count",
+            ))
     if lines and all("syllables" in line for line in lines):
         result["target"] = _digest([
             [(s["stress"], s["length"]) for s in line["syllables"]] for line in lines
@@ -57,13 +72,15 @@ def content_fingerprints(lines):
     return result
 
 
-def read_content_index(directory):
+def read_content_index(directory, *, octuple_config=None):
     """Verify actual JSONL bytes and index all splits, including legacy exports."""
     from .data import read_manifest
     from .melody_checkpoint import file_sha256
 
     directory = Path(directory).resolve()
     manifest = read_manifest(directory)
+    if octuple_config is None:
+        octuple_config = manifest.get("octuple_codec", {}).get("config")
     scope = file_sha256(directory / "manifest.json")
     entries, seen = [], set()
     for split in ("train", "valid", "test"):
@@ -88,8 +105,10 @@ def read_content_index(directory):
                 entries.append({
                     "song_id": song_id, "source": manifest["config"].get("source", "dali"),
                     "split": split, "scope": scope, "group": info["group"],
-                    "identity": info.get("identity", {}),
-                    "content_fingerprints": content_fingerprints(lines),
+                    "identity": {**info.get("identity", {}),
+                                 "msd_ids": source_msd_ids(song.get("source", {}))},
+                    "content_fingerprints": content_fingerprints(
+                        lines, song.get("source"), octuple_config=octuple_config),
                     "lines": len(lines),
                     "slots": sum(len(line.get("syllables", [])) for line in lines),
                 })
@@ -101,6 +120,14 @@ def read_content_index(directory):
         "version": 1, "policy": CONTENT_POLICY, "prepared_dir": str(directory),
         "manifest_sha256": scope, "data_sha256": manifest["sha256"], "entries": entries,
     }
+
+
+def source_msd_ids(source):
+    ids = {source.get("msd_id", "")}
+    ids.update(Path(path).parent.name for path in source.get("deduplication", {}).get(
+        "source_aliases", []))
+    return sorted(identity for identity in ids if isinstance(identity, str)
+                  and re.fullmatch(r"TR[A-Z0-9]{16}", identity))
 
 
 def identity_components(entries):

@@ -110,7 +110,8 @@ def _inference_report(report, song, name):
     if learned:
         result["bridge"] = {
             "checkpoint": predictor.get("checkpoint"),
-            "count_sources": ["notes"] * len(source),
+            "count_sources": [predictor.get("slot_count_source", "notes")] * len(source),
+            "source_scheme": predictor.get("source_scheme"),
         }
         # Keep the Imagine report's musical comparison, using stored MIDI results.
         for other_name, other in song["methods"].items():

@@ -13,6 +13,9 @@ def markdown_report(report):
     actual = report.get("prosody_mode") == "actual"
     count_sources = report.get("bridge", {}).get("count_sources", [])
     note_slots = learned and bool(count_sources) and all(s == "notes" for s in count_sources)
+    role_slots = learned and bool(count_sources) and all(
+        s == "predicted_syllable_starts" for s in count_sources
+    )
 
     def escaped(value):
         return str(value).replace("|", "\\|").replace("\n", " ").replace("`", "'")
@@ -28,6 +31,9 @@ def markdown_report(report):
         (
             "- Template method: learned stress and IPA vowel length; one prosody slot per note."
             if note_slots
+            else "- Template method: predicted syllable starts with melisma continuations, "
+            "stress and IPA vowel length."
+            if role_slots
             else "- Template method: learned IPA syllable counts, stress and vowel length."
             if learned
             else f"- Template method: `{report['stress_source']}`; one note per syllable."

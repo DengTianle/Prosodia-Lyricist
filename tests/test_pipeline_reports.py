@@ -98,6 +98,14 @@ def test_random_sampling_is_paired_reproducible_and_does_not_change_global_rng(s
     assert len(pipeline_reports.select_report_songs(saved_report, count=20)) == 5
 
 
+def test_role_bridge_report_retains_predicted_start_count_source(saved_report):
+    predictor = saved_report["methods"]["bridge"]["predictor"]
+    predictor["slot_count_source"] = "predicted_syllable_starts"
+    text = pipeline_reports.detailed_markdown(saved_report, saved_report["per_song"][0], "bridge")
+    assert "predicted syllable starts with melisma continuations" in text
+    assert "one prosody slot per note" not in text
+
+
 def test_exports_infer_style_reports_lyrics_reference_tail_and_midi_comparison(
     tmp_path, saved_report
 ):

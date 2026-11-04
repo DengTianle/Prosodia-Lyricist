@@ -14,7 +14,8 @@ from .bridge_alignment import ALIGNMENT_POLICIES, aligned_note_indices, recover_
 from .data import read_manifest
 from .ipa import REPO_RULES, REPO_STRESSES
 from .melody_checkpoint import file_sha256
-from .melody_encoder.encoding import MELODY_FEATURE_DIM, encode_note_sequence
+from .melody_encoder.encoding import MELODY_FEATURE_DIM, MELODY_REPRESENTATION, encode_note_sequence
+from .melody_encoder.octuple import REPRESENTATION, canonical_meter, codec_metadata, encode_octuple
 from .meter import METER_FEATURE_DIM, encode_meter
 from .runtime import log_stage
 
@@ -74,14 +75,28 @@ def melody_arrays(lines):
     return pitches, onsets, durations, line_ids
 
 
-def encode_bridge_song(lines):
+def encode_bridge_song(lines, *, representation=MELODY_REPRESENTATION, source=None,
+                       octuple_config=None, canonical_timing=False):
     """Encode the entire song once with the original 177-D representation.
 
     Pitch reference, log-duration bins and IOI bins are shared by all phrases.
     Phrase IDs and optional observed meter are separate conditioning inputs.
     """
+    if representation == REPRESENTATION:
+        encoded = encode_octuple(lines, source, octuple_config)
+        meter_lines = [{"melody": {"midi_pitches": [0] * len(encoded["meter"]),
+                                  "meter": encoded.pop("meter")}}]
+        meter, observed = encode_meter(meter_lines)
+        return {**encoded, "meter_features": meter, "meter_mask": observed}
+    if representation != MELODY_REPRESENTATION:
+        raise ValueError("Unsupported melody representation")
     pitches, onsets, durations, line_ids = melody_arrays(lines)
-    meter, observed = encode_meter(lines)
+    if canonical_timing:
+        entries, _ = canonical_meter(lines, source)
+        meter, observed = encode_meter([{"melody": {"midi_pitches": pitches.tolist(),
+                                                    "meter": entries}}])
+    else:
+        meter, observed = encode_meter(lines)
     return {
         "melody_features": encode_note_sequence(pitches, onsets - onsets[0], durations),
         "meter_features": meter,
@@ -145,6 +160,10 @@ class BridgeDataset(Dataset):
         strength_labels=None,
         alignment_policy="strict",
         dali_dir=None,
+        representation=MELODY_REPRESENTATION,
+        octuple_config=None,
+        predict_note_roles=False,
+        canonical_timing=False,
     ):
         if alignment_policy is not None and alignment_policy not in ALIGNMENT_POLICIES:
             raise ValueError("alignment_policy must be strict or prefix")
@@ -157,6 +176,12 @@ class BridgeDataset(Dataset):
             raise ValueError("Song/target limits must be positive")
         manifest = read_manifest(directory)
         data = manifest["config"]
+        if representation == REPRESENTATION or canonical_timing:
+            prepared_codec = manifest.get("octuple_codec")
+            if prepared_codec is None or prepared_codec.get("grid_policy") != codec_metadata()[
+                "grid_policy"
+            ] or prepared_codec != codec_metadata(prepared_codec.get("config")):
+                raise ValueError("Prepare canonical Lakh inputs before octuple training")
         if not data.get("include_melody") or data["stress_source"] != "ipa":
             raise ValueError("Prepare with include_melody: true and stress_source: ipa")
         prepared_labels = (
@@ -222,7 +247,10 @@ class BridgeDataset(Dataset):
                 )
                 self.examples.append(
                     {
-                        **encode_bridge_song(lines),
+                        **encode_bridge_song(lines, representation=representation,
+                                             source=song.get("source"),
+                                             octuple_config=octuple_config,
+                                             canonical_timing=canonical_timing),
                         **alignment,
                         "labels": encode_bridge_targets(
                             lines, data["max_syllables"], pairs=self.pairs
@@ -232,6 +260,14 @@ class BridgeDataset(Dataset):
                         "song_mean_note_duration_seconds": float(durations.mean()),
                     }
                 )
+                if predict_note_roles:
+                    roles = [role for line in lines for role in line.get("note_roles", [])]
+                    if len(roles) != sum(note_counts) or any(type(r) is not int or r not in (0, 1)
+                                                           for r in roles):
+                        raise ValueError("Prepare explicit START/CONTINUE note-role targets")
+                    if any(line["note_roles"][0] != 0 for line in lines):
+                        raise ValueError("A supplied phrase must begin with a syllable start")
+                    self.examples[-1]["note_roles"] = roles
                 self.songs.add(song["song_id"])
                 if limit is not None and len(self.examples) >= limit:
                     break
@@ -269,18 +305,24 @@ class BridgeDataset(Dataset):
 def bridge_collate(examples, *, pairs=PAIRS):
     if not examples:
         raise ValueError("Cannot collate an empty bridge batch")
-    for key in ("labels", "target_note_indices"):
+    for key in ("labels", "target_note_indices", "timing_residuals", "note_roles"):
         if any((key in e) != (key in examples[0]) for e in examples):
             raise ValueError("Cannot mix labeled/unlabeled or aligned/unaligned examples")
     width = max(len(e["note_line_ids"]) for e in examples)
+    octuple = "timing_residuals" in examples[0]
     batch = {
-        "melody_features": torch.zeros(len(examples), width, MELODY_FEATURE_DIM),
+        "melody_features": torch.zeros(len(examples), width, 8 if octuple else MELODY_FEATURE_DIM,
+                                       dtype=torch.long if octuple else torch.float32),
         "melody_attention_mask": torch.zeros(len(examples), width, dtype=torch.long),
         "note_line_ids": torch.zeros(len(examples), width, dtype=torch.long),
         "line_counts": torch.tensor([e["line_count"] for e in examples]),
         "meter_features": torch.zeros(len(examples), width, METER_FEATURE_DIM),
         "meter_mask": torch.zeros(len(examples), width, dtype=torch.bool),
     }
+    if octuple:
+        batch["timing_residuals"] = torch.zeros(len(examples), width, 3)
+    if "note_roles" in examples[0]:
+        batch["note_roles"] = torch.full((len(examples), width), -100, dtype=torch.long)
     if "labels" in examples[0]:
         batch["labels"] = torch.full(
             (len(examples), max(len(e["labels"]) for e in examples)), -100, dtype=torch.long
@@ -295,6 +337,10 @@ def bridge_collate(examples, *, pairs=PAIRS):
         batch["melody_features"][row, :n] = torch.from_numpy(example["melody_features"])
         batch["melody_attention_mask"][row, :n] = 1
         batch["note_line_ids"][row, :n] = torch.tensor(example["note_line_ids"])
+        if octuple:
+            batch["timing_residuals"][row, :n] = torch.from_numpy(example["timing_residuals"])
+        if "note_roles" in batch:
+            batch["note_roles"][row, :n] = torch.tensor(example["note_roles"])
         if "meter_features" in example:
             batch["meter_features"][row, :n] = torch.from_numpy(example["meter_features"])
             batch["meter_mask"][row, :n] = torch.from_numpy(example["meter_mask"])

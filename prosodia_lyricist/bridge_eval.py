@@ -33,6 +33,7 @@ def evaluate_bridge(
     limit=None,
     progress=False,
     dali_dir=None,
+    role_threshold=None,
 ):
     """Score IPA-count predictions; gold labels are loss targets only for parallel models."""
     if split not in ("valid", "test"):
@@ -46,9 +47,14 @@ def evaluate_bridge(
         raise ValueError("Use fp32 on CPU/MPS; bf16 requires supported CUDA hardware")
     checkpoint, prepared_dir = Path(checkpoint).resolve(), Path(prepared_dir).resolve()
     model = ProsodyBridge.load(checkpoint)
+    if role_threshold is not None:
+        if not model.predict_note_roles or not 0 < role_threshold < 1:
+            raise ValueError("role_threshold requires a role head and a value in (0, 1)")
+        model.role_threshold = role_threshold
     manifest = read_manifest(prepared_dir)
     split_integrity = audit_content_splits(
-        read_content_index(prepared_dir), model.supervised_exposure,
+        read_content_index(prepared_dir, octuple_config=model.octuple_config),
+        model.supervised_exposure,
     )
     if model.supervised_exposure is None:
         split_integrity["ancestor_exposure"] = "unverified_legacy_checkpoint"
@@ -124,7 +130,7 @@ def evaluate_bridge(
             "max_syllables": model.max_syllables,
             "max_target_length": model.max_target_length,
         },
-        "source_scheme": "global_note_177d_v1",
+        "source_scheme": model.source_scheme,
         "meter_conditioning": model.meter_conditioning,
         "contrastive_fusion": model.contrastive_config is not None,
         "bridge_scope": model.bridge_scope,
@@ -153,15 +159,20 @@ def evaluate_bridge(
             "slot_count_source": "ipa",
         },
         "duration_baselines": duration_baselines,
+        **({"note_roles": scores["note_roles"]} if "note_roles" in scores else {}),
+        **({"free_prediction": scores["free_prediction"]} if "free_prediction" in scores else {}),
         "metric_definitions": {
-            "loss": "Sum of mean stress/length CE on aligned IPA slots; unmatched slots excluded.",
+            "loss": (
+                "Mean stress/length CE on aligned IPA slots, plus weighted-by-coefficient "
+                "unweighted role CE on valid notes when the role head is enabled."
+            ),
             "prediction_accuracy": (
                 "Micro accuracy on observed first-note anchors gathered into the IPA skeleton. "
                 "Gold labels, counts and alignment are never inputs to the global encoder/heads."
             ),
             "slot_count_source": (
                 "Reference IPA skeleton and observed word/note anchors are used for scoring. "
-                "MIDI inference directly emits one stress/length pair per note."
+                "Free prediction is scored separately when available; it does not use gold counts."
             ),
             "combined_accuracy": "Both strength and length must match at the same slot.",
             "classification": (
@@ -203,6 +214,11 @@ def main(argv=None):
     parser.add_argument("--precision", choices=("fp32", "bf16"), default="fp32")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--limit", type=int, help="First N retained songs")
+    parser.add_argument(
+        "--role-threshold",
+        type=float,
+        help="Continuation probability cutoff; tune on validation only",
+    )
     parser.add_argument("--output", type=Path, help="Also save the JSON summary to this path")
     parser.add_argument("--no-progress", action="store_true")
     args = parser.parse_args(argv)
@@ -217,6 +233,7 @@ def main(argv=None):
         limit=args.limit,
         progress=not args.no_progress,
         dali_dir=args.dali_dir,
+        role_threshold=args.role_threshold,
     )
     summary = json.dumps(report, indent=2, allow_nan=False) + "\n"
     if args.output:

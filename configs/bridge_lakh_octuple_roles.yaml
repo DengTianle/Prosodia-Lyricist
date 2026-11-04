@@ -1,0 +1,62 @@
+# Matched experiments share canonical timing, IPA labels, and preserved song splits.
+data:
+  source: lakh
+  lakh_file: ../outputs/lakh-alignment-audit/deduplicated-orthographic.jsonl.gz
+  prepared_dir: ../data/lakh-octuple
+  stress_source: ipa
+  prosody_mode: actual
+  include_melody: true
+  require_meter: true
+  max_syllables: 40
+  valid_fraction: 0.1
+  test_fraction: 0.1
+  seed: 1234
+  base_prepared_dir: ../data/leakage-clean-20261103/lakh-bridge
+model:
+  conditioning: bridge
+  melody_initialization: random
+  melody_checkpoint: null
+  melody_encoder:
+    d_model: 256
+    num_layers: 4
+    num_heads: 4
+    dim_feedforward: 1024
+    dropout: 0.1
+    pooling: cls
+    max_length: 2048
+  max_song_notes: 2048
+  max_song_lines: 256
+  max_target_length: 4096
+  alignment_policy: strict
+  meter_conditioning: false
+  representation: prosody_octuple_v1
+  canonical_timing: true
+  octuple_config:
+    resolution: 96
+    timing_residuals: true
+  predict_note_roles: true
+  role_loss_weight: 0.5
+  role_threshold: 0.5
+training:
+  output_dir: ../checkpoints/bridge-lakh-octuple-roles
+  device: auto
+  precision: fp32
+  seed: 1234
+  epochs: 100
+  batch_size: 8
+  num_workers: 0
+  gradient_accumulation_steps: 2
+  melody_unfreeze_epoch: 0
+  learning_rate: 0.0001
+  melody_learning_rate: 0.0001
+  length_class_weights: null
+  adam_betas:
+  - 0.9
+  - 0.98
+  adam_epsilon: 1.0e-05
+  weight_decay: 0.01
+  warmup_steps: 100
+  schedule: constant_after_warmup
+  gradient_clip: 1.0
+  patience: 5
+  role_class_weights: balanced

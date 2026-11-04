@@ -1,6 +1,7 @@
 """One global melody encoder with optional meter and contrastive conditioning."""
 
 import json
+import math
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from .bridge_data import PAD, PAIR_OFFSET, SLOT, bridge_vocabulary, prosody_pair
 from .ipa import PAPER_RULES, REPO_RULES, REPO_STRESSES
 from .melody_encoder.encoding import MELODY_REPRESENTATION
 from .melody_encoder.modeling import MelodyTransformerEncoder
+from .melody_encoder.octuple import REPRESENTATION, codec_config, codec_metadata
+from .melody_encoder.octuple_model import OctupleMelodyEncoder
 from .meter import METER_FEATURE_DIM, METER_FEATURE_SCHEME
 
 FORMAT_VERSION = 10
@@ -42,6 +45,13 @@ class ProsodyBridge(nn.Module):
         meter_conditioning=False,
         contrastive_config=None,
         provenance=None,
+        representation=MELODY_REPRESENTATION,
+        octuple_config=None,
+        predict_note_roles=False,
+        role_loss_weight=0.5,
+        role_threshold=0.5,
+        role_class_weights=None,
+        canonical_timing=False,
     ):
         super().__init__()
         for name, value in dict(
@@ -58,6 +68,38 @@ class ProsodyBridge(nn.Module):
             raise ValueError("alignment_policy must be strict or prefix")
         if not isinstance(meter_conditioning, bool):
             raise ValueError("meter_conditioning must be boolean")
+        if representation not in (MELODY_REPRESENTATION, REPRESENTATION):
+            raise ValueError("Unsupported melody representation")
+        if type(predict_note_roles) is not bool:
+            raise ValueError("predict_note_roles must be boolean")
+        if (
+            not isinstance(role_loss_weight, (int, float))
+            or isinstance(role_loss_weight, bool)
+            or not math.isfinite(role_loss_weight)
+            or role_loss_weight <= 0
+            or not isinstance(role_threshold, (int, float))
+            or isinstance(role_threshold, bool)
+            or not 0 < role_threshold < 1
+        ):
+            raise ValueError("Positive role_loss_weight and role_threshold in (0, 1) required")
+        self.representation = representation
+        if type(canonical_timing) is not bool:
+            raise ValueError("canonical_timing must be boolean")
+        self.canonical_timing = canonical_timing or representation == REPRESENTATION
+        self.source_scheme = (
+            REPRESENTATION
+            if representation == REPRESENTATION
+            else "global_note_177d_canonical_meter_v1"
+            if self.canonical_timing
+            else SOURCE_SCHEME
+        )
+        self.octuple_config = (
+            codec_config(octuple_config) if representation == REPRESENTATION else None
+        )
+        if representation != REPRESENTATION and octuple_config is not None:
+            raise ValueError("Octuple options require the octuple representation")
+        self.predict_note_roles = predict_note_roles
+        self.role_loss_weight, self.role_threshold = role_loss_weight, role_threshold
         self.melody_config = {**melody_config, "projection_dim": None}
         if max_song_notes > self.melody_config.get("max_length", 4096):
             raise ValueError("max_song_notes must fit the global melody encoder max_length")
@@ -72,12 +114,22 @@ class ProsodyBridge(nn.Module):
         self.vocabulary = bridge_vocabulary(self.max_lines, pairs=self.pairs)
         self.provenance = provenance or {}
         self.supervised_exposure = None
-        self.melody_encoder = MelodyTransformerEncoder(**self.melody_config)
+        self.melody_encoder = (
+            OctupleMelodyEncoder(**self.melody_config, octuple_config=self.octuple_config)
+            if representation == REPRESENTATION
+            else MelodyTransformerEncoder(**self.melody_config)
+        )
         width = self.melody_encoder.d_model
         self.line_embedding = nn.Embedding(self.max_lines + 1, width, padding_idx=0)
         self.head_dropout = nn.Dropout(self.melody_config.get("dropout", 0.1))
         self.strength_head = nn.Linear(width, len(self.strength_labels))
         self.length_head = nn.Linear(width, 2)
+        self.role_head = nn.Linear(width, 2) if predict_note_roles else None
+        if predict_note_roles:
+            weights = [1.0, 1.0] if role_class_weights is None else role_class_weights
+            if len(weights) != 2 or any(not math.isfinite(w) or w <= 0 for w in weights):
+                raise ValueError("role_class_weights must be positive [START, CONTINUE] weights")
+            self.register_buffer("role_class_weights", torch.tensor(weights, dtype=torch.float32))
         self.meter_adapter = None
         if meter_conditioning:
             self.enable_meter()
@@ -94,6 +146,8 @@ class ProsodyBridge(nn.Module):
 
     def enable_meter(self):
         """Add meter to a DALI checkpoint without changing its initial predictions."""
+        if self.representation == REPRESENTATION:
+            raise ValueError("Octuple includes meter; disable the legacy meter adapter")
         if self.meter_adapter is None:
             width = self.melody_encoder.d_model
             self.meter_adapter = nn.Sequential(
@@ -104,6 +158,8 @@ class ProsodyBridge(nn.Module):
 
     def add_contrastive(self, config, state=None):
         """Fuse a whole-song contrastive tower; its audio/projection heads are unused."""
+        if self.representation == REPRESENTATION:
+            raise ValueError("Octuple does not support contrastive fusion")
         if self.contrastive_encoder is not None:
             raise ValueError("A contrastive encoder is already attached")
         config = {**config, "projection_dim": None}
@@ -151,6 +207,10 @@ class ProsodyBridge(nn.Module):
             max_target_length=self.max_target_length,
             strength_labels=self.strength_labels,
             alignment_policy=self.alignment_policy,
+            representation=self.representation,
+            octuple_config=self.octuple_config,
+            predict_note_roles=self.predict_note_roles,
+            canonical_timing=self.canonical_timing,
         )
 
     def encode(
@@ -161,6 +221,7 @@ class ProsodyBridge(nn.Module):
         line_counts,
         meter_features=None,
         meter_mask=None,
+        timing_residuals=None,
     ):
         if melody_features.ndim != 3 or not 1 <= melody_features.shape[1] <= self.max_song_notes:
             raise ValueError("Melody exceeds bridge note limit or has an invalid shape")
@@ -222,8 +283,19 @@ class ProsodyBridge(nn.Module):
             fused = self.contrastive_adapter(torch.cat((encoded.note_embeddings, pooled), dim=-1))
             context = context + self.contrastive_gate.tanh() * fused
         # Even a frozen trunk must propagate gradients into trainable conditioning.
+        extra = {}
+        if self.representation == REPRESENTATION:
+            if timing_residuals is None or timing_residuals.shape != (*active.shape, 3):
+                raise ValueError("Octuple input requires timing_residuals")
+            extra["timing_residuals"] = timing_residuals.masked_fill(~active[..., None], 0)
+        elif timing_residuals is not None:
+            raise ValueError("Legacy melody encoding does not accept timing residuals")
         notes = self.melody_encoder.encode(
-            features, active, project=False, note_context=context
+            features,
+            active,
+            project=False,
+            note_context=context,
+            **extra,
         ).note_embeddings
         return notes.masked_fill(~active[..., None], 0)
 
@@ -282,6 +354,7 @@ class ProsodyBridge(nn.Module):
             logits=(strength.unsqueeze(-1) + length.unsqueeze(-2)).flatten(-2),
             strength_logits=strength,
             length_logits=length,
+            role_logits=self.role_head(hidden) if self.role_head is not None else None,
         )
 
     def predict_notes(self, **source):
@@ -342,6 +415,8 @@ class ProsodyBridge(nn.Module):
         target_note_indices,
         meter_features=None,
         meter_mask=None,
+        timing_residuals=None,
+        note_roles=None,
     ):
         if (
             labels.ndim != 2
@@ -358,6 +433,7 @@ class ProsodyBridge(nn.Module):
             line_counts=line_counts,
             meter_features=meter_features,
             meter_mask=meter_mask,
+            timing_residuals=timing_residuals,
         )
         output = self.align_note_predictions(
             notes,
@@ -385,8 +461,52 @@ class ProsodyBridge(nn.Module):
             if active.any()
             else output.length_logits.sum() * 0,
         }
-        output.loss, output.loss_components = sum(components.values()), components
+        output.note_predictions = notes
+        output.role_logits = notes.role_logits
+        output.loss = sum(components.values())
+        if self.predict_note_roles:
+            if note_roles is None or note_roles.shape != melody_attention_mask.shape:
+                raise ValueError("Role-head training requires per-note role targets")
+            role_active = note_roles.ne(-100) & melody_attention_mask.bool()
+            if ((note_roles[role_active] < 0) | (note_roles[role_active] > 1)).any():
+                raise ValueError("Note roles must be START=0 or CONTINUE=1")
+            components["role"] = (
+                F.cross_entropy(notes.role_logits[role_active].float(), note_roles[role_active])
+                if role_active.any()
+                else notes.role_logits.sum() * 0
+            )
+            output.loss = output.loss + self.role_loss_weight * components["role"]
+        output.loss_components = components
         return output
+
+    def predicted_starts(self, notes, attention_mask, note_line_ids):
+        active = attention_mask.bool()
+        starts = (
+            notes.role_logits.float().softmax(-1)[..., 1] < self.role_threshold
+            if self.predict_note_roles
+            else active.clone()
+        )
+        first = torch.ones_like(active)
+        first[:, 1:] = note_line_ids[:, 1:].ne(note_line_ids[:, :-1])
+        return (starts | first) & active
+
+    def generate_from_notes(self, notes, melody_attention_mask, note_line_ids, line_counts):
+        starts = self.predicted_starts(notes, melody_attention_mask, note_line_ids)
+        counts = self.note_counts(note_line_ids.masked_fill(~starts, 0), line_counts)
+        self.validate_counts(counts, line_counts)
+        skeleton = self.make_skeleton(counts)
+        indices = torch.full_like(skeleton["tokens"], -1)
+        for row in range(len(counts)):
+            indices[row, skeleton["tokens"][row].eq(SLOT)] = starts[row].nonzero().flatten()
+        output = self.align_note_predictions(
+            notes, indices, counts, line_counts, note_line_ids, melody_attention_mask
+        )
+        return SimpleNamespace(
+            sequences=self.template_sequences(output),
+            syllable_counts=counts,
+            note_start_mask=starts,
+            target_note_indices=indices,
+        )
 
     def template_sequences(self, output):
         """Serialize parallel head predictions without feeding labels back to the model."""
@@ -405,11 +525,12 @@ class ProsodyBridge(nn.Module):
         line_counts,
         meter_features=None,
         meter_mask=None,
+        timing_residuals=None,
         *,
         syllable_counts=None,
         target_note_indices=None,
     ):
-        """Emit one pair per MIDI note; observed IPA anchors are for evaluation only."""
+        """Emit pairs at predicted starts (or every note); IPA anchors are scoring-only."""
         notes = self.predict_notes(
             melody_features=melody_features,
             melody_attention_mask=melody_attention_mask,
@@ -417,19 +538,15 @@ class ProsodyBridge(nn.Module):
             line_counts=line_counts,
             meter_features=meter_features,
             meter_mask=meter_mask,
+            timing_residuals=timing_residuals,
         )
         counts = self.note_counts(note_line_ids, line_counts)
         if target_note_indices is None:
             if syllable_counts is not None and not torch.equal(syllable_counts, counts):
                 raise ValueError("IPA-count generation requires observed target_note_indices")
-            self.validate_counts(counts, line_counts)
-            skeleton = self.make_skeleton(counts)
-            target_note_indices = torch.full_like(skeleton["tokens"], -1)
-            for row in range(len(counts)):
-                slots = skeleton["tokens"][row].eq(SLOT)
-                target_note_indices[row, slots] = torch.arange(
-                    int(melody_attention_mask[row].sum()), device=counts.device
-                )
+            return self.generate_from_notes(
+                notes, melody_attention_mask, note_line_ids, line_counts
+            )
         else:
             if syllable_counts is None:
                 raise ValueError("Observed note alignment requires IPA syllable_counts")
@@ -455,16 +572,27 @@ class ProsodyBridge(nn.Module):
             alignment_policy=self.alignment_policy,
             meter_conditioning=self.meter_conditioning,
             contrastive_config=self.contrastive_config,
+            representation=self.representation,
+            octuple_config=self.octuple_config,
+            predict_note_roles=self.predict_note_roles,
+            role_loss_weight=self.role_loss_weight,
+            role_threshold=self.role_threshold,
+            role_class_weights=self.role_class_weights.tolist()
+            if self.predict_note_roles
+            else None,
+            canonical_timing=self.canonical_timing,
         )
 
     def save(self, directory):
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         metadata = dict(
-            format_version=FORMAT_VERSION,
-            source_scheme=SOURCE_SCHEME,
+            format_version=11
+            if self.canonical_timing or self.predict_note_roles
+            else FORMAT_VERSION,
+            source_scheme=self.source_scheme,
             target_scheme=TARGET_SCHEME,
-            melody_representation=MELODY_REPRESENTATION,
+            melody_representation=self.representation,
             meter_feature_scheme=METER_FEATURE_SCHEME,
             alignment_scheme=ALIGNMENT_FORMAT,
             prosody_rules=self.prosody_rules,
@@ -473,6 +601,8 @@ class ProsodyBridge(nn.Module):
             provenance=self.provenance,
             supervised_exposure=self.supervised_exposure,
         )
+        if self.representation == REPRESENTATION:
+            metadata["octuple_codec"] = codec_metadata(self.octuple_config)
         (directory / "bridge.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
         torch.save(self.state_dict(), directory / "bridge_weights.pt")
 
@@ -480,16 +610,36 @@ class ProsodyBridge(nn.Module):
     def load(cls, directory):
         directory = Path(directory)
         meta = json.loads((directory / "bridge.json").read_text(encoding="utf-8"))
-        if meta.get("format_version") != FORMAT_VERSION:
+        if meta.get("format_version") not in (FORMAT_VERSION, 11):
             raise ValueError(
                 "Global bridge requires format v10; retrain older window/query bridges"
             )
+        representation = meta.get("melody_representation")
+        if representation not in (MELODY_REPRESENTATION, REPRESENTATION):
+            raise ValueError("Unsupported checkpoint melody representation")
+        if (
+            meta.get("configuration", {}).get("representation", MELODY_REPRESENTATION)
+            != representation
+        ):
+            raise ValueError("Checkpoint representation metadata conflict")
+        if representation == REPRESENTATION and (
+            meta.get("format_version") != 11
+            or meta.get("octuple_codec")
+            != codec_metadata(meta["configuration"].get("octuple_config"))
+        ):
+            raise ValueError("Incompatible octuple vocabulary, quantizer, or grid policy")
         if any(
             meta.get(key) != value
             for key, value in dict(
-                source_scheme=SOURCE_SCHEME,
+                source_scheme=(
+                    REPRESENTATION
+                    if representation == REPRESENTATION
+                    else "global_note_177d_canonical_meter_v1"
+                    if meta["configuration"].get("canonical_timing")
+                    else SOURCE_SCHEME
+                ),
                 target_scheme=TARGET_SCHEME,
-                melody_representation=MELODY_REPRESENTATION,
+                melody_representation=representation,
                 meter_feature_scheme=METER_FEATURE_SCHEME,
             ).items()
         ) or meta.get("alignment_scheme") not in (ALIGNMENT_FORMAT, ALIGNMENT_SCHEME):

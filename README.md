@@ -296,6 +296,54 @@ For local CPU/MPS runs, set `training.device` to `auto` and `precision` to `fp32
 To fine-tune an existing bridge, set `melody_initialization: bridge` and
 `melody_checkpoint` to its `best/` directory, preserving its architecture and limits.
 
+### ProsodyOctuple on the calibrated Lakh subset
+
+The new `prosody_octuple_v1` path encodes one token per note: bar, within-bar
+position, pitch, melodic interval, duration, preceding gap, meter, and tempo.
+It uses 96 subdivisions per quarter and three timing residuals. A single
+whole-song Transformer predicts IPA stress/vowel length; the optional role head
+predicts syllable starts and melisma continuations. There is no contrastive tower.
+See [the encoding specification](docs/lakh-octuple-design.md).
+
+The three matched configurations share the same canonical prepared directory:
+
+| Config | Input | Syllable count at inference |
+| --- | --- | --- |
+| `configs/bridge_lakh_canonical.yaml` | Existing 177-D + canonical meter | One per note |
+| `configs/bridge_lakh_octuple.yaml` | ProsodyOctuple | One per note |
+| `configs/bridge_lakh_octuple_roles.yaml` | ProsodyOctuple | Predicted starts |
+
+```bash
+conda activate prosodia-lyricist
+python -m prosodia_lyricist.prepare --config configs/bridge_lakh_octuple.yaml
+python -m prosodia_lyricist.train --config configs/bridge_lakh_octuple_roles.yaml --smoke-test
+python -m prosodia_lyricist.train --config configs/bridge_lakh_octuple_roles.yaml
+python -m prosodia_lyricist.bridge_eval --checkpoint CHECKPOINT/best \
+  --prepared-dir data/lakh-octuple --split valid --output outputs/octuple-valid.json
+```
+
+`data.base_prepared_dir` names the verified Lakh IPA export to migrate. Preparation
+checks its files and raw export, retains its labels and groups, canonicalizes meter,
+and stores role targets separately from encoder inputs. Newly detected duplicate
+groups move together toward train, then validation; the manifest records moves.
+Original exports remain available. Encoder inputs use ticks/PPQ in both preparation
+and MIDI inference, retain triplets and long gaps, and collapse redundant meter events.
+
+Both MIDI inference and pipeline evaluation use the new checkpoint automatically
+through the existing `--bridge-checkpoint` option. Select a monophonic vocal track
+with explicit meter and supplied phrase-end markers. A phrase's first note always
+starts a syllable; following continuation predictions extend its group. Over-limit
+predicted templates fail explicitly. Unmarked phrase prediction is a future experiment.
+
+Evaluation reports aligned IPA predictions and `free_prediction` separately; the
+latter uses predicted starts without reference counts. Role reports include
+continuation precision/recall/F1, the always-start baseline, and the threshold.
+`--role-threshold` supports validation comparisons; store the chosen cutoff as
+`model.role_threshold` when training/fine-tuning the final checkpoint. Balanced
+role weights come exclusively from the prepared training split. New checkpoints
+use format v11 and verify codec hashes; existing v10 checkpoints remain readable.
+These configurations default to `auto`/`fp32`; CUDA runs can select `cuda`/`bf16`.
+
 ### Self-supervised melody pretraining
 
 `configs/bridge_pretrain.yaml` reconstructs masked musical attributes: pitch

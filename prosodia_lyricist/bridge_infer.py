@@ -57,15 +57,18 @@ def predict_midi_templates(
         title=title,
         track=track,
         phrase_policy=phrase_policy or "complete",
+        canonical=model.canonical_timing,
     )
     for index, line in enumerate(source["lines"]):
         count = len(line["melody"]["midi_pitches"])
-        if count > model.max_syllables:
+        if not model.predict_note_roles and count > model.max_syllables:
             raise ValueError(
                 f"MIDI phrase {index} has {count} notes; bridge slot limit is "
                 f"{model.max_syllables}; no truncation"
             )
-    encoded = encode_bridge_song(source["lines"])
+    encoded = encode_bridge_song(source["lines"], representation=model.representation,
+                                 source=source.get("source"), octuple_config=model.octuple_config,
+                                 canonical_timing=model.canonical_timing)
     inputs = {key: value.to(device) for key, value in bridge_collate([encoded]).items()}
     result = model.generate(**inputs)
     predicted = decode_bridge_tokens(result.sequences[0].tolist(), pairs=model.pairs)
@@ -82,7 +85,7 @@ def predict_midi_templates(
         "stress_labels": list(model.strength_labels),
         "unmarked_notes_omitted": source.get("unmarked_notes_omitted", 0),
         "bridge_scope": "song",
-        "source_scheme": "global_note_177d_v1",
+        "source_scheme": model.source_scheme,
         "meter_conditioning": model.meter_conditioning,
         "observed_meter_notes": int(inputs["meter_mask"].sum()),
         "contrastive_fusion": model.contrastive_config is not None,
@@ -95,7 +98,11 @@ def predict_midi_templates(
         "query_mode": model.query_mode,
         "query_attention": model.query_attention,
         "prosody_rules": model.prosody_rules,
-        "count_sources": ["notes"] * len(records),
+        "count_sources": ["predicted_syllable_starts" if model.predict_note_roles else "notes"]
+        * len(records),
+        "phrase_source": "supplied_markers",
+        "role_threshold": model.role_threshold if model.predict_note_roles else None,
+        "note_start_mask": result.note_start_mask[0].tolist(),
         "skeleton": {
             "lines": [
                 {"line_id": line["line_id"], "syllable_count": len(line["syllables"])}
@@ -104,5 +111,5 @@ def predict_midi_templates(
         },
         "note_counts": [len(line["melody"]["midi_pitches"]) for line in records],
         "syllable_counts": [len(line["syllables"]) for line in records],
-        "decoding": "note_heads",
+        "decoding": "note_roles_and_heads" if model.predict_note_roles else "note_heads",
     }

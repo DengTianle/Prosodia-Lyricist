@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from functools import partial
 from itertools import islice
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -26,6 +27,8 @@ from .bridge_model import ProsodyBridge
 from .data import read_manifest
 from .ipa import REPO_STRESSES
 from .melody_checkpoint import file_sha256, load_contrastive_melody
+from .melody_encoder.encoding import MELODY_REPRESENTATION
+from .melody_encoder.octuple import REPRESENTATION, codec_metadata
 from .runtime import log_stage, seed_everything, select_device
 from .split_integrity import read_content_index, require_clean_splits, training_exposure
 from .train import build_scheduler
@@ -113,6 +116,14 @@ def run_bridge_epoch(
         model.strength_labels, collect_length_scores=not training
     )
     templates = TemplateMetrics(pairs=model.pairs) if template_metrics else None
+    free_templates = (
+        TemplateMetrics(pairs=model.pairs)
+        if template_metrics and (model.predict_note_roles or model.representation == REPRESENTATION)
+        else None
+    )
+    free_songs, free_failures = 0, 0
+    role_confusion = torch.zeros(2, 2, dtype=torch.long)
+    role_total, role_weighted_total, role_weight_total, role_count = 0.0, 0.0, 0.0, 0
     iterator = iter(islice(loader, max_batches)) if max_batches is not None else iter(loader)
     with torch.enable_grad() if training else torch.no_grad():
         while group := list(islice(iterator, accumulation_steps if training else 1)):
@@ -121,6 +132,19 @@ def run_bridge_epoch(
             group_tokens = sum(int(mask.sum()) for mask in group_masks)
             if not group_tokens:
                 continue
+            group_role_weight = 0.0
+            if model.predict_note_roles:
+                role_weights = model.role_class_weights.detach().cpu()
+                group_role_weight = sum(
+                    float(
+                        role_weights[
+                            batch["note_roles"][
+                                batch["note_roles"].ne(-100) & batch["melody_attention_mask"].bool()
+                            ]
+                        ].sum()
+                    )
+                    for batch in group
+                )
             if weights is not None:
                 group_longs = sum(
                     int(((batch["labels"][mask] - PAIR_OFFSET) % 2).eq(0).sum())
@@ -160,14 +184,44 @@ def run_bridge_epoch(
                     batch_weight = weight_values[0] * longs + weight_values[1] * (count - longs)
                     weighted_length_total += weighted_length.item()
                     length_weight_total += batch_weight
+                prosody_loss = output.loss_components["strength"] + output.loss_components["length"]
+                if model.predict_note_roles:
+                    role_active = (
+                        batch["note_roles"].ne(-100) & batch["melody_attention_mask"].bool()
+                    )
+                    role_targets = batch["note_roles"][role_active]
+                    role_weighted = F.cross_entropy(
+                        output.role_logits[role_active].float(),
+                        role_targets,
+                        weight=model.role_class_weights,
+                        reduction="sum",
+                    )
+                    n_roles = len(role_targets)
+                    role_total += output.loss_components["role"].item() * n_roles
+                    role_weighted_total += role_weighted.item()
+                    role_weight_total += float(model.role_class_weights[role_targets].sum())
+                    role_count += n_roles
+                    starts = model.predicted_starts(
+                        output.note_predictions,
+                        batch["melody_attention_mask"],
+                        batch["note_line_ids"],
+                    )
+                    predicted_roles = (~starts)[role_active].long()
+                    role_confusion += torch.bincount(
+                        (2 * role_targets + predicted_roles).cpu(), minlength=4
+                    ).reshape(2, 2)
                 if training:
                     # Each head uses its own denominator across the accumulation group.
                     objective = (
                         output.loss_components["strength"] * (count / group_tokens)
                         + weighted_length / group_length_weight
                         if weights is not None
-                        else output.loss * (count / group_tokens)
+                        else prosody_loss * (count / group_tokens)
                     )
+                    if model.predict_note_roles and group_role_weight:
+                        objective = (
+                            objective + model.role_loss_weight * role_weighted / group_role_weight
+                        )
                     objective.backward()
                 predicted = (
                     2 * output.strength_logits.argmax(-1) + output.length_logits.argmax(-1)
@@ -182,8 +236,10 @@ def run_bridge_epoch(
                 # Each stress class occupies two pair IDs, ordered long then short.
                 strength_correct += int((predicted // 2).eq(expected // 2).sum())
                 length_correct += int((predicted % 2).eq(expected % 2).sum())
-                total_loss += output.loss.item() * count
+                total_loss += prosody_loss.item() * count
                 for name, value in output.loss_components.items():
+                    if name == "role":
+                        continue
                     component_totals[name] = component_totals.get(name, 0.0) + value.item() * count
                 if templates is not None:
                     note_counts = model.note_counts(batch["note_line_ids"], batch["line_counts"])
@@ -194,6 +250,45 @@ def run_bridge_epoch(
                         note_counts.tolist(),
                         target_mask=output.target_mask.tolist(),
                     )
+                if free_templates is not None:
+                    note_predictions = output.note_predictions
+                    starts = model.predicted_starts(
+                        note_predictions, batch["melody_attention_mask"], batch["note_line_ids"]
+                    )
+                    predicted_counts = model.note_counts(
+                        batch["note_line_ids"].masked_fill(~starts, 0), batch["line_counts"]
+                    )
+                    free_templates.diagnose_counts(batch["syllable_counts"], predicted_counts)
+                    for row in range(len(batch["line_counts"])):
+                        free_songs += 1
+                        notes = SimpleNamespace(
+                            **{
+                                name: getattr(note_predictions, name)[row : row + 1]
+                                if getattr(note_predictions, name) is not None
+                                else None
+                                for name in (
+                                    "logits",
+                                    "strength_logits",
+                                    "length_logits",
+                                    "role_logits",
+                                )
+                            }
+                        )
+                        try:
+                            generated = model.generate_from_notes(
+                                notes,
+                                batch["melody_attention_mask"][row : row + 1],
+                                batch["note_line_ids"][row : row + 1],
+                                batch["line_counts"][row : row + 1],
+                            )
+                        except ValueError:
+                            free_failures += 1
+                            continue
+                        free_templates.record(
+                            generated.sequences.tolist(),
+                            batch["labels"][row : row + 1].tolist(),
+                            generated.syllable_counts.tolist(),
+                        )
                 tokens += count
                 phrases += line_count
                 batches += 1
@@ -237,6 +332,51 @@ def run_bridge_epoch(
             "length": weighted_length_total / length_weight_total,
         }
         result["objective_loss"] = sum(result["objective_components"].values())
+    if model.predict_note_roles:
+        role_ce = role_total / role_count if role_count else 0.0
+        result["components"]["role"] = role_ce
+        result["loss"] += model.role_loss_weight * role_ce
+        objective = result.setdefault(
+            "objective_components",
+            {
+                "strength": result["components"]["strength"],
+                "length": result["components"]["length"],
+            },
+        )
+        objective["role"] = (
+            model.role_loss_weight * role_weighted_total / role_weight_total
+            if role_weight_total
+            else 0.0
+        )
+        result["objective_loss"] = sum(objective.values())
+        tn, fp, fn, tp = role_confusion.flatten().tolist()
+        result["note_roles"] = dict(
+            confusion=role_confusion.tolist(),
+            labels=["start", "continue"],
+            notes=role_count,
+            continuation_precision=tp / (tp + fp) if tp + fp else 0.0,
+            continuation_recall=tp / (tp + fn) if tp + fn else 0.0,
+            continuation_f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0,
+            accuracy=(tp + tn) / role_count if role_count else None,
+            always_start_accuracy=(tn + fp) / role_count if role_count else None,
+            threshold=model.role_threshold,
+            class_weights=model.role_class_weights.tolist(),
+            ce=role_ce,
+            weighted_ce=role_weighted_total / role_weight_total if role_weight_total else None,
+        )
+    if free_templates is not None:
+        free = free_templates.report()
+        free.update(
+            slot_count_source="predicted_syllable_starts" if model.predict_note_roles else "notes",
+            phrase_source="supplied",
+            songs=free_songs,
+            failed_songs=free_failures,
+            successful_songs=free_songs - free_failures,
+            count_mae=free["note_ipa_count_mae"],
+            count_match_rate=free["note_ipa_count_match_rate"],
+            score_scope="successful songs; count errors include failed songs",
+        )
+        result["free_prediction"] = free
     return result
 
 
@@ -248,6 +388,13 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     if audit_mode not in ("strict", "warning"):
         raise ValueError("training.pretraining_audit_mode must be strict or warning")
     initialization = cfg.get("melody_initialization", "random")
+    representation = cfg.get("representation", MELODY_REPRESENTATION)
+    if representation == REPRESENTATION and (
+        initialization == "masked" or cfg.get("contrastive_fusion")
+    ):
+        raise ValueError(
+            "Octuple requires random or matching bridge initialization, without contrastive fusion"
+        )
     if initialization not in ("random", "masked", "bridge"):
         raise ValueError("model.melody_initialization must be random, masked, or bridge")
     random_config = (
@@ -323,7 +470,14 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         manifest = read_manifest(data["prepared_dir"])
     # Storage relocation and obsolete window metadata do not change note arrays.
     # Prepared checksums, recovered raw notes and upstream splits are checked separately.
-    ignored = {"lines_per_window", "pretraining_manifest", "prepared_dir", "dali_dir", "lakh_file"}
+    ignored = {
+        "lines_per_window",
+        "pretraining_manifest",
+        "prepared_dir",
+        "dali_dir",
+        "lakh_file",
+        "base_prepared_dir",
+    }
     if {key: value for key, value in manifest["config"].items() if key not in ignored} != {
         key: value for key, value in data.items() if key not in ignored
     }:
@@ -333,7 +487,9 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
     ):
         raise ValueError("Song allowlist changed; prepare again")
     with log_stage("Checking supervised content identities across prepared splits"):
-        content_index = read_content_index(data["prepared_dir"])
+        content_index = read_content_index(
+            data["prepared_dir"], octuple_config=cfg.get("octuple_config")
+        )
         supervised_split_check = require_clean_splits(content_index)
     checkpoint = cfg.get("melody_checkpoint")
     strength_labels = (
@@ -345,6 +501,20 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         if not checkpoint:
             raise ValueError("Set model.melody_checkpoint to a global bridge best/ directory")
         model = ProsodyBridge.load(checkpoint)
+        for key in (
+            "representation",
+            "octuple_config",
+            "predict_note_roles",
+            "role_loss_weight",
+            "canonical_timing",
+        ):
+            if key in cfg and cfg[key] != getattr(model, key):
+                raise ValueError(f"Fine-tuning {key} differs from the checkpoint")
+        if "role_threshold" in cfg:
+            threshold = cfg["role_threshold"]
+            if not isinstance(threshold, (int, float)) or not 0 < threshold < 1:
+                raise ValueError("role_threshold must be in (0, 1)")
+            model.role_threshold = threshold
         if model.supervised_exposure is None:
             raise ValueError(
                 "Legacy bridge has no supervised training exposure index. Its ancestor "
@@ -406,6 +576,12 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
             max_song_lines=cfg.get("max_song_lines", 256),
             max_target_length=cfg.get("max_target_length", 4096),
             alignment_policy=cfg.get("alignment_policy", "strict"),
+            representation=representation,
+            octuple_config=cfg.get("octuple_config"),
+            predict_note_roles=cfg.get("predict_note_roles", False),
+            role_loss_weight=cfg.get("role_loss_weight", 0.5),
+            role_threshold=cfg.get("role_threshold", 0.5),
+            canonical_timing=cfg.get("canonical_timing", False),
         )
         if masked_metadata is not None:
             from .bridge_pretrain import initialize_from_masked
@@ -454,6 +630,23 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         )
         for split in ("train", "valid")
     }
+    if model.predict_note_roles:
+        role_weighting = settings.get("role_class_weights", "balanced")
+        if role_weighting == "balanced":
+            # Preparation counts cover the full train split even in smoke tests.
+            role_counts = manifest.get("note_role_counts", {})
+            n_start, n_continue = (role_counts.get(f"train_{i}", 0) for i in (0, 1))
+            if not n_start or not n_continue:
+                raise ValueError("Balanced role loss requires both roles in the training split")
+            values = [
+                (n_start + n_continue) / (2 * n_start),
+                (n_start + n_continue) / (2 * n_continue),
+            ]
+        elif role_weighting is None:
+            values = [1.0, 1.0]
+        else:
+            values = _length_class_weights(role_weighting)
+        model.role_class_weights.copy_(torch.tensor(values))
     loaders = {
         split: DataLoader(
             ds,
@@ -507,11 +700,15 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "bridge_target_scheme": model.target_scheme,
         "bridge_scope": model.bridge_scope,
         "training_count_source": "ipa",
-        "inference_count_source": "notes",
+        "inference_count_source": "predicted_syllable_starts"
+        if model.predict_note_roles
+        else "notes",
         "output_design": model.output_design,
         "length_class_weights": length_class_weights,
         "checkpoint_selection_metric": (
-            "valid.objective_loss" if length_class_weights is not None else "valid.loss"
+            "valid.objective_loss"
+            if length_class_weights is not None or model.predict_note_roles
+            else "valid.loss"
         ),
         "query_mode": model.query_mode,
         "query_attention": model.query_attention,
@@ -533,8 +730,12 @@ def train_bridge(config, *, output_dir=None, smoke_test=False):
         "precision": precision,
         "total_steps": steps * epochs,
         "examples": {s: len(ds) for s, ds in datasets.items()},
-        "source_scheme": "global_note_177d_v1",
+        "source_scheme": model.source_scheme,
+        "octuple_codec": codec_metadata(model.octuple_config)
+        if representation == REPRESENTATION
+        else None,
         "meter_conditioning": model.meter_conditioning,
+        "meter_encoding": "octuple_fields" if model.representation == REPRESENTATION else "adapter",
         "contrastive_fusion": model.contrastive_config is not None,
         "songs": {s: len(ds.songs) for s, ds in datasets.items()},
         "skipped_examples": {s: ds.skipped for s, ds in datasets.items()},

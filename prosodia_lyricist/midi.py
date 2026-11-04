@@ -7,7 +7,28 @@ from collections import defaultdict
 from .dali import normalize_text
 
 
-def midi_melody_record(path, *, track=0, title="", phrase_policy="complete"):
+def midi_clock_source(path):
+    """Read explicit meta-events; parsers' inserted 4/4 defaults are not observations."""
+    import mido
+
+    midi = mido.MidiFile(str(path))
+    if midi.type == 2 or midi.ticks_per_beat <= 0:
+        raise ValueError("Canonical input requires synchronous PPQ MIDI")
+    source = dict(ticks_per_quarter=midi.ticks_per_beat, tempo_map=[], time_signatures=[])
+    for track in midi.tracks:
+        tick = 0
+        for event in track:
+            tick += event.time
+            if event.type == "set_tempo":
+                source["tempo_map"].append(dict(tick=tick, tempo=event.tempo))
+            elif event.type == "time_signature":
+                source["time_signatures"].append(dict(tick=tick, numerator=event.numerator,
+                                                       denominator=event.denominator))
+    source["tempo_provenance"] = "explicit_events_with_midi_default_before_first"
+    return source
+
+
+def midi_melody_record(path, *, track=0, title="", phrase_policy="complete", canonical=False):
     """Raw melody notes in seconds, with phrase ends and no inferred prosody labels."""
     import miditoolkit
 
@@ -30,11 +51,27 @@ def midi_melody_record(path, *, track=0, title="", phrase_policy="complete"):
     final_marker = boundaries[-1]
     if phrase_policy == "complete" and boundaries[-1] < notes[-1].end:
         boundaries.append(notes[-1].end)
-    times = midi.get_tick_to_time_mapping()
+    clock, source = None, None
+    if canonical:
+        from fractions import Fraction
+
+        from .melody_encoder.octuple import MusicalClock
+
+        source = midi_clock_source(path)
+        clock = MusicalClock(source)
+        def seconds(tick):
+            return clock.seconds_at(Fraction(tick, midi.ticks_per_beat))
+    else:
+        times = midi.get_tick_to_time_mapping()
+        def seconds(tick):
+            return float(times[tick])
     signatures = sorted(midi.time_signature_changes, key=lambda signature: signature.time)
     signature_times = [signature.time for signature in signatures]
 
     def observed_meter(note):
+        if clock is not None:
+            _, position, n, d = clock.meter(Fraction(note.start, midi.ticks_per_beat))
+            return dict(numerator=n, denominator=d, beat_position=float(position*d/4))
         index = bisect_right(signature_times, note.start) - 1
         if index < 0:
             return None
@@ -60,18 +97,22 @@ def midi_melody_record(path, *, track=0, title="", phrase_policy="complete"):
                     "unmarked_tail": group[0].start > final_marker,
                     "melody": {
                         "midi_pitches": [n.pitch for n in group],
-                        "onset_seconds": [float(times[n.start]) for n in group],
+                        "onset_seconds": [seconds(n.start) for n in group],
                         "note_duration_seconds": [
-                            float(times[n.end] - times[n.start]) for n in group
+                            seconds(n.end) - seconds(n.start) for n in group
                         ],
                         "meter": [observed_meter(n) for n in group],
                     },
                 }
             )
+            if canonical:
+                lines[-1]["melody"].update(onset_ticks=[n.start for n in group],
+                                             note_duration_ticks=[n.end-n.start for n in group])
     return {
         "title": normalize_text(title),
         "lines": lines,
         "unmarked_notes_omitted": len(notes) - cursor,
+        **({"source": source} if canonical else {}),
     }
 
 

@@ -103,7 +103,13 @@ class BridgePredictor:
             "weights_sha256": file_sha256(self.checkpoint / "bridge_weights.pt"),
             "device": str(self.device), "track": track,
             "query_mode": self.model.query_mode, "bridge_scope": self.model.bridge_scope,
-            "prosody_rules": self.model.prosody_rules, "slot_count_source": "notes",
+            "prosody_rules": self.model.prosody_rules,
+            "source_scheme": self.model.source_scheme,
+            "slot_count_source": (
+                "predicted_syllable_starts" if self.model.predict_note_roles else "notes"
+            ),
+            "phrase_source": "supplied_markers",
+            "role_threshold": self.model.role_threshold if self.model.predict_note_roles else None,
         }
 
     def __call__(self, song):

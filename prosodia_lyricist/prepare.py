@@ -48,6 +48,7 @@ def song_groups(songs):
         for key in ("group", "source_song_id"):
             if info.get(key):
                 identities.append((key, info[key]))
+        identities.extend(("msd", value) for value in info.get("msd_ids", []) if value)
         for key in GROUP_FINGERPRINTS:
             value = info.get("content_fingerprints", {}).get(key)
             if value:
